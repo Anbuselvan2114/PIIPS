@@ -1,0 +1,16 @@
+# Prevent CRLF/LF line-ending conversion from corrupting binary files.
+*.pdf binary
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.exe binary
+*.dll binary
+*.msi binary
+*.zip binary
+*.xlsx binary
+*.docx binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
