@@ -36,8 +36,16 @@ Notes
   and re-enter the connection details there instead.
 - venv/ and frontend/node_modules/ are excluded because they are
   environment-specific; reinstall them on the destination with
-  `pip install -r <deps>` / `npm install` per the deployment guide
-  (PIIPS_UAT_Deployment_Guide.pdf) instead of copying them.
+  `pip install --no-deps -r requirements.txt` / `npm install` per the
+  deployment guide (PIIPS_UAT_Deployment_Guide.pdf) instead of copying
+  them. requirements.txt pins opencv-python==4.6.0.66 specifically to
+  match paddleocr's own declared ceiling (paddleocr 2.7.3 requires
+  opencv-python<=4.6.0.66), and does not include opencv-python-headless
+  at all (it duplicates opencv-python's cv2 module under a different
+  package name and pulls in numpy>=2, conflicting with the pinned
+  numpy==1.26.4). Even with the versions aligned, still use --no-deps:
+  it installs exactly the pinned list without pip re-resolving every
+  other package's own declared ranges against each other.
 - frontend/dist/ is excluded because it's a build output; rebuild on
   the destination with `npm run build`, or remove it from /XD above if
   you specifically want to ship a pre-built bundle instead of building
@@ -67,7 +75,15 @@ $Destination = "E:\PIIPS_Application"      # <-- EDIT THIS to the real server pa
                                             #     \\10.0.1.210\E$\PIIPS_Application
                                             #     if copying over the network)
 
-robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 /XF "config.json" "config_nonencrypted.json" "*.log"
+robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 /XD "venv" ".venv" "__pycache__" "node_modules" "logs" /XF "config.json" "config_nonencrypted.json" "*.log"
+
+# /XD above is not optional: the staged build never contains venv/ or
+# __pycache__/ in the first place (excluded at staging time), so without
+# excluding them here too, /MIR's delete pass would see the server's own
+# real venv/__pycache__ as "extra" (not in the source) and wipe them out
+# on every sync - forcing a full pip reinstall each time. /XD protects a
+# path from BOTH the copy and the delete pass, leaving anything already
+# there under those names completely untouched.
 
 # config.json is excluded from BOTH the copy AND the deletion pass (/XF
 # excludes a name from mirroring entirely) - the server keeps its own
@@ -102,9 +118,9 @@ venv\Scripts\pip install --upgrade pip
 venv\Scripts\pip install --no-deps -r requirements.txt
 
 # requirements.txt is a full `pip freeze` dump, so --no-deps skips
-# re-resolving each package's own dependency ranges (paddleocr declares
-# opencv-python<=4.6.0.66, which otherwise conflicts with the pinned
-# opencv-python==4.8.1.78 and fails with ResolutionImpossible).
+# re-resolving each package's own dependency ranges against each other -
+# do not drop it even though opencv-python is already pinned to match
+# paddleocr's declared ceiling (2.7.3 requires opencv-python<=4.6.0.66).
 # Requires Python 3.10.x (64-bit) - other versions have no matching
 # wheels for paddlepaddle/opencv. Verify with:
 venv\Scripts\python.exe --version

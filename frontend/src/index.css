@@ -49,23 +49,14 @@
   --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 16px rgba(0,0,0,.4);
   --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
 }
-/* Blue = white content with a Windows-blue (#0078D4) sidebar and accents. */
-:root[data-theme="blue"] {
-  --bg: #eef6fc; --surface: #ffffff; --surface-2: #f3f8fd;
-  --sidebar: #0078d4; --sidebar-2: #106ebe; --sidebar-text: #eaf3fb; --sidebar-muted: #a9cdea;
-  --text: #102a43; --muted: #5a7288; --border: #d5e4f2;
-  --primary: #0078d4; --primary-600: #106ebe; --primary-050: #eff6fc;
-  --shadow: 0 1px 2px rgba(0,120,212,.06), 0 4px 16px rgba(0,120,212,.10);
-  --shadow-sm: 0 1px 2px rgba(0,120,212,.10);
-}
-/* Dark Blue = white content with a deep-navy sidebar and accents. */
-:root[data-theme="darkblue"] {
-  --bg: #eef2fb; --surface: #ffffff; --surface-2: #f3f6fc;
-  --sidebar: #0b2a5b; --sidebar-2: #123a75; --sidebar-text: #dbe6fb; --sidebar-muted: #93aee0;
-  --text: #0b1f3f; --muted: #5a708f; --border: #d7e2f5;
-  --primary: #1d4ed8; --primary-600: #1e40af; --primary-050: #eaf1fd;
-  --shadow: 0 1px 2px rgba(29,78,216,.06), 0 4px 16px rgba(29,78,216,.10);
-  --shadow-sm: 0 1px 2px rgba(29,78,216,.10);
+/* Ocean Blue = white content with a deep-ocean-navy-to-teal sidebar and vivid ocean-blue accents. */
+:root[data-theme="oceanblue"] {
+  --bg: #eaf6fb; --surface: #ffffff; --surface-2: #eef8fc;
+  --sidebar: #003554; --sidebar-2: #006494; --sidebar-text: #e0f4ff; --sidebar-muted: #7fb3d5;
+  --text: #062c3f; --muted: #4d7a92; --border: #cfe8f5;
+  --primary: #0582ca; --primary-600: #006494; --primary-050: #e6f6fd;
+  --shadow: 0 1px 2px rgba(5,130,202,.06), 0 4px 16px rgba(5,130,202,.10);
+  --shadow-sm: 0 1px 2px rgba(5,130,202,.10);
 }
 
 .theme-select {

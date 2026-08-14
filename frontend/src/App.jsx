@@ -156,8 +156,7 @@ export default function App() {
               <option value="standard">Standard</option>
               <option value="light">Light</option>
               <option value="dark">Dark</option>
-              <option value="blue">Blue</option>
-              <option value="darkblue">Dark Blue</option>
+              <option value="oceanblue">Ocean Blue</option>
             </select>
           </label>
         </header>
