@@ -367,47 +367,61 @@ def _is_blank(value):
 # ---------------------------------------------------------------------------
 
 # JSON field names Service First (_HEADER_FROM_SF / _enrich_items in
-# service_api.py) populates. payment_terms_code/Due_Date are computed from
-# PaymentTermsName (SF) with a PDF/default fallback, but SF is the primary
-# driver when it's configured, so they're labeled Service First too.
+# service_api.py) populates directly.
 _SF_HEADER_FIELDS = {
     "Nav_VendorCode", "Pay_to_Vendor_No", "Location_Code", "Location_State_Code",
     "GST_Order_Address_State", "Buy_from_Vendor_No", "Currency_Code",
-    "Gen_Bus_Posting_Group", "PaymentTermsName", "payment_terms_code", "Due_Date",
+    "Gen_Bus_Posting_Group", "PaymentTermsName",
 }
 _SF_LINE_FIELDS = {
     "Nav_Item_No", "ProductNo", "PartSpecification", "HSN_Type",
     "HSN_Percentage_Description", "TaxPercentage", "GST_%", "Nav_Part_Description",
 }
 
+# JSON field names computed by processor.py's own business logic rather than
+# being a plain passthrough of any single source (payment_terms_code/
+# Due_Date combine PaymentTermsName (SF) with a PDF/default fallback through
+# resolve_payment_terms()/add_days_to_date() - neither SF nor PDF alone
+# determines the final value, the app's rule does).
+_SYSTEM_COMPUTED_FIELDS = {"payment_terms_code", "Due_Date"}
+
 # Columns whose value is a computed relationship key (see _link_override)
 # rather than a mapped JSON field or template static value — classified by
-# what actually determines them, ignoring any configured mapping.
+# what actually determines them, ignoring any configured mapping. "System"
+# for ones the app computes outright (a sequence number, a fixed constant,
+# BC relationship keys); "Template" only where a template's own static
+# value is genuinely the primary driver (with a hardcoded fallback used
+# solely when nothing was configured).
 _LINK_OVERRIDE_SOURCE = {
     ("Purchase Header", "Document Type"): "Template",
-    ("Purchase Header", "No."): "Template",
+    ("Purchase Header", "No."): "System",
     ("Purchase Line", "Document Type"): "Template",
-    ("Purchase Line", "Document No."): "Template",
-    ("Purchase Line", "Line No."): "PDF",
-    ("Reservation Entry", "Source Type"): "Template",
-    ("Reservation Entry", "Source Subtype"): "Template",
-    ("Reservation Entry", "Source ID"): "Template",
-    ("Reservation Entry", "Source Ref. No."): "PDF",
-    ("Reservation Entry", "Quantity"): "Template",
-    ("Reservation Entry", "Quantity (Base)"): "Template",
+    ("Purchase Line", "Document No."): "System",
+    ("Purchase Line", "Line No."): "System",
+    ("Reservation Entry", "Source Type"): "System",
+    ("Reservation Entry", "Source Subtype"): "System",
+    ("Reservation Entry", "Source ID"): "System",
+    ("Reservation Entry", "Source Ref. No."): "System",
+    ("Reservation Entry", "Quantity"): "System",
+    ("Reservation Entry", "Quantity (Base)"): "System",
 }
 
 
 def field_source(sheet, col, mapping=None):
-    """'Service First' / 'Template' / 'PDF' — where a Purchase Header/Line/
-    Reservation Entry column's value comes from, for the Dashboard's Fields
-    drill-down popup and the Template screen. A reservation row only exists
-    at all because of a Service First reservation, so any column actually
-    mapped there reads straight from that sf_item data (unlike Purchase
-    Line, its mapping specs aren't a PDF/SF mix — every mapped Reservation
-    Entry column is Service First). An unmapped column falls back to the
+    """'Service First' / 'Template' / 'PDF' / 'System' / 'None' — where a
+    Purchase Header/Line/Reservation Entry column's value comes from, for
+    the Dashboard's Fields drill-down popup and the Template screen.
+    'System' means the app computes it outright (a business rule, a
+    sequence number, a BC relationship key) rather than passing through any
+    single source untouched. A reservation row only exists at all because
+    of a Service First reservation, so any column actually mapped there
+    reads straight from that sf_item data (unlike Purchase Line, its
+    mapping specs aren't a PDF/SF mix — every mapped Reservation Entry
+    column is Service First). An unmapped column falls back to the
     business Template's static value; everything else is extracted straight
-    from the PDF.
+    from the PDF. ('None' — nothing populates it at all — is a Template-
+    screen-only refinement layered on top of this by the caller, since it
+    depends on whether a static value has actually been entered.)
     Sample: field_source('Purchase Header', 'Location Code')"""
     if col == "InvoiceNo":
         return "PDF"
@@ -420,6 +434,8 @@ def field_source(sheet, col, mapping=None):
     spec = (mapping.get(sheet) or {}).get(col, "")
     if not spec or spec.startswith("="):
         return "Template"
+    if spec in _SYSTEM_COMPUTED_FIELDS:
+        return "System"
     if sheet == "Reservation Entry":
         return "Service First"
     sf_fields = _SF_HEADER_FIELDS if sheet == "Purchase Header" else _SF_LINE_FIELDS

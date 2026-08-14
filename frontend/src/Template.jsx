@@ -72,10 +72,27 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
   const [values, setValues] = useState(() => {
     const v = {}; (sheets || []).forEach((s) => (v[s] = { ...(existing?.[s] || {}) })); return v;
   });
+  // Columns with no saved value (source "None") the user has explicitly
+  // opted to configure this session via the dropdown below - kept visible
+  // even while still blank, unlike every other "None" column which stays
+  // hidden until picked.
+  const [addedFields, setAddedFields] = useState({});
+  const [pendingField, setPendingField] = useState({});
   const [message, setMessage] = useState(null);
 
   const unmapped = (sheet) => (columns[sheet] || []).filter((c) => !(mapping[sheet] && mapping[sheet][c]));
   const setVal = (sheet, col, val) => setValues((v) => ({ ...v, [sheet]: { ...v[sheet], [col]: val } }));
+  const sourceOf = (sheet, col) => {
+    const base = (sources[sheet] || {})[col] || "Template";
+    const hasStatic = Boolean((values[sheet] || {})[col]);
+    return base === "Template" && !hasStatic ? "None" : base;
+  };
+  const addField = (sheet) => {
+    const col = pendingField[sheet];
+    if (!col) return;
+    setAddedFields((a) => ({ ...a, [sheet]: [...(a[sheet] || []), col] }));
+    setPendingField((p) => ({ ...p, [sheet]: "" }));
+  };
 
   const onSave = async () => {
     setMessage(null);
@@ -122,32 +139,49 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
       </div>
 
       {(sheets || []).map((sheet) => {
-        const cols = unmapped(sheet);
+        const added = addedFields[sheet] || [];
+        // On load, only columns that already have a saved value (source
+        // "Template") - blank/"None" columns stay hidden unless explicitly
+        // added below. Service First / PDF / System-computed columns are
+        // never shown at all, since a static value here can't affect them.
+        const rows = unmapped(sheet)
+          .filter((col) => sourceOf(sheet, col) === "Template" || added.includes(col))
+          .map((col) => ({ _key: col, column: col, source: sourceOf(sheet, col) }));
+
+        // Candidates for the dropdown: blank, not-yet-added "None" columns.
+        const noneOptions = unmapped(sheet).filter(
+          (col) => sourceOf(sheet, col) === "None" && !added.includes(col)
+        );
+
+        const addControls = (
+          <>
+            <select style={{ width: "auto", minWidth: 220 }}
+                    value={pendingField[sheet] || ""}
+                    onChange={(e) => setPendingField((p) => ({ ...p, [sheet]: e.target.value }))}>
+              <option value="">Add a field…</option>
+              {noneOptions.map((col) => <option key={col} value={col}>{col}</option>)}
+            </select>
+            <button className="btn btn-subtle btn-sm" onClick={() => addField(sheet)}
+                    disabled={!pendingField[sheet]}>+ Add</button>
+          </>
+        );
+
         return (
           <div className="card" key={sheet}>
-            <h3>{sheet} <span className="muted" style={{ fontWeight: 400, fontSize: 13 }}>({cols.length} unmapped)</span></h3>
+            <h3>{sheet} <span className="muted" style={{ fontWeight: 400, fontSize: 13 }}>({rows.length} configured)</span></h3>
+
             <DataTable
-              rows={cols.map((col) => {
-                const base = (sources[sheet] || {})[col] || "Template";
-                // A column that's neither mapped nor link-overridden shows
-                // as "Template" by default, but that's only a real source
-                // once a static value is actually entered here — until
-                // then, nothing populates it at all.
-                const hasStatic = Boolean((values[sheet] || {})[col]);
-                const source = base === "Template" && !hasStatic ? "None" : base;
-                return { _key: col, column: col, source };
-              })}
-              searchKeys={["column"]} empty="All columns are mapped."
+              rows={rows}
+              actions={addControls}
+              searchKeys={["column"]} empty="No configured static-value columns for this sheet yet — add one above."
               columns={[
                 { key: "column", label: "Column" },
                 { key: "source", label: "Source" },
                 { key: "value", label: "Static value", sortable: false,
                   render: (r) => (
-                    r.source === "Template" || r.source === "None"
-                      ? <input value={(values[sheet] || {})[r.column] || ""}
-                               onChange={(e) => setVal(sheet, r.column, e.target.value)}
-                               placeholder="static value" />
-                      : <span className="hint">Not used — value comes from {r.source}</span>
+                    <input value={(values[sheet] || {})[r.column] || ""}
+                           onChange={(e) => setVal(sheet, r.column, e.target.value)}
+                           placeholder="static value" />
                   ) },
               ]} />
           </div>

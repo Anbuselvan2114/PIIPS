@@ -46,6 +46,44 @@ Notes
   8 or higher indicates a real copy failure worth investigating.
 
 ========================================================
+PART 1b - Day-to-day: sync a Publish-staged build to the server
+========================================================
+
+After the Publish menu (Super Admin) stages a fresh build locally in
+D:\WorkSpace\Projects\Python\PIIPS_Published\<uat|live>, copy THAT folder
+onto the real server - not the repo root again. Use /MIR (mirror), not a
+plain copy: a plain overwrite-copy leaves stale files behind (old
+content-hashed JS bundle filenames, or a skipped index.html if some tool
+silently avoided overwriting an existing file), which is why "delete
+everything then copy" was needed by hand before. /MIR automates exactly
+that - it copies new/changed files AND deletes anything in the destination
+that's no longer in the source, in one step, so nothing stale is ever left
+lying around.
+
+$StagedBuild = "D:\WorkSpace\Projects\Python\PIIPS_Published\uat"
+$Destination = "E:\PIIPS_Application"      # <-- EDIT THIS to the real server path
+                                            #     (run locally if RDP'd into the
+                                            #     server, or as a UNC path like
+                                            #     \\10.0.1.210\E$\PIIPS_Application
+                                            #     if copying over the network)
+
+robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 `
+    /XF "config.json" "config_nonencrypted.json" "*.log"
+
+# config.json is excluded from BOTH the copy AND the deletion pass (/XF
+# excludes a name from mirroring entirely) - the server keeps its own
+# DPAPI-encrypted connection string, never overwritten by this sync.
+# robocopy exit codes 0-7 mean success; 8+ is a real failure.
+
+Restart-Service PIIPS_Backend
+Start-Sleep -Seconds 15
+Invoke-RestMethod http://127.0.0.1:8000/health   # expect {"status":"Healthy"}
+
+# Then hard-refresh the browser (Ctrl+F5) or open a private window - and if
+# it's still stale after that, unregister the service worker once (F12 ->
+# Application -> Service Workers -> Unregister, or Clear site data).
+
+========================================================
 PART 2 - Set up and host under IIS on the destination server
 ========================================================
 

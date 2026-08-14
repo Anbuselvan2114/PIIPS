@@ -27,7 +27,7 @@ export function Logo({ size = 40 }) {
 // Generic table: search box, click-to-sort headers, 10-row pagination.
 // columns: [{ key, label, render?(row), sortable? }]
 export function DataTable({ columns, rows, searchKeys, pageSize = 10,
-                            pageSizeOptions, empty }) {
+                            pageSizeOptions, empty, actions }) {
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState(null);
   const [sortDir, setSortDir] = useState("asc");
@@ -71,14 +71,26 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
 
   useEffect(() => { setPage(0); }, [query, rows, size]);
 
-  if (!rows.length) return <div className="empty">{empty || "No rows."}</div>;
+  const searchRow = (
+    <div style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+      <input className="input" placeholder="Search…" value={query}
+             onChange={(e) => setQuery(e.target.value)} style={{ maxWidth: 260 }} />
+      {actions}
+    </div>
+  );
+
+  if (!rows.length) {
+    return (
+      <div>
+        {actions && searchRow}
+        <div className="empty">{empty || "No rows."}</div>
+      </div>
+    );
+  }
 
   return (
     <div>
-      <div style={{ marginBottom: 10 }}>
-        <input className="input" placeholder="Search…" value={query}
-               onChange={(e) => setQuery(e.target.value)} style={{ maxWidth: 260 }} />
-      </div>
+      {searchRow}
       <div className="table-wrap">
         <table className="tbl">
           <thead>
