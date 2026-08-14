@@ -237,6 +237,12 @@ export default function Dashboard({ user }) {
     (user?.user_type || "").toLowerCase()
   );
 
+  // The Fields drill-down button is for anyone who administers data
+  // (Super Admin + Admin), unlike the INCOMPLETE DATA/NEW TEMPLATE label
+  // swap below, which is specifically about hiding technical status names
+  // from non-admin roles.
+  const canViewFields = isSuperAdmin || (user?.user_type || "").toLowerCase() === "admin";
+
   // Non-super-admins see "INCOMPLETE DATA" relabeled as "NEW TEMPLATE"
   // everywhere it's displayed (chart, breakdown, invoice lists) — the
   // underlying status name/logic is unchanged, this is display-only.
@@ -250,7 +256,7 @@ export default function Dashboard({ user }) {
     { key: "invoice_type", label: "Invoice Type" },
     { key: "status", label: "Status", render: (row) => displayStatus(row.status) },
     { key: "batch", label: "Batch" },
-    ...(isSuperAdmin ? [{ key: "_fields", label: "", sortable: false,
+    ...(canViewFields ? [{ key: "_fields", label: "", sortable: false,
       render: (row) => row.header_id ? (
         <button className="btn btn-subtle btn-sm" onClick={() => openFieldCheck(row)}>
           Fields

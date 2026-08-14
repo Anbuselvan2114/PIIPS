@@ -16,10 +16,10 @@ output/
 *.log
 
 # Sample invoice PDFs and generated manuals — not tracked in git
+# (PIIPS_UAT_Deployment_Guide.pdf is the exception - tracked deliberately)
 sample_input/
 manuals/
 PIIPS_Developer_Manual.pdf
-PIIPS_UAT_Deployment_Guide.pdf
 PIIPS_User_Manual_Accounts.pdf
 PIIPS_User_Manual_Admin.pdf
 PIIPS_User_Manual_Super_Admin.pdf
