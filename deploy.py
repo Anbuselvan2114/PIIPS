@@ -11,16 +11,19 @@ runbook) - this used to also do that part automatically over the target's
 admin share, but that requires the PIIPS_Backend service account to be a
 local admin on the target machine, which isn't set up everywhere yet.
 
-Publishing to UAT first commits+pushes whatever is currently sitting
-uncommitted in this working copy onto 'Development' (a safety net so local
-edits are never silently dropped by branch switches), then merges
-'Development' into 'uat' - so Publish-to-UAT always deploys the very latest
-local edits, not just whatever 'uat' already had.
+Publishing to UAT commits+pushes whatever is currently sitting uncommitted
+in this working copy onto 'Development' (a safety net so local edits are
+never silently dropped by branch switches), pulls 'Development', then
+builds and copies straight from there - so Publish-to-UAT always deploys
+the very latest local work. It does NOT merge anything into the 'uat' git
+branch anymore - that branch is only touched by whoever/whatever promotes
+to Live, separately from this.
 
-Publishing to Live does NOT touch Development or re-merge anything - it is
-a pure promotion of whatever 'uat' already has, deployed as-is. This means
-new work always lands on UAT first; Live only ever gets what's already been
-promoted into 'uat'.
+Publishing to Live does NOT touch Development at all - it is a pure
+promotion of whatever the 'uat' git branch already has, deployed as-is.
+Since Publish-to-UAT no longer updates that branch, something else (a
+manual merge, or a future promote step) has to move Development's work
+into 'uat' before Live will ever see it.
 
 'live' currently publishes from the 'uat' git branch itself (the 'live'
 branch has no app code merged into it yet) - update BRANCH_FOR_ENV once
@@ -33,7 +36,7 @@ import subprocess
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PUBLISHED_ROOT = r"D:\WorkSpace\Projects\Python\PIIPS_Published"
 
-BRANCH_FOR_ENV = {"uat": "uat", "live": "uat"}
+BRANCH_FOR_ENV = {"uat": "Development", "live": "uat"}
 
 _ROBOCOPY_XD = [
     ".git", ".claude", "venv", ".venv", "__pycache__", "node_modules",
@@ -90,20 +93,6 @@ def _push_local_changes_to_development(log):
         log.append("[WARNING] git push to Development failed - commit is local-only for now.")
 
 
-def _merge_development_into_uat(log):
-    """Fast-forward/merge 'Development' into 'uat' so a Publish run always
-    deploys the very latest local edits, not just whatever 'uat' already
-    had. A merge conflict is a real stop - it means someone needs to
-    resolve it by hand, so this does NOT swallow that failure. Pushing the
-    merge back to origin is best-effort like the other pushes above."""
-    _run(["git", "checkout", "uat"], BASE_DIR, log)
-    _run(["git", "merge", "Development", "--no-edit"], BASE_DIR, log)
-    try:
-        _run(["git", "push", "origin", "uat"], BASE_DIR, log)
-    except PublishError:
-        log.append("[WARNING] git push to uat failed - merge is local-only for now.")
-
-
 def publish(environment, published_root=None):
     """Push local edits to Development, pull the mapped branch, rebuild the
     frontend, and copy the result into <published_root>/<environment> on
@@ -122,14 +111,14 @@ def publish(environment, published_root=None):
     log = [f"Publishing '{environment}' from branch '{branch}' to {dest} (local only)"]
 
     if environment == "uat":
-        # UAT is where fresh local edits land: back them up onto Development,
-        # then promote Development into uat, so Publish-to-UAT always
-        # deploys the very latest local work.
+        # UAT builds straight from Development: back up whatever's sitting
+        # uncommitted here, then the checkout+pull below (branch=
+        # "Development") picks it right back up.
         _push_local_changes_to_development(log)
-        _merge_development_into_uat(log)
     else:
-        # Live is a pure promotion of whatever uat already has - it must
-        # never pull in edits Development/uat haven't been through first.
+        # Live is a pure promotion of whatever the uat branch already has -
+        # it must never pull in edits Development hasn't been promoted
+        # through first.
         log.append("Live publish does not touch Development - deploying uat as-is.")
 
     _run(["git", "checkout", branch], BASE_DIR, log)
