@@ -33,6 +33,12 @@ DEFAULT_CONFIG = {
     # Base URL of the Service First / NAV backend that supplies reservation
     # (spare-purchase) and HSN details. e.g. "http://10.0.1.x:port".
     "sf_api_url": "",
+    # Local folder the Publish feature (Super Admin > Manual > Publish)
+    # stages a built UAT/Live copy into - see deploy.py.
+    "publish_root": "",
+    # {"uat"|"live": {"at": iso-str, "by": username, "status": "Success"|"Failed"}}
+    # - last Publish outcome per environment, shown on the Publish page.
+    "publish_status": {},
 }
 
 # Legacy keys that used to hold folder paths; migrated into folder_path.

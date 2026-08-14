@@ -1,13 +1,15 @@
 """
 Publish orchestration for the Super-Admin "Publish" feature.
 
-Runs ON the machine that hosts this backend (today: the dev machine), and
-reaches OUT to the registered UAT/Live server over its admin share + remote
-service control - the same robocopy + sc.exe steps documented in
-Deploy_To_Network.txt, just triggered from the app instead of typed by hand.
-That machine's account (whatever runs the PIIPS_Backend Windows service)
-must already have admin rights on the target servers, and git/npm must be
-on its PATH - this module assumes both, it does not set either up.
+Runs ON the machine that hosts this backend (today: the dev machine). It
+pulls/merges the right git branch, rebuilds the frontend, and copies the
+result into a LOCAL staging folder under PUBLISHED_ROOT (one subfolder per
+environment) - it does NOT touch any remote server or restart any service.
+Moving a staged build onto the actual UAT/Live server, and restarting it
+there, is a manual step for now (see Deploy_To_Network.txt for that
+runbook) - this used to also do that part automatically over the target's
+admin share, but that requires the PIIPS_Backend service account to be a
+local admin on the target machine, which isn't set up everywhere yet.
 
 Publishing to UAT first commits+pushes whatever is currently sitting
 uncommitted in this working copy onto 'Development' (a safety net so local
@@ -27,10 +29,9 @@ real releases start landing on 'live'.
 
 import os
 import subprocess
-import time
-import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_PUBLISHED_ROOT = r"D:\WorkSpace\Projects\Python\PIIPS_Published"
 
 BRANCH_FOR_ENV = {"uat": "uat", "live": "uat"}
 
@@ -103,20 +104,22 @@ def _merge_development_into_uat(log):
         log.append("[WARNING] git push to uat failed - merge is local-only for now.")
 
 
-def publish(environment, server):
+def publish(environment, published_root=None):
     """Push local edits to Development, pull the mapped branch, rebuild the
-    frontend, copy to `server` (a dict from database.get_deploy_server) and
-    restart it there.
+    frontend, and copy the result into <published_root>/<environment> on
+    this machine (published_root defaults to DEFAULT_PUBLISHED_ROOT). Does
+    not touch any remote server or service.
 
     Returns the full log text on success; raises PublishError (whose
     message IS the log so far) on the first failed step.
-    Sample: publish('uat', database.get_deploy_server('uat'))
+    Sample: publish('uat', r'D:\\PIIPS_Published')
     """
     branch = BRANCH_FOR_ENV.get(environment)
     if not branch:
         raise PublishError(f"No git branch mapped for environment '{environment}'.")
 
-    log = [f"Publishing '{environment}' from branch '{branch}' to {server['ServerHost']}"]
+    dest = os.path.join(published_root or DEFAULT_PUBLISHED_ROOT, environment)
+    log = [f"Publishing '{environment}' from branch '{branch}' to {dest} (local only)"]
 
     if environment == "uat":
         # UAT is where fresh local edits land: back them up onto Development,
@@ -150,37 +153,14 @@ def publish(environment, server):
     _run(["npm.cmd", "install"], frontend_dir, log)
     _run(["npm.cmd", "run", "build"], frontend_dir, log)
 
+    os.makedirs(dest, exist_ok=True)
     robocopy_cmd = (
-        ["robocopy", BASE_DIR, server["FolderPath"], "/E", "/XJ",
+        ["robocopy", BASE_DIR, dest, "/E", "/XJ",
          "/R:2", "/W:5", "/MT:8", "/XD", *_ROBOCOPY_XD, "/XF", *_ROBOCOPY_XF]
     )
     # robocopy's own exit codes: 0-7 = success (bit flags for what changed),
     # 8+ = real failure. Not a normal 0-only process exit code.
     _run(robocopy_cmd, BASE_DIR, log, allow_returncodes=range(0, 8))
 
-    host = server["ServerHost"]
-    service = server["ServiceName"] or "PIIPS_Backend"
-    _run(["sc.exe", f"\\\\{host}", "stop", service], BASE_DIR, log, allow_returncodes=(0, 1062))
-    time.sleep(3)
-    _run(["sc.exe", f"\\\\{host}", "start", service], BASE_DIR, log)
-
-    port = server.get("Port")
-    if port:
-        log.append("Waiting for the service to come back up...")
-        url = f"http://{host}:{port}/health"
-        ok = False
-        for _ in range(10):
-            time.sleep(3)
-            try:
-                with urllib.request.urlopen(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        log.append(f"Health check OK: {url}")
-                        ok = True
-                        break
-            except Exception as exc:  # noqa: BLE001
-                log.append(f"  ({exc})")
-        if not ok:
-            log.append(f"[WARNING] {url} did not respond healthy in time - verify manually.")
-
-    log.append("Publish complete.")
+    log.append(f"Publish complete - staged at {dest}. Move it to the real server by hand.")
     return "\n".join(log)

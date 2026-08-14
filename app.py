@@ -334,14 +334,9 @@ def save_db_config(payload: DbConfigModel):
     return {"ok": True, "db_configured": True}
 
 
-class DeployServerModel(BaseModel):
+class PublishConfigModel(BaseModel):
     user_id: Optional[int] = None
-    environment: str                      # "uat" | "live"
-    server_host: str
-    folder_path: str                      # UNC path, e.g. \\10.0.1.213\D$\PIIPS_UAT
-    site_name: Optional[str] = ""
-    service_name: Optional[str] = "PIIPS_Backend"
-    port: Optional[int] = None
+    publish_root: str
 
 
 class PublishModel(BaseModel):
@@ -352,32 +347,23 @@ class PublishModel(BaseModel):
 _DEPLOY_ENVIRONMENTS = {"uat", "live"}
 
 
-@app.get("/api/deploy/servers")
-def list_deploy_servers(user_id: Optional[int] = None):
-    import database
+@app.get("/api/publish-config")
+def get_publish_config(user_id: Optional[int] = None):
     _require_developer(user_id)
-    return {"servers": database.list_deploy_servers()}
+    cfg = config_store.load_config()
+    return {
+        "publish_root": cfg.get("publish_root") or "",
+        "status": cfg.get("publish_status") or {},
+    }
 
 
-@app.post("/api/deploy/servers")
-def save_deploy_server(payload: DeployServerModel):
-    import database
+@app.post("/api/publish-config")
+def save_publish_config(payload: PublishConfigModel):
     _require_developer(payload.user_id)
-
-    environment = (payload.environment or "").strip().lower()
-    if environment not in _DEPLOY_ENVIRONMENTS:
-        raise HTTPException(status_code=400, detail="environment must be 'uat' or 'live'.")
-
-    host = (payload.server_host or "").strip()
-    folder = (payload.folder_path or "").strip()
-    if not host or not folder:
-        raise HTTPException(status_code=400, detail="Server host and folder path are required.")
-
-    database.upsert_deploy_server(
-        environment, host, folder, (payload.site_name or "").strip(),
-        (payload.service_name or "PIIPS_Backend").strip(), payload.port,
-        payload.user_id,
-    )
+    root = (payload.publish_root or "").strip()
+    if not root:
+        raise HTTPException(status_code=400, detail="Root path is required.")
+    config_store.save_config({"publish_root": root})
     return {"ok": True}
 
 
@@ -385,6 +371,7 @@ def save_deploy_server(payload: DeployServerModel):
 def publish_deploy(payload: PublishModel):
     import database
     import deploy
+    from datetime import datetime, timezone
 
     _require_developer(payload.user_id)
 
@@ -392,23 +379,30 @@ def publish_deploy(payload: PublishModel):
     if environment not in _DEPLOY_ENVIRONMENTS:
         raise HTTPException(status_code=400, detail="environment must be 'uat' or 'live'.")
 
-    server = database.get_deploy_server(environment)
-    if not server:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No server is registered for '{environment}' yet. Register it first.",
-        )
+    root = (config_store.load_config().get("publish_root") or "").strip()
+    who = database.get_username_and_role(payload.user_id) or {}
+
+    def _record(status, log):
+        cfg = config_store.load_config()
+        publish_status = dict(cfg.get("publish_status") or {})
+        publish_status[environment] = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "by": who.get("username") or f"user #{payload.user_id}",
+            "status": status,
+            "log": log,
+        }
+        config_store.save_config({"publish_status": publish_status})
 
     try:
-        log = deploy.publish(environment, server)
+        log = deploy.publish(environment, root or None)
     except deploy.PublishError as exc:
-        database.record_publish_result(environment, "Failed", str(exc), payload.user_id)
+        _record("Failed", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
-        database.record_publish_result(environment, "Failed", str(exc), payload.user_id)
+        _record("Failed", str(exc))
         raise HTTPException(status_code=500, detail=f"Publish failed: {exc}")
 
-    database.record_publish_result(environment, "Success", log, payload.user_id)
+    _record("Success", log)
     return {"ok": True, "log": log}
 
 
