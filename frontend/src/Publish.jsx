@@ -1,7 +1,22 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getDeployServers, saveDeployServer, publishDeploy } from "./api";
 
 const BLANK = { server_host: "", folder_path: "", site_name: "", service_name: "PIIPS_Backend", port: "" };
+
+// Publish runs several minutes of real work (git, npm install/build,
+// robocopy, remote restart) behind one blocking request - the backend has
+// no step-by-step progress API, so this is a timed approximation of where
+// it's likely at, not a true percentage. It always jumps to 100% (or the
+// failed state) the moment the real request actually resolves.
+const PUBLISH_STAGES = [
+  { label: "Checking out branch…", percent: 8 },
+  { label: "Pulling latest…", percent: 18 },
+  { label: "Installing frontend dependencies…", percent: 35 },
+  { label: "Building frontend…", percent: 55 },
+  { label: "Copying files to server…", percent: 80 },
+  { label: "Restarting service & health check…", percent: 92 },
+];
+const PUBLISH_STAGE_MS = 6000;
 
 function EnvironmentCard({ environment, label, userId, saved, onSaved }) {
   const [form, setForm] = useState(BLANK);
@@ -9,6 +24,9 @@ function EnvironmentCard({ environment, label, userId, saved, onSaved }) {
   const [publishing, setPublishing] = useState(false);
   const [message, setMessage] = useState(null);
   const [log, setLog] = useState(null);
+  const [stageIdx, setStageIdx] = useState(0);
+  const [failed, setFailed] = useState(false);
+  const timerRef = useRef(null);
 
   useEffect(() => {
     if (saved) {
@@ -45,20 +63,32 @@ function EnvironmentCard({ environment, label, userId, saved, onSaved }) {
     }
   };
 
+  useEffect(() => () => clearInterval(timerRef.current), []);
+
   const onPublish = async () => {
-    setPublishing(true); setMessage(null); setLog(null);
+    setPublishing(true); setMessage(null); setLog(null); setFailed(false); setStageIdx(0);
+    timerRef.current = setInterval(() => {
+      setStageIdx((i) => Math.min(i + 1, PUBLISH_STAGES.length - 1));
+    }, PUBLISH_STAGE_MS);
+
     try {
       const r = await publishDeploy(environment, userId);
+      clearInterval(timerRef.current);
+      setStageIdx(PUBLISH_STAGES.length - 1);
       setLog(r.log);
       setMessage({ ok: true, text: "Publish complete." });
       onSaved();
     } catch (e) {
+      clearInterval(timerRef.current);
+      setFailed(true);
       setLog(e.message);
       setMessage({ ok: false, text: "Publish failed." });
     } finally {
       setPublishing(false);
     }
   };
+
+  const stagePercent = failed ? 100 : PUBLISH_STAGES[stageIdx].percent;
 
   const registered = Boolean(saved);
 
@@ -98,8 +128,18 @@ function EnvironmentCard({ environment, label, userId, saved, onSaved }) {
 
       <button className="btn btn-primary" onClick={onPublish}
               disabled={!registered || publishing} style={{ marginLeft: 8 }}>
-        {publishing ? "Publishing… (can take a few minutes)" : `Publish to ${label}`}
+        {publishing ? "Publishing…" : `Publish to ${label}`}
       </button>
+
+      {publishing && (
+        <div style={{ marginTop: 12 }}>
+          <div className="progress-meta">
+            <span>{PUBLISH_STAGES[stageIdx].label}</span>
+            <span>{stagePercent}%</span>
+          </div>
+          <div className="progress"><div className="progress-bar" style={{ width: `${stagePercent}%` }} /></div>
+        </div>
+      )}
 
       {saved?.LastPublishedDatetime && (
         <div className="hint" style={{ marginTop: 8 }}>
