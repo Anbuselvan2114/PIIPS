@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+venv/
+.venv/
+
+# Runtime / generated
+config.json
+config_nonencrypted.json
+format_model.json
+model_backups/
+New_Format/
+output/
+*.log
+
+# Sample invoice PDFs and generated manuals — not tracked in git
+# (PIIPS_UAT_Deployment_Guide.pdf is the exception - tracked deliberately)
+sample_input/
+manuals/
+PIIPS_Developer_Manual.pdf
+PIIPS_User_Manual_Accounts.pdf
+PIIPS_User_Manual_Admin.pdf
+PIIPS_User_Manual_Super_Admin.pdf
+PIIPS_User_Manual_User.pdf
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local Claude Code tooling (not part of the application)
+.claude/

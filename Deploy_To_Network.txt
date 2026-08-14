@@ -1,0 +1,338 @@
+PIIPS - Copy project to a network machine (PowerShell)
+========================================================
+
+Edit $Destination below to the real target first (this is a DUMMY
+placeholder IP/share - replace it with the actual server path, e.g.
+\\10.0.1.213\D$\PIIPS):
+
+    $Destination = "\\10.0.0.99\D$\PIIPS"
+
+Then run the block below from the project root
+(D:\WorkSpace\Projects\Python\PIIPS) in PowerShell.
+
+------------------------------------------------------------------
+$Source      = "D:\WorkSpace\Projects\Python\PIIPS"
+$Destination = "\\10.0.0.99\D$\PIIPS"        # <-- EDIT THIS
+
+if (-not (Test-Path $Destination)) {
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+}
+
+# Mirrors $Source -> $Destination, excluding local-only / generated /
+# machine-specific folders and files that must NOT travel to another
+# machine (see notes below). Re-run any time to sync just the changes.
+robocopy $Source $Destination /E /XJ /R:2 /W:5 /MT:8 `
+    /XD ".git" ".claude" "venv" ".venv" "__pycache__" "node_modules" "dist" `
+        "logs" "output" "New_Format" "model_backups" "old" `
+    /XF "config.json" "*.log" "*.pyc"
+
+------------------------------------------------------------------
+Notes
+------------------------------------------------------------------
+- config.json is deliberately excluded: its db_connection string is
+  encrypted with Windows DPAPI in LOCAL_MACHINE scope, so a copy taken
+  on this machine cannot be decrypted on the destination machine. On
+  the destination, open the app's Database Configuration screen once
+  and re-enter the connection details there instead.
+- venv/ and frontend/node_modules/ are excluded because they are
+  environment-specific; reinstall them on the destination with
+  `pip install -r <deps>` / `npm install` per the deployment guide
+  (PIIPS_UAT_Deployment_Guide.pdf) instead of copying them.
+- frontend/dist/ is excluded because it's a build output; rebuild on
+  the destination with `npm run build`, or remove it from /XD above if
+  you specifically want to ship a pre-built bundle instead of building
+  on the target machine.
+- robocopy exit codes 0-7 mean success (see `robocopy /?`); anything
+  8 or higher indicates a real copy failure worth investigating.
+
+========================================================
+PART 1b - Day-to-day: sync a Publish-staged build to the server
+========================================================
+
+After the Publish menu (Super Admin) stages a fresh build locally in
+D:\WorkSpace\Projects\Python\PIIPS_Published\<uat|live>, copy THAT folder
+onto the real server - not the repo root again. Use /MIR (mirror), not a
+plain copy: a plain overwrite-copy leaves stale files behind (old
+content-hashed JS bundle filenames, or a skipped index.html if some tool
+silently avoided overwriting an existing file), which is why "delete
+everything then copy" was needed by hand before. /MIR automates exactly
+that - it copies new/changed files AND deletes anything in the destination
+that's no longer in the source, in one step, so nothing stale is ever left
+lying around.
+
+$StagedBuild = "D:\WorkSpace\Projects\Python\PIIPS_Published\uat"
+$Destination = "E:\PIIPS_Application"      # <-- EDIT THIS to the real server path
+                                            #     (run locally if RDP'd into the
+                                            #     server, or as a UNC path like
+                                            #     \\10.0.1.210\E$\PIIPS_Application
+                                            #     if copying over the network)
+
+robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 `
+    /XF "config.json" "config_nonencrypted.json" "*.log"
+
+# config.json is excluded from BOTH the copy AND the deletion pass (/XF
+# excludes a name from mirroring entirely) - the server keeps its own
+# DPAPI-encrypted connection string, never overwritten by this sync.
+# robocopy exit codes 0-7 mean success; 8+ is a real failure.
+
+Restart-Service PIIPS_Backend
+Start-Sleep -Seconds 15
+Invoke-RestMethod http://127.0.0.1:8000/health   # expect {"status":"Healthy"}
+
+# Then hard-refresh the browser (Ctrl+F5) or open a private window - and if
+# it's still stale after that, unregister the service worker once (F12 ->
+# Application -> Service Workers -> Unregister, or Clear site data).
+
+========================================================
+PART 2 - Set up and host under IIS on the destination server
+========================================================
+
+Everything below runs ON the destination server itself (e.g. via RDP),
+as Administrator, after the robocopy step above has copied the files.
+Adjust $AppPath / port 8080 / service name for your environment - the
+example below uses E:\PIIPS_Application as the destination path.
+
+------------------------------------------------------------------
+2.1 Python environment
+------------------------------------------------------------------
+$AppPath = "E:\PIIPS_Application"        # <-- EDIT THIS to match $Destination above
+
+cd $AppPath
+python -m venv venv
+venv\Scripts\pip install --upgrade pip
+venv\Scripts\pip install --no-deps -r requirements.txt
+
+# requirements.txt is a full `pip freeze` dump, so --no-deps skips
+# re-resolving each package's own dependency ranges (paddleocr declares
+# opencv-python<=4.6.0.66, which otherwise conflicts with the pinned
+# opencv-python==4.8.1.78 and fails with ResolutionImpossible).
+# Requires Python 3.10.x (64-bit) - other versions have no matching
+# wheels for paddlepaddle/opencv. Verify with:
+venv\Scripts\python.exe --version
+
+# Verify the app imports cleanly before continuing:
+venv\Scripts\python.exe -c "import app; print('OK')"
+
+------------------------------------------------------------------
+2.2 Build the frontend (skip if you copied a pre-built frontend/dist)
+------------------------------------------------------------------
+cd $AppPath\frontend
+npm install
+npm run build
+
+------------------------------------------------------------------
+2.3 Install the backend as a Windows Service (NSSM)
+------------------------------------------------------------------
+cd $AppPath\required_softwares\nssm-2.24\win64
+
+New-Item -ItemType Directory -Path "$AppPath\logs" -Force | Out-Null
+
+.\nssm.exe install PIIPS_Backend "$AppPath\venv\Scripts\python.exe" "-m uvicorn main:app --host 127.0.0.1 --port 8000"
+.\nssm.exe set PIIPS_Backend AppDirectory "$AppPath"
+.\nssm.exe set PIIPS_Backend Start SERVICE_AUTO_START
+.\nssm.exe set PIIPS_Backend AppStdout "$AppPath\logs\service_stdout.log"
+.\nssm.exe set PIIPS_Backend AppStderr "$AppPath\logs\service_stderr.log"
+.\nssm.exe set PIIPS_Backend AppExit Default Restart
+
+net start PIIPS_Backend
+
+# Confirm it's healthy (first start can take 15-30s while PaddleOCR
+# initialises - retry a few times before assuming a failure):
+Invoke-RestMethod http://127.0.0.1:8000/health   # expect {"status":"Healthy"}
+
+------------------------------------------------------------------
+2.4 Configure the IIS reverse-proxy site
+------------------------------------------------------------------
+# Prerequisite (one-time): IIS with URL Rewrite + Application Request
+# Routing installed - installers are bundled in required_softwares\
+# (rewrite_amd64_en-US.msi, requestRouter_amd64.msi).
+
+# Check what ports/sites already exist before picking one for PIIPS -
+# it must not collide with another site already on this server:
+Import-Module WebAdministration
+Get-Website | Select-Object Name, State,
+    @{n='Bindings';e={($_.bindings.Collection | ForEach-Object { $_.bindingInformation }) -join '; '}}
+netstat -ano | findstr LISTENING
+
+# Enable ARR proxying, one-time server-wide (no-op if another site on
+# this server already proxies via ARR). Without this, the rewrite rule
+# below fails with HTTP Error 404.4 / error code 0x8007007b (IIS treats
+# the rewritten http://127.0.0.1:8000/... target as a literal file path
+# instead of proxying to it, and falls back to the static-file handler).
+& "$env:windir\System32\inetsrv\appcmd.exe" set config -section:system.webServer/proxy /enabled:"True" /commit:apphost
+iisreset
+# If appcmd errors with "Unrecognized configuration section
+# system.webServer/proxy", ARR itself isn't installed - run
+# required_softwares\requestRouter_amd64.msi, then rerun the two lines above.
+# (GUI equivalent: IIS Manager -> server node (top level) -> Application
+# Request Routing Cache -> Server Proxy Settings... -> check "Enable proxy".)
+
+# Create a dedicated No-Managed-Code app pool + site:
+New-WebAppPool -Name "PIIPS_AI" -Force
+Set-ItemProperty "IIS:\AppPools\PIIPS_AI" -Name managedRuntimeVersion -Value ""
+
+New-Website -Name "PIIPS_AI" `
+    -PhysicalPath $AppPath `
+    -Port 8080 `
+    -ApplicationPool "PIIPS_AI" -Force
+
+# If the site already exists on a different port (e.g. it was created
+# earlier as 5000 and now needs to move to 8080), rebind it instead of
+# recreating it:
+Set-WebBinding -Name "PIIPS_AI" -BindingInformation "*:5000:" -PropertyName "Port" -Value 8080
+Get-WebBinding -Name "PIIPS_AI"
+Restart-WebItem "IIS:\Sites\PIIPS_AI"
+
+# $AppPath already contains a web.config with the reverse-proxy rule
+# targeting http://127.0.0.1:8000 - it must match the --port used in
+# the nssm.exe install command above (2.3). If it doesn't match, edit
+# web.config's rewrite rule accordingly.
+
+# Open the site's port on Windows Firewall - without this, the site
+# loads fine from the server itself (localhost/127.0.0.1) but times out
+# from every other machine, since IIS is listening but nothing lets
+# inbound traffic reach it:
+New-NetFirewallRule -DisplayName "PIIPS IIS 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow
+
+------------------------------------------------------------------
+2.5 Verification / smoke test
+------------------------------------------------------------------
+Get-Service PIIPS_Backend                                    # expect Running
+Get-Website -Name "PIIPS_AI"                                 # expect Started
+Invoke-RestMethod http://127.0.0.1:8000/health                # expect {"status":"Healthy"}
+Invoke-WebRequest http://localhost:8080/health -UseBasicParsing  # expect HTTP 200
+
+# From a DIFFERENT machine (not the server itself), confirm the port is
+# actually reachable from outside before assuming the app is broken:
+Test-NetConnection <uat-server-ip> -Port 8080
+
+# Then open http://<destination-server>:8080 in a browser, log in, and:
+# - Database Configuration: re-enter the connection string (see note above
+#   re: config.json / DPAPI) and confirm the connection test succeeds.
+# - Folder Configuration: confirm/set the base data folder path.
+# - Process one sample PDF end-to-end and confirm it completes without errors.
+
+------------------------------------------------------------------
+2.6 Quick command reference (day-to-day)
+------------------------------------------------------------------
+Get-Service PIIPS_Backend
+Restart-Service PIIPS_Backend
+Get-Website -Name "PIIPS_AI"
+Restart-WebItem "IIS:\Sites\PIIPS_AI"
+Get-Content $AppPath\logs\service_stdout.log -Tail 50
+Get-Content $AppPath\logs\service_stderr.log -Tail 50
+
+------------------------------------------------------------------
+Common problems
+------------------------------------------------------------------
+
+--- 502.3 Bad Gateway right after a service (re)start ---
+Uvicorn/PaddleOCR is still initialising (10-30s) - wait and retry.
+
+--- 502.3 Bad Gateway persistently ---
+ARR proxy not enabled, or backend not listening on the port
+web.config targets. Re-run the ARR-enable commands in 2.4, and verify
+the backend directly:
+Invoke-RestMethod http://127.0.0.1:8000/health
+
+--- HTTP 404.4 (Handler: StaticFile, error code 0x8007007b) on the
+    site's own port, e.g. http://localhost:8080/ ---
+ARR proxy isn't enabled, so the rewrite rule's target URL is treated as
+a literal file path instead of being proxied. Fix (see 2.4):
+& "$env:windir\System32\inetsrv\appcmd.exe" set config -section:system.webServer/proxy /enabled:"True" /commit:apphost
+iisreset
+
+--- "New-Website ... used by another process" ---
+The chosen port is already bound. Identify what's using it:
+netstat -ano | findstr :<port>
+Get-Process -Id <PID_FROM_ABOVE>
+# Also check for a reserved/excluded range (common with Hyper-V/containers,
+# can claim a port with nothing showing as LISTENING):
+netsh interface ipv4 show excludedportrange protocol=tcp
+# Then either pick a free port, or rebind the existing site (see 2.4's
+# Set-WebBinding example) - if you change the port, update web.config's
+# rewrite rule to match if the *backend* port changed too.
+
+--- Login fails with: Database error: db_connection is not configured
+    (server/database missing) ---
+config.json's db_connection is either empty, or still holds the DPAPI-
+encrypted blob copied from another machine (it cannot be decrypted on
+this server - see the Notes in Part 1). Fix on THIS server by setting a
+plaintext connection string directly in config.json - do it via
+PowerShell (safer than notepad, avoids encoding/formatting mistakes):
+$configPath = "E:\PIIPS_Application\config.json"
+$config = Get-Content $configPath -Raw | ConvertFrom-Json
+$config.db_connection = "Server=<host>;Database=<db>;User Id=<user>;Password=<password>;"
+$config | ConvertTo-Json | Set-Content $configPath -Encoding utf8
+Restart-Service PIIPS_Backend
+Invoke-RestMethod http://127.0.0.1:8000/health
+# On restart, the app detects the plaintext value and DPAPI-encrypts it
+# in place using THIS machine's key - seeing config.json go back to
+# "enc:dpapi:..." after a restart is expected/correct, not a bug.
+
+--- Site opens fine at http://localhost:8080 ON THE SERVER, but times
+    out from any other machine (e.g. http://<uat-server-ip>:8080) ---
+Windows Firewall has no inbound rule for the site's port, so IIS is
+listening but nothing lets outside traffic reach it. Fix:
+New-NetFirewallRule -DisplayName "PIIPS IIS 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow
+# Then confirm from the OTHER machine (not the server itself):
+Test-NetConnection <uat-server-ip> -Port 8080
+# If Get-WebBinding shows the binding is scoped to "*:<port>:" (all IPs,
+# no host header) this step is the fix; a host-header-restricted binding
+# would be a separate issue.
+
+--- Database error: [IM002] Data source name not found and no default
+    driver specified (SQLDriverConnect) ---
+ODBC Driver 17 for SQL Server isn't installed on this server (the app
+hardcodes that EXACT driver name in database.py - installing a
+different version, e.g. 18, will NOT fix this since the name string
+won't match). Check first:
+Get-OdbcDriver -Name "ODBC Driver 17 for SQL Server"
+# If "Driver cannot be found", install it. If this server has internet
+# access:
+Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2200732" -OutFile "$env:TEMP\msodbcsql17.msi"
+Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\msodbcsql17.msi`" /passive /norestart IACCEPTMSODBCSQLLICENSETERMS=YES" -Wait -PassThru | Select-Object ExitCode
+# ExitCode 0 = success. If this server has NO internet access (common
+# on UAT boxes - Invoke-WebRequest will fail with "Unable to connect to
+# the remote server"), download the MSI on a machine that does have
+# internet, then copy it to the UAT server instead of downloading there:
+# ON THE MACHINE WITH INTERNET:
+Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2200732" -OutFile "$env:TEMP\msodbcsql17.msi"
+# COPY TO THE UAT SERVER - first confirm it's reachable:
+Test-Connection <uat-server-ip> -Count 2
+Test-NetConnection <uat-server-ip> -Port 445
+# then either a plain admin-share copy:
+Copy-Item "$env:TEMP\msodbcsql17.msi" "\\<uat-server-ip>\D$\msodbcsql17.msi"
+# ...or, if the admin share/credentials don't cooperate ("network name
+# cannot be found" etc.), mount it explicitly with credentials instead:
+New-PSDrive -Name Z -PSProvider FileSystem -Root "\\<uat-server-ip>\D$" -Credential (Get-Credential)
+Copy-Item "$env:TEMP\msodbcsql17.msi" "Z:\msodbcsql17.msi"
+Remove-PSDrive Z
+# ...or, if admin shares are locked down entirely, RDP into the UAT
+# server and drag-and-drop the file into the session instead.
+# THEN, on the UAT server, install from the local copy:
+Start-Process msiexec.exe -ArgumentList "/i `"D:\msodbcsql17.msi`" /passive /norestart IACCEPTMSODBCSQLLICENSETERMS=YES" -Wait -PassThru | Select-Object ExitCode
+Get-OdbcDriver -Name "ODBC Driver 17 for SQL Server"
+Restart-Service PIIPS_Backend
+
+--- First PDF processed fails with a DNS error mentioning
+    paddleocr.bj.bcebos.com ---
+NSSM runs the service as Local System, whose PaddleOCR model cache is
+separate from your interactive user profile. Either let it download
+once (if this server has internet access), or pre-seed it by copying
+%UserProfile%\.paddleocr from a machine that already has the models to
+C:\Windows\System32\config\systemprofile\.paddleocr on this server,
+then:
+Restart-Service PIIPS_Backend
+
+--- pyodbc.InterfaceError / "Data source name not found" ---
+ODBC Driver 17 for SQL Server isn't installed - install it from
+Microsoft, then:
+Restart-Service PIIPS_Backend
+
+--- PDF processing fails with a poppler/pdfinfo error ---
+Poppler's Library\bin isn't on the System PATH (not just the user
+PATH). Add it via System Properties -> Environment Variables, or:
+[Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Poppler\Library\bin", "Machine")
+# then restart the shell/service so it picks up the new PATH:
+Restart-Service PIIPS_Backend
