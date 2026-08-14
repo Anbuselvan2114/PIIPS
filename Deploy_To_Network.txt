@@ -21,10 +21,10 @@ if (-not (Test-Path $Destination)) {
 # Mirrors $Source -> $Destination, excluding local-only / generated /
 # machine-specific folders and files that must NOT travel to another
 # machine (see notes below). Re-run any time to sync just the changes.
-robocopy $Source $Destination /E /XJ /R:2 /W:5 /MT:8 `
-    /XD ".git" ".claude" "venv" ".venv" "__pycache__" "node_modules" "dist" `
-        "logs" "output" "New_Format" "model_backups" "old" `
-    /XF "config.json" "*.log" "*.pyc"
+# One line on purpose - backtick line-continuation is fragile when pasted
+# into a PowerShell console (a blank line before it, or the console's own
+# ">>" continuation prompts, can corrupt the paste).
+robocopy $Source $Destination /E /XJ /R:2 /W:5 /MT:8 /XD ".git" ".claude" "venv" ".venv" "__pycache__" "node_modules" "dist" "logs" "output" "New_Format" "model_backups" "old" /XF "config.json" "*.log" "*.pyc"
 
 ------------------------------------------------------------------
 Notes
@@ -67,8 +67,7 @@ $Destination = "E:\PIIPS_Application"      # <-- EDIT THIS to the real server pa
                                             #     \\10.0.1.210\E$\PIIPS_Application
                                             #     if copying over the network)
 
-robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 `
-    /XF "config.json" "config_nonencrypted.json" "*.log"
+robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 /XF "config.json" "config_nonencrypted.json" "*.log"
 
 # config.json is excluded from BOTH the copy AND the deletion pass (/XF
 # excludes a name from mirroring entirely) - the server keeps its own
