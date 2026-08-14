@@ -227,6 +227,21 @@ export const uploadInputFiles = async (fileList, subpath = "", user_id) => {
   return res.json();
 };
 
+export const getDeployServers = (user_id) =>
+  request(`/api/deploy/servers${user_id != null ? `?user_id=${user_id}` : ""}`);
+
+export const saveDeployServer = (payload) =>
+  request("/api/deploy/servers", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+export const publishDeploy = (environment, user_id) =>
+  request("/api/deploy/publish", {
+    method: "POST",
+    body: JSON.stringify({ environment, user_id }),
+  });
+
 export const getBackups = () => request("/api/backups");
 
 export const restoreBackup = (name) =>

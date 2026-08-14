@@ -334,6 +334,84 @@ def save_db_config(payload: DbConfigModel):
     return {"ok": True, "db_configured": True}
 
 
+class DeployServerModel(BaseModel):
+    user_id: Optional[int] = None
+    environment: str                      # "uat" | "live"
+    server_host: str
+    folder_path: str                      # UNC path, e.g. \\10.0.1.213\D$\PIIPS_UAT
+    site_name: Optional[str] = ""
+    service_name: Optional[str] = "PIIPS_Backend"
+    port: Optional[int] = None
+
+
+class PublishModel(BaseModel):
+    user_id: Optional[int] = None
+    environment: str
+
+
+_DEPLOY_ENVIRONMENTS = {"uat", "live"}
+
+
+@app.get("/api/deploy/servers")
+def list_deploy_servers(user_id: Optional[int] = None):
+    import database
+    _require_developer(user_id)
+    return {"servers": database.list_deploy_servers()}
+
+
+@app.post("/api/deploy/servers")
+def save_deploy_server(payload: DeployServerModel):
+    import database
+    _require_developer(payload.user_id)
+
+    environment = (payload.environment or "").strip().lower()
+    if environment not in _DEPLOY_ENVIRONMENTS:
+        raise HTTPException(status_code=400, detail="environment must be 'uat' or 'live'.")
+
+    host = (payload.server_host or "").strip()
+    folder = (payload.folder_path or "").strip()
+    if not host or not folder:
+        raise HTTPException(status_code=400, detail="Server host and folder path are required.")
+
+    database.upsert_deploy_server(
+        environment, host, folder, (payload.site_name or "").strip(),
+        (payload.service_name or "PIIPS_Backend").strip(), payload.port,
+        payload.user_id,
+    )
+    return {"ok": True}
+
+
+@app.post("/api/deploy/publish")
+def publish_deploy(payload: PublishModel):
+    import database
+    import deploy
+
+    _require_developer(payload.user_id)
+
+    environment = (payload.environment or "").strip().lower()
+    if environment not in _DEPLOY_ENVIRONMENTS:
+        raise HTTPException(status_code=400, detail="environment must be 'uat' or 'live'.")
+
+    server = database.get_deploy_server(environment)
+    if not server:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No server is registered for '{environment}' yet. Register it first.",
+        )
+
+    try:
+        log = deploy.publish(environment, server)
+    except deploy.PublishError as exc:
+        database.record_publish_result(environment, "Failed", str(exc), payload.user_id)
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        database.record_publish_result(environment, "Failed", str(exc), payload.user_id)
+        raise HTTPException(status_code=500, detail=f"Publish failed: {exc}")
+
+    database.record_publish_result(environment, "Success", log, payload.user_id)
+    return {"ok": True, "log": log}
+
+
 def _require_folders():
     folders = config_store.folders(create=True)
     if not folders:

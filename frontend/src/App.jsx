@@ -15,6 +15,7 @@ import Lifecycle from "./Lifecycle";
 import Login from "./Login";
 import ForgotPassword from "./ForgotPassword";
 import Manuals from "./Manuals";
+import Publish from "./Publish";
 
 // key, label, icon, nav group
 const MENU = [
@@ -33,6 +34,7 @@ const MENU = [
   ["mapping", "Field Mapping", "🔗", "Mapping"],
   ["training", "Model Training", "🧠", "Admin"],
   ["users", "User Management", "👤", "Admin"],
+  ["publish", "Publish", "🚀", "Admin"],
 ];
 
 const ROLE_MENUS = {
@@ -57,6 +59,7 @@ const PAGES = {
   template: Template, users: UserManagement, dbconfig: DatabaseConfig,
   apiconfig: ApiConfiguration, buyerorder: BuyerOrderEntry,
   load: Load, post: Post, complete: Complete, manual: Manuals,
+  publish: Publish,
 };
 
 const loadUser = () => {

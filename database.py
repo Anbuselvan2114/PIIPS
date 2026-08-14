@@ -1369,6 +1369,27 @@ _MENU_TABLE_DDL = [
     "WHERE pt.BatchName IS NULL AND h.BatchName IS NOT NULL')",
     "IF COL_LENGTH('dbo.tbl_Purchase_Header','BatchName') IS NOT NULL "
     "ALTER TABLE dbo.tbl_Purchase_Header DROP COLUMN BatchName",
+    # ---- Registered UAT/Live deployment targets for the Publish feature ---
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'tbl_DeployServer')
+    CREATE TABLE tbl_DeployServer (
+        Id                     INT IDENTITY(1,1) PRIMARY KEY,
+        Environment            NVARCHAR(20) NOT NULL UNIQUE,  -- 'uat' | 'live'
+        ServerHost             NVARCHAR(200) NOT NULL,        -- IP/hostname (sc.exe + health check)
+        FolderPath             NVARCHAR(500) NOT NULL,        -- UNC destination, e.g. \\10.0.1.213\D$\PIIPS_UAT
+        SiteName               NVARCHAR(200) NULL,            -- IIS site name (informational)
+        ServiceName            NVARCHAR(200) NOT NULL DEFAULT 'PIIPS_Backend',
+        Port                   INT NULL,                      -- IIS site port, for the health-check URL
+        CreatedById            INT NULL,
+        CreatedDatetime        DATETIME NOT NULL DEFAULT GETDATE(),
+        LastModifiedById       INT NULL,
+        LastModifiedDatetime   DATETIME NULL,
+        LastPublishedById      INT NULL,
+        LastPublishedDatetime  DATETIME NULL,
+        LastPublishStatus      NVARCHAR(20) NULL,
+        LastPublishLog         NVARCHAR(MAX) NULL
+    )
+    """,
 ]
 
 # Table-valued parameter types used by the save procedures for bulk MERGE.
@@ -2881,6 +2902,105 @@ def set_user_active(user_id, is_active, modified_by=None):
         row = cur.fetchone()
         conn.commit()
         return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+def list_deploy_servers():
+    """Registered UAT/Live deploy targets with their last-publish info, and
+    the username of whoever last published to each (blank if never).
+    Sample: list_deploy_servers()"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT s.Id, s.Environment, s.ServerHost, s.FolderPath, s.SiteName, "
+            "s.ServiceName, s.Port, s.LastPublishedDatetime, s.LastPublishStatus, "
+            "s.LastPublishLog, u.UserName AS LastPublishedBy "
+            "FROM dbo.tbl_DeployServer s "
+            "LEFT JOIN dbo.tbl_User u ON u.UserId = s.LastPublishedById "
+            "ORDER BY s.Environment"
+        )
+        cols = [d[0] for d in cur.description]
+        rows = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            if d.get("LastPublishedDatetime") is not None:
+                d["LastPublishedDatetime"] = str(d["LastPublishedDatetime"])
+            rows.append(d)
+        return rows
+    finally:
+        conn.close()
+
+
+def get_deploy_server(environment):
+    """One registered deploy target by environment ('uat'/'live'), or None.
+    Sample: get_deploy_server('uat')"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT Id, Environment, ServerHost, FolderPath, SiteName, "
+            "ServiceName, Port FROM dbo.tbl_DeployServer WHERE Environment = ?",
+            environment,
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, r))
+    finally:
+        conn.close()
+
+
+def upsert_deploy_server(environment, server_host, folder_path, site_name,
+                          service_name, port, user_id):
+    """Register a new deploy target or update the existing one for this
+    environment. Sample: upsert_deploy_server('uat', '10.0.1.213',
+    r'\\\\10.0.1.213\\D$\\PIIPS_UAT', 'PIIPS_AI_UAT', 'PIIPS_Backend', 8081, 1)"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            IF EXISTS (SELECT 1 FROM dbo.tbl_DeployServer WHERE Environment = ?)
+                UPDATE dbo.tbl_DeployServer SET
+                    ServerHost = ?, FolderPath = ?, SiteName = ?,
+                    ServiceName = ?, Port = ?,
+                    LastModifiedById = ?, LastModifiedDatetime = GETDATE()
+                WHERE Environment = ?
+            ELSE
+                INSERT INTO dbo.tbl_DeployServer
+                    (Environment, ServerHost, FolderPath, SiteName, ServiceName,
+                     Port, CreatedById)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            environment,
+            server_host, folder_path, site_name, service_name, port, user_id, environment,
+            environment, server_host, folder_path, site_name, service_name, port, user_id,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_publish_result(environment, status, log, user_id):
+    """Stamp the outcome of a Publish run onto its deploy-server row.
+    Sample: record_publish_result('uat', 'Success', '...log text...', 1)"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE dbo.tbl_DeployServer SET "
+            "LastPublishedById = ?, LastPublishedDatetime = GETDATE(), "
+            "LastPublishStatus = ?, LastPublishLog = ? WHERE Environment = ?",
+            user_id, status, log, environment,
+        )
+        conn.commit()
     finally:
         conn.close()
 
