@@ -290,6 +290,7 @@ def build_rows_grouped(invoices, mapping=None):
             reservations.append(_row(inv, sf, "Reservation Entry", re_map, re_cols))
         groups.append({
             "invoice_no": inv.get("invoice_no", ""),
+            "po_number_format": inv.get("PO_Number_Format", ""),
             "header": header,
             "lines": lines,
             "reservations": reservations,
@@ -388,19 +389,26 @@ _LINK_OVERRIDE_SOURCE = {
     ("Purchase Line", "Document Type"): "Template",
     ("Purchase Line", "Document No."): "Template",
     ("Purchase Line", "Line No."): "PDF",
+    ("Reservation Entry", "Source Type"): "Template",
+    ("Reservation Entry", "Source Subtype"): "Template",
+    ("Reservation Entry", "Source ID"): "Template",
+    ("Reservation Entry", "Source Ref. No."): "PDF",
+    ("Reservation Entry", "Quantity"): "Template",
+    ("Reservation Entry", "Quantity (Base)"): "Template",
 }
 
 
 def field_source(sheet, col, mapping=None):
     """'Service First' / 'Template' / 'PDF' — where a Purchase Header/Line/
     Reservation Entry column's value comes from, for the Dashboard's Fields
-    drill-down popup. Reservation Entry doesn't exist at all without a
-    Service First reservation row, so every one of its columns is Service
-    First; an unmapped column falls back to the business Template's static
-    value; everything else is extracted straight from the PDF.
+    drill-down popup and the Template screen. A reservation row only exists
+    at all because of a Service First reservation, so any column actually
+    mapped there reads straight from that sf_item data (unlike Purchase
+    Line, its mapping specs aren't a PDF/SF mix — every mapped Reservation
+    Entry column is Service First). An unmapped column falls back to the
+    business Template's static value; everything else is extracted straight
+    from the PDF.
     Sample: field_source('Purchase Header', 'Location Code')"""
-    if sheet == "Reservation Entry":
-        return "Service First"
     if col == "InvoiceNo":
         return "PDF"
 
@@ -412,6 +420,8 @@ def field_source(sheet, col, mapping=None):
     spec = (mapping.get(sheet) or {}).get(col, "")
     if not spec or spec.startswith("="):
         return "Template"
+    if sheet == "Reservation Entry":
+        return "Service First"
     sf_fields = _SF_HEADER_FIELDS if sheet == "Purchase Header" else _SF_LINE_FIELDS
     return "Service First" if spec in sf_fields else "PDF"
 
@@ -499,10 +509,16 @@ def renumber_batch(sheet_data, start_doc_no=None, start_entry_no=None):
     Mutates `sheet_data` in place; also returns it.
 
     Document No.: renumbers Purchase Header["No."] sequentially from
-    `start_doc_no`, in row order (fetch_batch orders headers by creation),
-    keeping each header's own existing prefix/zero-padding (e.g.
-    "PO-2627-00003" -> "PO-2627-00010" when start_doc_no=10). The same new
-    value is propagated onto Purchase Line["Document No."] and
+    `start_doc_no`, in row order (fetch_batch orders headers by creation).
+    Each header's new value is its own PO_Number_Format (from the template
+    active when it was processed - see processor.py/save_grouped) plus the
+    running sequence, 6-digit zero-padded (e.g. PO_Number_Format="PO-2627-"
+    and start_doc_no=10 -> "PO-2627-000010", start_doc_no=20 ->
+    "PO-2627-000020" for the next header). A header with no PO_Number_Format
+    on record (no template matched it) instead keeps whatever prefix/padding
+    its existing "No." already had, or is just the bare sequence number if
+    it never had one either. The same new value is propagated onto
+    Purchase Line["Document No."] and
     Reservation Entry["Source ID"] for the rows belonging to that header —
     linked by Purchase_Header_ID (a real FK, present on every row
     database.fetch_batch returns), not by matching the old "No."/
@@ -520,9 +536,13 @@ def renumber_batch(sheet_data, start_doc_no=None, start_entry_no=None):
         seq = start_doc_no
         id_to_new_no = {}
         for row in header_rows:
-            old = str(row.get("No.") or "").strip()
-            m = _DOC_NO_SUFFIX_RE.match(old) if old else None
-            new = f"{m.group(1)}{seq:0{len(m.group(2))}d}" if m else str(seq)
+            po_fmt = str(row.get("PO_Number_Format") or "").strip()
+            if po_fmt:
+                new = f"{po_fmt}{seq:06d}"
+            else:
+                old = str(row.get("No.") or "").strip()
+                m = _DOC_NO_SUFFIX_RE.match(old) if old else None
+                new = f"{m.group(1)}{seq:0{len(m.group(2))}d}" if m else str(seq)
             header_id = row.get("Id")
             if header_id is not None:
                 id_to_new_no[header_id] = new

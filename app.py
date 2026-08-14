@@ -1229,12 +1229,20 @@ class TemplateKeyModel(BaseModel):
 def get_templates():
     import template_store
     import excel_export
+
+    columns = excel_export.sheet_columns()
+    mapping = excel_export.load_mapping()
+    sources = {
+        sheet: {col: excel_export.field_source(sheet, col, mapping) for col in cols}
+        for sheet, cols in columns.items()
+    }
     return {
         "entities": template_store.ENTITIES,
         "invoice_types": template_store.INVOICE_TYPES,
         "sheets": template_store.SHEETS,
-        "columns": excel_export.sheet_columns(),
-        "mapping": excel_export.load_mapping(),
+        "columns": columns,
+        "mapping": mapping,
+        "sources": sources,
         "templates": template_store.load()["Static_Values"],
     }
 

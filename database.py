@@ -222,7 +222,7 @@ def save_grouped(data, batch_name=None, tracker=None):
     ph_cols = list(cols["Purchase Header"])
     pl_cols = list(cols["Purchase Line"])
     re_cols = list(cols["Reservation Entry"])
-    header_cols = ph_cols + ["InvoiceNo", "Last_Updated_No"]   # BatchName now lives on the tracker
+    header_cols = ph_cols + ["InvoiceNo", "Last_Updated_No", "PO_Number_Format"]   # BatchName now lives on the tracker
 
     tracker = tracker or {}
     initiators = tracker.get("initiators") or []
@@ -245,6 +245,7 @@ def save_grouped(data, batch_name=None, tracker=None):
         header = {c: _norm(g["header"].get(c)) for c in ph_cols}
         header["InvoiceNo"] = g.get("invoice_no")
         header["Last_Updated_No"] = g["header"].get("Last_Updated_No")
+        header["PO_Number_Format"] = g.get("po_number_format")
         header["_BatchName"] = batch_name       # -> tracker.BatchName
         header["_gid"] = gid
         init = initiators[gid] if gid < len(initiators) else None
@@ -674,7 +675,7 @@ def fetch_batch(batch_name, sheet_cols):
     # back below — usp_FetchBatch includes whatever's requested that
     # actually exists as a real column, so this piggybacks on the same
     # dynamic-column mechanism without any SQL changes.
-    header_req = header_cols + ["Id", "No.", "Last_Updated_No"]
+    header_req = header_cols + ["Id", "No.", "Last_Updated_No", "PO_Number_Format"]
     line_req = line_cols + ["Purchase_Header_ID", "Document No."]
     res_req = res_cols + ["Id", "Purchase_Header_ID", "Source ID", "Entry No.", "Last_Updated_Entry_No"]
 
@@ -1566,6 +1567,14 @@ _MENU_PROC_DDL = [
         -- instead, self-healing the column on first use like InvoiceNo.
         IF COL_LENGTH('dbo.tbl_Purchase_Header', 'Last_Updated_No') IS NULL
             ALTER TABLE dbo.tbl_Purchase_Header ADD Last_Updated_No NVARCHAR(200) NULL;
+
+        -- The template's PO number prefix at the time this header was
+        -- saved, kept separately from Last_Updated_No so a later Dashboard
+        -- renumber can rebuild "prefix + new sequence" even when the
+        -- invoice_no fallback used for Last_Updated_No doesn't look like
+        -- "PREFIX000123" at all.
+        IF COL_LENGTH('dbo.tbl_Purchase_Header', 'PO_Number_Format') IS NULL
+            ALTER TABLE dbo.tbl_Purchase_Header ADD PO_Number_Format NVARCHAR(100) NULL;
 
         -- Same idea for Reservation Entry's [Entry No.] — a working value
         -- (Last_Updated_Entry_No) tracked per row, finalized into the

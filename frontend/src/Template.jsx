@@ -15,7 +15,7 @@ export default function Template({ user }) {
   if (!data) return <div className="page"><div className="card">Loading…</div></div>;
 
   if (view === "edit") {
-    return <TemplateEdit data={data} editKey={editKey} user={user}
+    return <TemplateEdit data={data} sources={data.sources || {}} editKey={editKey} user={user}
              onBack={() => { setView("list"); refresh(); }} />;
   }
 
@@ -61,7 +61,7 @@ export default function Template({ user }) {
   );
 }
 
-function TemplateEdit({ data, editKey, user, onBack }) {
+function TemplateEdit({ data, sources, editKey, user, onBack }) {
   const { entities, invoice_types: invoiceTypes, sheets, columns, mapping, templates } = data;
   const existing = editKey ? templates[editKey] : null;
 
@@ -127,15 +127,27 @@ function TemplateEdit({ data, editKey, user, onBack }) {
           <div className="card" key={sheet}>
             <h3>{sheet} <span className="muted" style={{ fontWeight: 400, fontSize: 13 }}>({cols.length} unmapped)</span></h3>
             <DataTable
-              rows={cols.map((col) => ({ _key: col, column: col }))}
+              rows={cols.map((col) => {
+                const base = (sources[sheet] || {})[col] || "Template";
+                // A column that's neither mapped nor link-overridden shows
+                // as "Template" by default, but that's only a real source
+                // once a static value is actually entered here — until
+                // then, nothing populates it at all.
+                const hasStatic = Boolean((values[sheet] || {})[col]);
+                const source = base === "Template" && !hasStatic ? "None" : base;
+                return { _key: col, column: col, source };
+              })}
               searchKeys={["column"]} empty="All columns are mapped."
               columns={[
                 { key: "column", label: "Column" },
+                { key: "source", label: "Source" },
                 { key: "value", label: "Static value", sortable: false,
                   render: (r) => (
-                    <input value={(values[sheet] || {})[r.column] || ""}
-                           onChange={(e) => setVal(sheet, r.column, e.target.value)}
-                           placeholder="static value" />
+                    r.source === "Template" || r.source === "None"
+                      ? <input value={(values[sheet] || {})[r.column] || ""}
+                               onChange={(e) => setVal(sheet, r.column, e.target.value)}
+                               placeholder="static value" />
+                      : <span className="hint">Not used — value comes from {r.source}</span>
                   ) },
               ]} />
           </div>

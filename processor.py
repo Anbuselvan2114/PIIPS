@@ -390,11 +390,17 @@ class JobManager:
                                     or "Order"
                                 )
                                 doc_no = (
-                                    f"{po_fmt}{job._doc_seq:05d}" if po_fmt
-                                    else (data.get("invoice_no") or f"DOC{job._doc_seq:05d}")
+                                    f"{po_fmt}{job._doc_seq:06d}" if po_fmt
+                                    else (data.get("invoice_no") or f"DOC{job._doc_seq:06d}")
                                 )
                                 data["Document Type"] = doc_type
                                 data["Document No."] = doc_no
+                                # Kept separately (not just parsed back out of
+                                # Document No.) so a Dashboard renumber later
+                                # can rebuild "prefix + new sequence" even for
+                                # a header whose invoice_no fallback doesn't
+                                # look like "PREFIX000123" at all.
+                                data["PO_Number_Format"] = po_fmt
 
                                 # ---- Service First: reservation (sf_items) +
                                 # HSN enrichment + validation. Sets data["sf_items"]
