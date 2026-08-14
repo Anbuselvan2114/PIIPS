@@ -1194,9 +1194,34 @@ class FieldsModel(BaseModel):
 def get_fields():
     """Effective columns per sheet, plus the original template columns."""
     import excel_export
+    import template_store
+
+    columns = excel_export.sheet_columns()
+    mapping = excel_export.load_mapping()
+
+    # A column can be reused across many templates with no single "this
+    # invoice's" value to check (unlike the Template edit screen, which
+    # only ever looks at the one template being edited) - so "Template" is
+    # downgraded to "None" here only when NOT ONE currently-saved template
+    # has a non-blank static value for it. Otherwise every unmapped column
+    # would show "Template" regardless of whether anything actually uses it.
+    templates = template_store.load()["Static_Values"].values()
+
+    def has_any_static(sheet, col):
+        return any((t.get(sheet) or {}).get(col, "").strip() for t in templates)
+
+    sources = {}
+    for sheet, cols in columns.items():
+        sources[sheet] = {}
+        for col in cols:
+            source = excel_export.field_source(sheet, col, mapping)
+            if source == "Template" and not has_any_static(sheet, col):
+                source = "None"
+            sources[sheet][col] = source
     return {
-        "columns": excel_export.sheet_columns(),
+        "columns": columns,
         "template": excel_export.template_columns(),
+        "sources": sources,
     }
 
 

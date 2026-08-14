@@ -168,15 +168,15 @@ export default function Dashboard({ user }) {
 
   const openBatchModal = async (batch, status, statusLabel) => {
     const titleBase = status ? `Batch — ${batch} — ${statusLabel}` : `Batch — ${batch}`;
-    setModal({ kind: "batch", title: titleBase, rows: [], loading: true, batch });
+    setModal({ kind: "batch", title: titleBase, rows: [], loading: true, batch, status });
     try {
       const r = await getInvoicesByBatch(batch);
       const rows = status
         ? (r.invoices || []).filter((row) => row.status === status)
         : (r.invoices || []);
       setModal({ kind: "batch", title: `${titleBase} (${rows.length})`,
-                 rows, loading: false, batch });
-    } catch (e) { setModal({ kind: "batch", title: "Batch", rows: [], loading: false, batch, error: e.message }); }
+                 rows, loading: false, batch, status });
+    } catch (e) { setModal({ kind: "batch", title: "Batch", rows: [], loading: false, batch, status, error: e.message }); }
   };
 
   const openFieldCheck = async (row) => {
@@ -263,17 +263,23 @@ export default function Dashboard({ user }) {
         </button>
       ) : null }] : []),
   ];
+  // Include/Exclude only makes sense once an invoice is actually staged
+  // for export (READY TO LOAD), or to undo a previous exclude (EXCLUDED) —
+  // for every other status it's not shown at all, rather than offered and
+  // doing something confusing.
   const batchModalColumns = [
     ...invoiceColumns.filter((c) => c.key !== "batch"),
-    { key: "include", label: "Include / Exclude", sortable: false,
-      render: (row) => (
-        <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-          <input type="checkbox" checked={!row.is_excluded} onChange={() => toggleExclude(row)} />
-          <span className={`badge ${row.is_excluded ? "badge-warning" : "badge-success"}`}>
-            {row.is_excluded ? "Excluded" : "Included"}
-          </span>
-        </label>
-      ) },
+    ...(["READY TO LOAD", "EXCLUDED"].includes(modal?.status) ? [
+      { key: "include", label: "Include / Exclude", sortable: false,
+        render: (row) => (
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input type="checkbox" checked={!row.is_excluded} onChange={() => toggleExclude(row)} />
+            <span className={`badge ${row.is_excluded ? "badge-warning" : "badge-success"}`}>
+              {row.is_excluded ? "Excluded" : "Included"}
+            </span>
+          </label>
+        ) },
+    ] : []),
   ];
 
   const resultRows = results.map((r, i) => {

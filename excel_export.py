@@ -194,6 +194,14 @@ def _link_override(sheet, col, inv, item):
             return doc_type
         if col == "No.":
             return doc_no
+        if col == "Consignment Note No.":
+            # BC's field is too short for the full SPRPUR/YYYY/MM/DD-NNNNN
+            # buyer's order token (see buyer_order.py) - strip the constant
+            # "SPRPUR/" prefix, keeping only the part that's actually
+            # unique per order, e.g. "SPRPUR/2026/07/27-85557" ->
+            # "2026/07/27-85557".
+            return re.sub(r"^[S5]PRPUR/?", "", inv.get("buyer_order_no", "") or "",
+                          flags=re.IGNORECASE)
     elif sheet == "Purchase Line":
         if col == "Document Type":
             return doc_type
@@ -205,7 +213,11 @@ def _link_override(sheet, col, inv, item):
         if col == "Source Type":
             return PURCHASE_LINE_SOURCE_TYPE
         if col == "Source Subtype":
-            return doc_type
+            # BC's Source Subtype is the numeric Document Type option value,
+            # not the text ("Order"/etc.) Purchase Header/Line carry - every
+            # purchase invoice PIIPS creates is an Order, whose BC option
+            # value is 1, so this is a fixed constant like Source Type.
+            return "1"
         if col == "Source ID":
             return doc_no
         if col == "Source Ref. No.":
@@ -348,7 +360,7 @@ _LINE_TYPE_REQUIRED_FIELD = {
 # be null before then.
 REQUIRED_RESERVATION_FIELDS = [
     "Positive", "Item No.", "Location Code", "Quantity (Base)",
-    "Reservation Status", "Creation Date", "Source Type",
+    "Reservation Status", "Creation Date", "Source Type", "Source Subtype",
     "Expected Receipt Date", "Serial No.",
     "Qty. per Unit of Measure", "Quantity", "Suppressed Action Msg.",
     "Planning Flexibility", "Qty. to Handle (Base)", "Qty. to Invoice (Base)",
@@ -395,6 +407,7 @@ _SYSTEM_COMPUTED_FIELDS = {"payment_terms_code", "Due_Date"}
 _LINK_OVERRIDE_SOURCE = {
     ("Purchase Header", "Document Type"): "Template",
     ("Purchase Header", "No."): "System",
+    ("Purchase Header", "Consignment Note No."): "System",
     ("Purchase Line", "Document Type"): "Template",
     ("Purchase Line", "Document No."): "System",
     ("Purchase Line", "Line No."): "System",

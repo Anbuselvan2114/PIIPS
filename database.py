@@ -709,6 +709,14 @@ def fetch_batch(batch_name, sheet_cols):
             row["No."] = effective
             if row.get("Id") is not None:
                 last_no_by_header[row["Id"]] = effective
+            # Re-applied here (not just at save time in excel_export.py's
+            # _link_override) so a download is correct even for invoices
+            # saved before this prefix-strip existed - re.sub is a no-op on
+            # a value that's already clean.
+            if "Consignment Note No." in row:
+                row["Consignment Note No."] = re.sub(
+                    r"^[S5]PRPUR/?", "", row.get("Consignment Note No.") or "",
+                    flags=re.IGNORECASE)
 
         for row in pl_r:
             if not (row.get("Document No.") or "").strip():
@@ -719,6 +727,12 @@ def fetch_batch(batch_name, sheet_cols):
                 row["Source ID"] = last_no_by_header.get(row.get("Purchase_Header_ID"), "")
             if not (row.get("Entry No.") or "").strip():
                 row["Entry No."] = (row.get("Last_Updated_Entry_No") or "").strip()
+            # Forced here too (not just at save time), same reasoning as
+            # Consignment Note No. above - a row saved before this fix
+            # still has the old "Order" text rather than BC's numeric
+            # Document Type option value.
+            if "Source Subtype" in row:
+                row["Source Subtype"] = "1"
 
         return {
             "Purchase Header": {"columns": header_cols, "rows": ph_r},
@@ -849,10 +863,16 @@ def invoices_by_status(status_id):
 
 
 def invoices_by_batch(batch_name):
-    """Active invoices in a batch (batch eye-button pop-up). Only tracker rows
-    with IsActive = 1 are listed; inactive/failed ones are ignored.
+    """Every invoice in a batch (Dashboard batches table's per-status
+    drill-down pop-up). Deliberately NOT filtered by IsActive: every
+    non-terminal status (BUYER ORDER NO DOESN'T EXIST, PENDING IN SF,
+    INCOMPLETE DATA) is saved with IsActive=0 by evaluate_invoice() - it
+    marks "not yet validated/ready", not "hide this row". Filtering on it
+    here used to make the popup disagree with the status column's own
+    count (e.g. count shows 3, popup opens to 0) for exactly the statuses
+    someone clicking in is most likely trying to review.
     Sample: invoices_by_batch('PIIPS_Batch_20260722_101500')"""
-    return _invoice_list("pt.BatchName = ? AND pt.IsActive = 1", [batch_name])
+    return _invoice_list("pt.BatchName = ?", [batch_name])
 
 
 def invoices_by_statuses(status_names, active_only=False):
@@ -900,9 +920,18 @@ def get_invoice_field_check(header_id):
             for n in names:
                 v = values.get(n)
                 v = "" if v is None else str(v)
+                source = excel_export.field_source(sheet, n, field_mapping)
+                # field_source() calls any unmapped column "Template" since
+                # that's where a value for it *would* come from - but if no
+                # static value was actually ever set (this invoice's actual
+                # stored value is blank), nothing really populated it, so
+                # show that honestly as "None" rather than implying a
+                # template value exists when it doesn't.
+                if source == "Template" and not v.strip():
+                    source = "None"
                 rows.append({
                     "field": n, "value": v, "missing": not v.strip(),
-                    "source": excel_export.field_source(sheet, n, field_mapping),
+                    "source": source,
                 })
             return rows
 
@@ -942,6 +971,11 @@ def get_invoice_field_check(header_id):
                 header_id,
             )
             res_rows = [dict(zip(res_cols, r)) for r in cur.fetchall()]
+            # Same forced recompute as fetch_batch() - a row saved before
+            # the Source Subtype fix still has the old "Order" text stored.
+            for rr in res_rows:
+                if "Source Subtype" in rr:
+                    rr["Source Subtype"] = "1"
 
         return {
             "header": field_rows("Purchase Header", header_wanted, header_values),
@@ -2117,7 +2151,11 @@ _MENU_PROC_DDL = [
         GROUP BY pt.BatchName
         ORDER BY MIN(h.CreatedAt) DESC;
 
-        -- 2) Count of tracker rows per StatusID, per batch.
+        -- 2) Count of tracker rows per StatusID, per batch. Deliberately
+        -- NOT filtered by IsActive - see invoices_by_batch()'s docstring
+        -- for why (every non-terminal status sets IsActive=0, so filtering
+        -- on it here would undercount exactly the statuses users most need
+        -- an accurate count for).
         SELECT pt.BatchName, s.StatusId, s.StatusName, COUNT(*) AS Cnt
         FROM dbo.tbl_Purchase_Tracker pt
         LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID
