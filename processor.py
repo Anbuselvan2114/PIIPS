@@ -360,15 +360,35 @@ class JobManager:
                                     })
                                     continue
 
-                                # Skip if this invoice is already saved (any batch).
+                                # Skip if this invoice is already saved (any
+                                # batch) - matched by the extracted Vendor
+                                # Invoice No., not the PDF's filename, so a
+                                # re-upload under a different filename is
+                                # still caught. Moved out of Input so it
+                                # doesn't get picked up and OCR'd again on
+                                # every future run.
                                 if inv_no in invoice_map:
+                                    moved_to = (
+                                        None if multi
+                                        else config_store.move_pdf_to_status(
+                                            filename, "DUPLICATE", src_path=src_path
+                                        )
+                                    )
+                                    if job.mirror_folder and moved_to:
+                                        self._copy(moved_to, job.mirror_folder)
                                     records.append({
                                         "file": filename,
+                                        "rel": rel,
                                         "status": "skipped",
                                         "format": fmt_name,
                                         "format_status": "already_processed",
-                                        "reason": f"Invoice {inv_no} already processed",
+                                        "reason": (
+                                            f"Invoice {inv_no} already processed → moved to DUPLICATE"
+                                            if moved_to else
+                                            f"Invoice {inv_no} already processed"
+                                        ),
                                         "existing_batch": invoice_map[inv_no],
+                                        "moved_to": moved_to,
                                     })
                                     continue
 
