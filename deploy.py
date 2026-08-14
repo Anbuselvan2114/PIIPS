@@ -75,22 +75,24 @@ def _run(cmd, cwd, log, allow_returncodes=(0,)):
 def _push_local_changes_to_development(log):
     """Commit whatever's currently sitting uncommitted in this working copy
     onto 'Development' and push it, so nothing typed here is ever silently
-    dropped by the branch switch that follows. A clean tree or a failed push
-    (no network, etc.) are both non-fatal - the commit (if any) still exists
-    locally either way, so the checkout below can proceed regardless."""
+    dropped by the branch switch that follows. Also pushes any commits that
+    already exist locally but never made it to origin (e.g. a prior push
+    that failed for lack of network) - a clean working tree does NOT mean
+    there's nothing to push. A failed push is non-fatal either way - the
+    commit(s) still exist locally, so the checkout below can proceed."""
     _run(["git", "checkout", "Development"], BASE_DIR, log)
 
     status = _run(["git", "status", "--porcelain"], BASE_DIR, log)
-    if not status.stdout.strip():
-        log.append("No local changes to push.")
-        return
+    if status.stdout.strip():
+        _run(["git", "add", "-A"], BASE_DIR, log)
+        _run(["git", "commit", "-m", "Auto-publish: sync local changes"], BASE_DIR, log)
+    else:
+        log.append("No uncommitted local changes.")
 
-    _run(["git", "add", "-A"], BASE_DIR, log)
-    _run(["git", "commit", "-m", "Auto-publish: sync local changes"], BASE_DIR, log)
     try:
         _run(["git", "push", "origin", "Development"], BASE_DIR, log)
     except PublishError:
-        log.append("[WARNING] git push to Development failed - commit is local-only for now.")
+        log.append("[WARNING] git push to Development failed - commit(s) are local-only for now.")
 
 
 def publish(environment, published_root=None):
