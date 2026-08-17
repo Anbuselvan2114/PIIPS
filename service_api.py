@@ -183,19 +183,27 @@ def _enrich_items(data, order_no):
         item["_hsn_nav_item_no_missing"] = not (info and str(info.get("Nav_Item_No") or "").strip())
         if not info:
             continue
-        # Only overwrite ProductNo when SF actually has one — an SF match
-        # with no code must not blank out the PDF's own HSN/SAC value that
-        # build_invoice_json already seeded it with.
+        # Only overwrite a field when SF actually has a value for it — an SF
+        # match whose own record is missing a piece (no code, no tax rate,
+        # ...) must not blank out what build_invoice_json/the PDF already
+        # seeded it with. TaxPercentage in particular drives the "GST %"
+        # column, and SF's item master frequently has the Nav_Item_No but
+        # not a rate, which used to silently wipe out the PDF-derived rate.
         new_product_no = info.get("ProductNo") or info.get("Nav_Item_No", "")
         if new_product_no:
             item["ProductNo"] = new_product_no
         item["Nav_Item_No"] = info.get("Nav_Item_No", "")
-        item["PartSpecification"] = info.get("PartSpecification", "")
-        item["Nav_Part_Description"] = info.get("Nav_Part_Description", "")
-        item["HSN_Type"] = info.get("HSN_Type", "")
-        item["HSN_Percentage_Description"] = info.get("HSN_Percentage_Description", "")
-        item["TaxPercentage"] = info.get("TaxPercentage", "")
-        item["GST_%"] = info.get("TaxPercentage", "")
+        if info.get("PartSpecification"):
+            item["PartSpecification"] = info["PartSpecification"]
+        if info.get("Nav_Part_Description"):
+            item["Nav_Part_Description"] = info["Nav_Part_Description"]
+        if info.get("HSN_Type"):
+            item["HSN_Type"] = info["HSN_Type"]
+        if info.get("HSN_Percentage_Description"):
+            item["HSN_Percentage_Description"] = info["HSN_Percentage_Description"]
+        if info.get("TaxPercentage"):
+            item["TaxPercentage"] = info["TaxPercentage"]
+            item["GST_%"] = info["TaxPercentage"]
 
 
 # ---------------------------------------------------------------------------
