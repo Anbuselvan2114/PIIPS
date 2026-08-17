@@ -181,19 +181,25 @@ _HEADER_FROM_SF = {
 }
 
 
-def _enrich_items(data, order_no):
-    """Enrich line items from the HSN API (item no., HSN, tax)."""
-    items = data.get("items", []) or []
-    hsn_items = []
-    for item in items:
+def _hsn_lookup_items(data, order_no):
+    """{'PartSpecification', 'PurchaseOrderNo'} rows this invoice needs
+    looked up in GetHSNDetails - no API call, just what to ask for. Split
+    out from _apply_hsn_map so a whole batch's items can be combined into
+    one GetHSNDetails call instead of one per invoice."""
+    items = []
+    for item in data.get("items", []) or []:
         if item.get("_charge"):
             continue  # freight / courier lines aren't Navision parts
         desc = str(item.get("Description", "")).strip()
         if desc:
-            hsn_items.append({"PartSpecification": desc, "PurchaseOrderNo": order_no})
-    if not hsn_items:
-        return
-    hsn_map = get_hsn_details(hsn_items)
+            items.append({"PartSpecification": desc, "PurchaseOrderNo": order_no})
+    return items
+
+
+def _apply_hsn_map(data, order_no, hsn_map):
+    """Enrich this invoice's line items (item no., HSN, tax) from an
+    already-fetched {(po_lower, part_lower): row} map - no API call."""
+    items = data.get("items", []) or []
     for item in items:
         if item.get("_charge"):
             continue
@@ -230,8 +236,46 @@ def _enrich_items(data, order_no):
 
 
 # ---------------------------------------------------------------------------
-# Orchestration for one invoice
+# Orchestration
 # ---------------------------------------------------------------------------
+
+def fetch_sf_batch(invoices):
+    """
+    One-shot batched Service First lookup for a whole processing run - a
+    single GetSparePurchaseItem call covering every invoice's PO, and a
+    single GetHSNDetails call covering every invoice's items, instead of
+    two HTTP round trips per invoice. `invoices` is an iterable of invoice
+    `data` dicts (only buyer_order_no/items are read). Returns
+    (spare_map, hsn_map), both pass straight into apply_sf_batch.
+
+    Sample: fetch_sf_batch([{'buyer_order_no': 'SPRPUR/2026/04/27-83650', 'items': []}])
+    """
+    order_nos = []
+    hsn_items = []
+    for data in invoices:
+        order_no = (data.get("buyer_order_no") or "").strip()
+        if order_no:
+            order_nos.append(order_no)
+            hsn_items.extend(_hsn_lookup_items(data, order_no))
+
+    spare_map = get_spare_purchase_items(order_nos) if order_nos else {}
+    hsn_map = get_hsn_details(hsn_items) if hsn_items else {}
+    return spare_map, hsn_map
+
+
+def apply_sf_batch(data, spare_map, hsn_map):
+    """
+    Apply the results of a prior fetch_sf_batch() to one invoice and
+    evaluate it - the batched-run equivalent of enrich_invoice(), with no
+    HTTP calls of its own. Returns the same verdict shape enrich_invoice
+    does.
+
+    Sample: apply_sf_batch(data, spare_map, hsn_map)
+    """
+    order_no = (data.get("buyer_order_no") or "").strip()
+    rows = spare_map.get(_clean(order_no), []) if order_no else []
+    return _apply_sf_to_invoice(data, order_no, rows, hsn_map)
+
 
 def enrich_invoice(data):
     """
@@ -241,6 +285,11 @@ def enrich_invoice(data):
 
         {"status", "is_active", "is_synced", "errors", "reason"}
 
+    Makes its own HTTP calls for just this one invoice - for a whole batch
+    of invoices, use fetch_sf_batch()/apply_sf_batch() instead so the run
+    makes one GetSparePurchaseItem/GetHSNDetails call in total rather than
+    one pair per invoice.
+
     Sample: enrich_invoice({'buyer_order_no': 'SPRPUR/2026/04/27-83650', 'seller_gstin': '33AAAAA0000A1Z5', 'items': []})
     """
     order_no = (data.get("buyer_order_no") or "").strip()
@@ -249,6 +298,17 @@ def enrich_invoice(data):
     if _base_url() and order_no:
         rows = get_spare_purchase_items([order_no]).get(_clean(order_no), [])
 
+    hsn_items = _hsn_lookup_items(data, order_no) if rows else []
+    hsn_map = get_hsn_details(hsn_items) if hsn_items else {}
+
+    return _apply_sf_to_invoice(data, order_no, rows, hsn_map)
+
+
+def _apply_sf_to_invoice(data, order_no, rows, hsn_map):
+    """Shared by enrich_invoice() and apply_sf_batch(): given the
+    GetSparePurchaseItem rows for this invoice's PO and the (possibly
+    much larger, batch-wide) GetHSNDetails map, enrich `data` in place
+    and return its verdict. No HTTP calls."""
     if rows:
         apply_sf_item_defaults(rows)
         data["sf_items"] = rows
@@ -258,7 +318,7 @@ def enrich_invoice(data):
         for dest, src in _HEADER_FROM_SF.items():
             data[dest] = first.get(src, "")
 
-        _enrich_items(data, order_no)
+        _apply_hsn_map(data, order_no, hsn_map)
 
         # Link each reservation row to its Purchase Line item so
         # Reservation Entry.Source Ref. No. = Purchase Line.Line No. for

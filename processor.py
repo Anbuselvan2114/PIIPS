@@ -244,6 +244,99 @@ class JobManager:
             ocr = OCREngine()
             fmt_model = FormatModel()
 
+            def _finish_group(ctx, verdict):
+                """Complete one invoice given its verdict (computed
+                immediately for non-SF cases, or from the batched SF apply
+                below for PART invoices): New_Format training-copy, payment
+                terms/due date, per-item BC linking, JSON write, and the
+                tracker record itself. No SF calls happen in here."""
+                data = ctx["data"]
+
+                if verdict.get("new_format") and job.unknown_folder:
+                    try:
+                        self._copy(ctx["src_path"], job.unknown_folder)
+                        if job.mirror_folder:
+                            self._copy(ctx["src_path"], job.mirror_folder)
+                    except Exception:  # noqa: BLE001 - best-effort
+                        traceback.print_exc()
+
+                # ---- Payment Terms Code / Due Date ----
+                # data["PaymentTermsName"] comes from Service First (GRN
+                # only, when SF returned rows); data["payment_terms_code"]
+                # already holds whatever the PDF itself states (Mode/Terms
+                # of Payment), set earlier in build_invoice_json. Resolve
+                # the final code + day count per the business rule, then
+                # derive Due Date from Document Date.
+                terms_code, terms_days = resolve_payment_terms(
+                    data.get("PaymentTermsName", ""),
+                    data.get("payment_terms_code", ""),
+                )
+                data["payment_terms_code"] = terms_code
+                data["Due_Date"] = add_days_to_date(
+                    data.get("invoice_date", ""), terms_days
+                )
+
+                for it in data.get("items", []):
+                    line_no = it.get("Line_No", "")
+                    it["Document Type"] = ctx["doc_type"]
+                    it["Document No."] = ctx["doc_no"]
+                    it["Source Type"] = "39"
+                    it["Source Subtype"] = ctx["doc_type"]
+                    it["Source ID"] = ctx["doc_no"]
+                    it["Source Ref. No."] = line_no
+
+                # Write the JSON into Output mirroring the Input template
+                # structure: <Output>/<entity>/<name>/<file>.json A file
+                # split into multiple invoices gets a suffixed name for the
+                # 2nd+ one so they don't overwrite each other.
+                rel_dir_parts = [p for p in os.path.dirname(ctx["rel"]).split("/") if p]
+                out_dir = os.path.join(job.output_folder, *rel_dir_parts)
+                os.makedirs(out_dir, exist_ok=True)
+                suffix = f"_{ctx['group_idx'] + 1}" if ctx["multi"] else ""
+                out_path = os.path.join(
+                    out_dir,
+                    os.path.splitext(ctx["filename"])[0] + suffix + ".json",
+                )
+
+                with open(out_path, "w", encoding="utf-8") as fp:
+                    json.dump(data, fp, indent=4, ensure_ascii=False)
+
+                # Attach static after writing the clean JSON so these
+                # internal keys stay out of the per-PDF file.
+                data["_static"] = ctx["static"]
+                data["_template_key"] = ctx["tkey"]
+                # So excel_export._link_override can special-case PART
+                # invoices' freight/charge lines without a separate lookup.
+                data["_invoice_type"] = ctx["invoice_type"]
+
+                rec = {
+                    "file": ctx["filename"],
+                    # Path relative to the Input root, matching the upload
+                    # log's RelPath so the tracker can resolve who
+                    # initiated (uploaded) this file.
+                    "rel": ctx["rel"],
+                    "status": "success",
+                    "output": out_path,
+                    "format": ctx["fmt_name"],
+                    "format_status": "matched" if ctx["fmt_name"] else "unmatched",
+                    "batch": job.batch_name,
+                    "data": data,
+                    # Service First verdict -> per-invoice tracker status /
+                    # IsActive / IsSynced, applied in _save_to_db.
+                    "_status": verdict["status"],
+                    "_isactive": verdict["is_active"],
+                    "_synced": verdict.get("is_synced", False),
+                    "_invoice_type": ctx["invoice_type"],
+                }
+                if verdict.get("reason"):
+                    rec["reason"] = verdict["reason"]
+                return rec
+
+            # Invoices whose verdict needs Service First, queued up across
+            # every file instead of looked up one at a time - see the
+            # batched fetch_sf_batch()/apply_sf_batch() call after this loop.
+            pending = []
+
             for src_path in source_files:
 
                 filename = os.path.basename(src_path)
@@ -375,12 +468,24 @@ class JobManager:
                             # look like "PREFIX000123" at all.
                             data["PO_Number_Format"] = po_fmt
 
-                            # ---- Service First: reservation (sf_items) +
-                            # HSN enrichment + validation. Sets data["sf_items"]
-                            # and vendor/header fields; returns the tracker
-                            # verdict (status / is_active / is_synced / reason).
-                            with job._lock:
-                                job.stage = "Syncing"
+                            # Registered as soon as this invoice_no is
+                            # accepted (not deferred to _finish_group) so a
+                            # duplicate elsewhere later in this SAME run is
+                            # still caught by the check above, even though
+                            # PART invoices don't get their final verdict
+                            # until the batched Service First call below.
+                            if inv_no:
+                                invoice_map[inv_no] = job.batch_name
+
+                            ctx = {
+                                "data": data, "filename": filename, "rel": rel,
+                                "fmt_name": fmt_name, "doc_type": doc_type,
+                                "doc_no": doc_no, "invoice_type": invoice_type,
+                                "group_idx": group_idx, "multi": multi,
+                                "src_path": src_path, "inv_no": inv_no,
+                                "static": static, "tkey": tkey,
+                            }
+
                             if fmt_name is None or not inv_no:
                                 # Either the format itself is unrecognized,
                                 # or no Vendor Invoice No. could be read off
@@ -399,109 +504,19 @@ class JobManager:
                                 verdict = {"status": "NEW TEMPLATE", "is_active": False,
                                            "is_synced": False, "new_format": True,
                                            "reason": reason}
+                                records.append(_finish_group(ctx, verdict))
                             elif invoice_type == "SERVICE":
                                 # SERVICE invoices never carry a Buyer Order
                                 # No. and have no Service First / reservation
                                 # concept — skip the SF calls and the
                                 # PO-driven verdict logic; ready for Load as-is.
                                 verdict = {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
+                                records.append(_finish_group(ctx, verdict))
                             else:
-                                verdict = service_api.enrich_invoice(data)
-
-                            # SF's item-master lookup (GetHSNDetails) never
-                            # recognized a line's description at all — the
-                            # invoice still saves as NEW TEMPLATE below,
-                            # but also copy the source PDF into New_Format
-                            # so it shows up on the Training screen.
-                            if verdict.get("new_format") and job.unknown_folder:
-                                try:
-                                    self._copy(src_path, job.unknown_folder)
-                                    if job.mirror_folder:
-                                        self._copy(src_path, job.mirror_folder)
-                                except Exception:  # noqa: BLE001 - best-effort
-                                    traceback.print_exc()
-
-                            # ---- Payment Terms Code / Due Date ----
-                            # data["PaymentTermsName"] comes from Service
-                            # First (GRN only, when SF returned rows);
-                            # data["payment_terms_code"] already holds
-                            # whatever the PDF itself states (Mode/Terms
-                            # of Payment), set earlier in
-                            # build_invoice_json. Resolve the final code
-                            # + day count per the business rule, then
-                            # derive Due Date from Document Date.
-                            terms_code, terms_days = resolve_payment_terms(
-                                data.get("PaymentTermsName", ""),
-                                data.get("payment_terms_code", ""),
-                            )
-                            data["payment_terms_code"] = terms_code
-                            data["Due_Date"] = add_days_to_date(
-                                data.get("invoice_date", ""), terms_days
-                            )
-
-                            for it in data.get("items", []):
-                                line_no = it.get("Line_No", "")
-                                it["Document Type"] = doc_type
-                                it["Document No."] = doc_no
-                                it["Source Type"] = "39"
-                                it["Source Subtype"] = doc_type
-                                it["Source ID"] = doc_no
-                                it["Source Ref. No."] = line_no
-
-                            # Write the JSON into Output mirroring the Input
-                            # template structure: <Output>/<entity>/<name>/<file>.json
-                            # A file split into multiple invoices gets a
-                            # suffixed name for the 2nd+ one so they don't
-                            # overwrite each other.
-                            rel_dir_parts = [p for p in os.path.dirname(rel).split("/") if p]
-                            out_dir = os.path.join(job.output_folder, *rel_dir_parts)
-                            os.makedirs(out_dir, exist_ok=True)
-                            suffix = f"_{group_idx + 1}" if multi else ""
-                            out_path = os.path.join(
-                                out_dir,
-                                os.path.splitext(filename)[0] + suffix + ".json",
-                            )
-
-                            with open(out_path, "w", encoding="utf-8") as fp:
-                                json.dump(data, fp, indent=4, ensure_ascii=False)
-
-                            # Attach static after writing the clean JSON so
-                            # these internal keys stay out of the per-PDF file.
-                            data["_static"] = static
-                            data["_template_key"] = tkey
-                            # So excel_export._link_override can special-case
-                            # PART invoices' freight/charge lines without a
-                            # separate lookup.
-                            data["_invoice_type"] = invoice_type
-
-                            rec = {
-                                "file": filename,
-                                # Path relative to the Input root, matching
-                                # the upload log's RelPath so the tracker can
-                                # resolve who initiated (uploaded) this file.
-                                "rel": rel,
-                                "status": "success",
-                                "output": out_path,
-                                "format": fmt_name,
-                                "format_status": "matched" if fmt_name else "unmatched",
-                                "batch": job.batch_name,
-                                "data": data,
-                                # Service First verdict -> per-invoice tracker
-                                # status / IsActive / IsSynced, applied in
-                                # _save_to_db.
-                                "_status": verdict["status"],
-                                "_isactive": verdict["is_active"],
-                                "_synced": verdict.get("is_synced", False),
-                                "_invoice_type": invoice_type,
-                            }
-                            if verdict.get("reason"):
-                                rec["reason"] = verdict["reason"]
-                            records.append(rec)
-
-                            # Mark this invoice seen so a duplicate later in
-                            # the same run is also skipped.
-                            if inv_no:
-                                invoice_map[inv_no] = job.batch_name
+                                # Don't call Service First per invoice -
+                                # queue it for the one batched lookup after
+                                # every file in this run has been extracted.
+                                pending.append(ctx)
 
                 except Exception as exc:  # noqa: BLE001 - report, keep going
 
@@ -532,6 +547,32 @@ class JobManager:
                     for record in records:
                         job.results.append(record)
                     job.processed += 1
+
+            # ---- Batched Service First lookup ---------------------------
+            # One GetSparePurchaseItem call and one GetHSNDetails call for
+            # every PART invoice queued above, instead of that pair once
+            # per invoice - a 43-file run used to mean 80+ HTTP round trips,
+            # each blocking on Service First's own response time.
+            if job.mode == "process" and pending:
+                with job._lock:
+                    job.current_file = ""
+                    job.stage = "Syncing"
+                try:
+                    spare_map, hsn_map = service_api.fetch_sf_batch(
+                        ctx["data"] for ctx in pending
+                    )
+                except Exception:  # noqa: BLE001 - best-effort, same as any single SF call failing
+                    traceback.print_exc()
+                    spare_map, hsn_map = {}, {}
+                for ctx in pending:
+                    try:
+                        verdict = service_api.apply_sf_batch(ctx["data"], spare_map, hsn_map)
+                        rec = _finish_group(ctx, verdict)
+                    except Exception as exc:  # noqa: BLE001 - report, keep going
+                        traceback.print_exc()
+                        rec = {"file": ctx["filename"], "status": "error", "error": str(exc)}
+                    with job._lock:
+                        job.results.append(rec)
 
             # Commit the learned model once, only after a full training run.
             if job.mode == "train":
