@@ -29,7 +29,8 @@ STATUS_VALUES = [
     "BUYER ORDER NO DOESN'T EXIST",
     "SF PROCESSED",
     "PENDING IN SF",
-    "INCOMPLETE DATA",
+    "DATA MISMATCH",      # renamed from "INCOMPLETE DATA" - see migration below
+    "NEW TEMPLATE",       # unrecognized-format PDFs, previously untracked entirely
     "READY TO LOAD",
     "LOADED",
     "POSTED",
@@ -867,7 +868,7 @@ def invoices_by_batch(batch_name):
     """Every invoice in a batch (Dashboard batches table's per-status
     drill-down pop-up). Deliberately NOT filtered by IsActive: every
     non-terminal status (BUYER ORDER NO DOESN'T EXIST, PENDING IN SF,
-    INCOMPLETE DATA) is saved with IsActive=0 by evaluate_invoice() - it
+    DATA MISMATCH) is saved with IsActive=0 by evaluate_invoice() - it
     marks "not yet validated/ready", not "hide this row". Filtering on it
     here used to make the popup disagree with the status column's own
     count (e.g. count shows 3, popup opens to 0) for exactly the statuses
@@ -904,7 +905,7 @@ def get_invoice_field_check(header_id):
     """Field-by-field mandatory-data breakdown for one invoice: every
     required Purchase Header / Purchase Line / Reservation Entry column,
     its current stored value, and whether it's missing — for the Dashboard's
-    'INCOMPLETE DATA' drill-down (exactly which field(s) are missing and
+    'DATA MISMATCH' drill-down (exactly which field(s) are missing and
     what's currently in them).
     Sample: get_invoice_field_check(29)"""
     import excel_export
@@ -1281,6 +1282,15 @@ _MENU_TABLE_DDL = [
         StatusName NVARCHAR(150) NOT NULL UNIQUE
     )
     """,
+    # Rename in place (UPDATE, not delete+reinsert) so every existing
+    # tracker row's StatusID keeps pointing at the same row - only its
+    # display name changes. Must run before the seed INSERT below, or the
+    # seed would insert "DATA MISMATCH" as a brand new row (since it
+    # doesn't exist yet under that name) while old rows stay orphaned on
+    # the never-updated "INCOMPLETE DATA" name.
+    "IF EXISTS (SELECT 1 FROM dbo.tbl_status WHERE StatusName = 'INCOMPLETE DATA') "
+    "AND NOT EXISTS (SELECT 1 FROM dbo.tbl_status WHERE StatusName = 'DATA MISMATCH') "
+    "UPDATE dbo.tbl_status SET StatusName = 'DATA MISMATCH' WHERE StatusName = 'INCOMPLETE DATA'",
     f"""
     INSERT INTO tbl_status (StatusName)
     SELECT v FROM (VALUES {_STATUS_SEED_VALUES}) t(v)

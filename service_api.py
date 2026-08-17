@@ -332,14 +332,14 @@ def evaluate_invoice(data):
             # GetHSNDetails (the item-master lookup) never resolved this
             # line's description at all -> SF has no idea what this part
             # is. Treat the PDF as an unrecognized/new template: park the
-            # invoice as INCOMPLETE DATA (Purchase Line's [No.] stays
+            # invoice as NEW TEMPLATE (Purchase Line's [No.] stays
             # blank) and flag it for retraining, rather than the generic
             # "PENDING IN SF" used when SF simply hasn't received the part
             # yet.
             if it.get("_hsn_nav_item_no_missing"):
                 msg = ("The field [No.] is blank in Purchase Line table — "
                        "the pdf is a new format")
-                return {"status": "INCOMPLETE DATA", "is_active": False,
+                return {"status": "NEW TEMPLATE", "is_active": False,
                         "is_synced": is_synced, "errors": [msg],
                         "reason": msg, "new_format": True}
             nav = str(it.get("ProductNo") or it.get("Nav_Item_No") or "").strip()

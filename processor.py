@@ -281,252 +281,243 @@ class JobManager:
                         # multiple invoices is assumed to be one vendor).
                         fmt_name, score = fmt_model.match(ocr_result)
 
-                        if fmt_name is None:
+                        # Most PDFs contain exactly one invoice; some (e.g. a
+                        # batch of service-call reports saved as one file)
+                        # contain several distinct ones — ocr_engine already
+                        # split those into separate groups. Process each as
+                        # its own invoice. An unrecognized format (fmt_name
+                        # is None) still goes through this same loop rather
+                        # than being parked with no DB record at all — it's
+                        # saved with its own NEW TEMPLATE status below so
+                        # it's visible/trackable, while still being copied
+                        # to New_Format for training exactly as before.
+                        invoice_groups = ocr_result.get("Invoices") or [ocr_result]
+                        multi = len(invoice_groups) > 1
+                        rel = os.path.relpath(src_path, job.source_folder).replace("\\", "/")
+                        records = []
 
-                            # Unknown format -> move to the (network)
-                            # New_Format folder for visibility, and mirror a
-                            # copy to the server New_Format so it can be
-                            # trained there.
-                            moved_to = self._move(src_path, job.unknown_folder)
+                        for group_idx, invoice_ocr in enumerate(invoice_groups):
 
-                            if job.mirror_folder and moved_to:
-                                self._copy(moved_to, job.mirror_folder)
+                            data = build_invoice_json(invoice_ocr, src_path)
 
-                            records = [{
-                                "file": filename,
-                                # Input-relative path so the upload log entry
-                                # can be reset (StatusID = 0) for re-upload.
-                                "rel": os.path.relpath(src_path, job.source_folder).replace("\\", "/"),
-                                "status": "unknown",
-                                "format": None,
-                                "format_status": "unknown",
-                                "reason": "Format not trained → moved to New_Format",
-                                "moved_to": moved_to,
-                            }]
+                            data["Template_Name"] = fmt_name
+                            data["Template"] = fmt_name
 
-                        else:
+                            # GST Vendor Type is derived, not extracted:
+                            # a seller with a readable GSTIN is GST
+                            # Registered, otherwise Unregistered.
+                            data["GST_Vendor_Type"] = (
+                                "Registered" if (data.get("seller_gstin") or "").strip()
+                                else "UnRegistered"
+                            )
 
-                            # Most PDFs contain exactly one invoice; some
-                            # (e.g. a batch of service-call reports saved as
-                            # one file) contain several distinct ones —
-                            # ocr_engine already split those into separate
-                            # groups. Process each as its own invoice.
-                            invoice_groups = ocr_result.get("Invoices") or [ocr_result]
-                            multi = len(invoice_groups) > 1
-                            rel = os.path.relpath(src_path, job.source_folder).replace("\\", "/")
-                            records = []
+                            inv_no = (data.get("invoice_no") or "").strip()
 
-                            for group_idx, invoice_ocr in enumerate(invoice_groups):
-
-                                data = build_invoice_json(invoice_ocr, src_path)
-
-                                data["Template_Name"] = fmt_name
-                                data["Template"] = fmt_name
-
-                                # GST Vendor Type is derived, not extracted:
-                                # a seller with a readable GSTIN is GST
-                                # Registered, otherwise Unregistered.
-                                data["GST_Vendor_Type"] = (
-                                    "Registered" if (data.get("seller_gstin") or "").strip()
-                                    else "UnRegistered"
+                            if not inv_no:
+                                # No Vendor Invoice No. extracted for this
+                                # invoice. Only move the source PDF back
+                                # to New_Format when it has no OTHER,
+                                # already-usable invoice split — moving
+                                # it would discard that other invoice.
+                                moved_to = (
+                                    None if multi
+                                    else self._move(src_path, job.unknown_folder)
                                 )
-
-                                inv_no = (data.get("invoice_no") or "").strip()
-
-                                if not inv_no:
-                                    # No Vendor Invoice No. extracted for this
-                                    # invoice. Only move the source PDF back
-                                    # to New_Format when it has no OTHER,
-                                    # already-usable invoice split — moving
-                                    # it would discard that other invoice.
-                                    moved_to = (
-                                        None if multi
-                                        else self._move(src_path, job.unknown_folder)
-                                    )
-                                    if job.mirror_folder and moved_to:
-                                        self._copy(moved_to, job.mirror_folder)
-                                    records.append({
-                                        "file": filename,
-                                        "rel": rel,
-                                        "status": "unknown",
-                                        "format": fmt_name,
-                                        "format_status": "unknown",
-                                        "reason": (
-                                            "Vendor Invoice No. not extracted → moved to New_Format for retraining"
-                                            if moved_to else
-                                            "Vendor Invoice No. not extracted for one invoice in this file"
-                                        ),
-                                        "moved_to": moved_to,
-                                    })
-                                    continue
-
-                                # Skip if this invoice is already saved (any
-                                # batch) - matched by the extracted Vendor
-                                # Invoice No., not the PDF's filename, so a
-                                # re-upload under a different filename is
-                                # still caught. Moved out of Input so it
-                                # doesn't get picked up and OCR'd again on
-                                # every future run.
-                                if inv_no in invoice_map:
-                                    moved_to = (
-                                        None if multi
-                                        else config_store.move_pdf_to_status(
-                                            filename, "DUPLICATE", src_path=src_path
-                                        )
-                                    )
-                                    if job.mirror_folder and moved_to:
-                                        self._copy(moved_to, job.mirror_folder)
-                                    records.append({
-                                        "file": filename,
-                                        "rel": rel,
-                                        "status": "skipped",
-                                        "format": fmt_name,
-                                        "format_status": "already_processed",
-                                        "reason": (
-                                            f"Invoice {inv_no} already processed → moved to DUPLICATE"
-                                            if moved_to else
-                                            f"Invoice {inv_no} already processed"
-                                        ),
-                                        "existing_batch": invoice_map[inv_no],
-                                        "moved_to": moved_to,
-                                    })
-                                    continue
-
-                                # Static values from the business template chosen
-                                # by the PDF's path: <Input>/<entity>/<name>/...
-                                static, tkey = template_store.static_for_path(
-                                    job.source_folder, src_path
-                                )
-                                invoice_type = template_store.invoice_type_for_path(
-                                    job.source_folder, src_path
-                                )
-
-                                # ---- BC relationship keys (Header/Line/Reservation) ----
-                                job._doc_seq += 1
-                                po_fmt = static.get("PO_Number_Format", "") or ""
-                                doc_type = (
-                                    static.get("Purchase Header", {}).get("Document Type")
-                                    or static.get("Purchase Line", {}).get("Document Type")
-                                    or "Order"
-                                )
-                                doc_no = (
-                                    f"{po_fmt}{job._doc_seq:06d}" if po_fmt
-                                    else (data.get("invoice_no") or f"DOC{job._doc_seq:06d}")
-                                )
-                                data["Document Type"] = doc_type
-                                data["Document No."] = doc_no
-                                # Kept separately (not just parsed back out of
-                                # Document No.) so a Dashboard renumber later
-                                # can rebuild "prefix + new sequence" even for
-                                # a header whose invoice_no fallback doesn't
-                                # look like "PREFIX000123" at all.
-                                data["PO_Number_Format"] = po_fmt
-
-                                # ---- Service First: reservation (sf_items) +
-                                # HSN enrichment + validation. Sets data["sf_items"]
-                                # and vendor/header fields; returns the tracker
-                                # verdict (status / is_active / is_synced / reason).
-                                with job._lock:
-                                    job.stage = "Syncing"
-                                if invoice_type == "SERVICE":
-                                    # SERVICE invoices never carry a Buyer Order
-                                    # No. and have no Service First / reservation
-                                    # concept — skip the SF calls and the
-                                    # PO-driven verdict logic; ready for Load as-is.
-                                    verdict = {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
-                                else:
-                                    verdict = service_api.enrich_invoice(data)
-
-                                # SF's item-master lookup (GetHSNDetails) never
-                                # recognized a line's description at all — the
-                                # invoice still saves as INCOMPLETE DATA below,
-                                # but also copy the source PDF into New_Format
-                                # so it shows up on the Training screen.
-                                if verdict.get("new_format") and job.unknown_folder:
-                                    try:
-                                        self._copy(src_path, job.unknown_folder)
-                                        if job.mirror_folder:
-                                            self._copy(src_path, job.mirror_folder)
-                                    except Exception:  # noqa: BLE001 - best-effort
-                                        traceback.print_exc()
-
-                                # ---- Payment Terms Code / Due Date ----
-                                # data["PaymentTermsName"] comes from Service
-                                # First (GRN only, when SF returned rows);
-                                # data["payment_terms_code"] already holds
-                                # whatever the PDF itself states (Mode/Terms
-                                # of Payment), set earlier in
-                                # build_invoice_json. Resolve the final code
-                                # + day count per the business rule, then
-                                # derive Due Date from Document Date.
-                                terms_code, terms_days = resolve_payment_terms(
-                                    data.get("PaymentTermsName", ""),
-                                    data.get("payment_terms_code", ""),
-                                )
-                                data["payment_terms_code"] = terms_code
-                                data["Due_Date"] = add_days_to_date(
-                                    data.get("invoice_date", ""), terms_days
-                                )
-
-                                for it in data.get("items", []):
-                                    line_no = it.get("Line_No", "")
-                                    it["Document Type"] = doc_type
-                                    it["Document No."] = doc_no
-                                    it["Source Type"] = "39"
-                                    it["Source Subtype"] = doc_type
-                                    it["Source ID"] = doc_no
-                                    it["Source Ref. No."] = line_no
-
-                                # Write the JSON into Output mirroring the Input
-                                # template structure: <Output>/<entity>/<name>/<file>.json
-                                # A file split into multiple invoices gets a
-                                # suffixed name for the 2nd+ one so they don't
-                                # overwrite each other.
-                                rel_dir_parts = [p for p in os.path.dirname(rel).split("/") if p]
-                                out_dir = os.path.join(job.output_folder, *rel_dir_parts)
-                                os.makedirs(out_dir, exist_ok=True)
-                                suffix = f"_{group_idx + 1}" if multi else ""
-                                out_path = os.path.join(
-                                    out_dir,
-                                    os.path.splitext(filename)[0] + suffix + ".json",
-                                )
-
-                                with open(out_path, "w", encoding="utf-8") as fp:
-                                    json.dump(data, fp, indent=4, ensure_ascii=False)
-
-                                # Attach static after writing the clean JSON so
-                                # these internal keys stay out of the per-PDF file.
-                                data["_static"] = static
-                                data["_template_key"] = tkey
-
-                                rec = {
+                                if job.mirror_folder and moved_to:
+                                    self._copy(moved_to, job.mirror_folder)
+                                records.append({
                                     "file": filename,
-                                    # Path relative to the Input root, matching
-                                    # the upload log's RelPath so the tracker can
-                                    # resolve who initiated (uploaded) this file.
                                     "rel": rel,
-                                    "status": "success",
-                                    "output": out_path,
+                                    "status": "unknown",
                                     "format": fmt_name,
-                                    "format_status": "matched",
-                                    "batch": job.batch_name,
-                                    "data": data,
-                                    # Service First verdict -> per-invoice tracker
-                                    # status / IsActive / IsSynced, applied in
-                                    # _save_to_db.
-                                    "_status": verdict["status"],
-                                    "_isactive": verdict["is_active"],
-                                    "_synced": verdict.get("is_synced", False),
-                                    "_invoice_type": invoice_type,
-                                }
-                                if verdict.get("reason"):
-                                    rec["reason"] = verdict["reason"]
-                                records.append(rec)
+                                    "format_status": "unknown",
+                                    "reason": (
+                                        "Vendor Invoice No. not extracted → moved to New_Format for retraining"
+                                        if moved_to else
+                                        "Vendor Invoice No. not extracted for one invoice in this file"
+                                    ),
+                                    "moved_to": moved_to,
+                                })
+                                continue
 
-                                # Mark this invoice seen so a duplicate later in
-                                # the same run is also skipped.
-                                if inv_no:
-                                    invoice_map[inv_no] = job.batch_name
+                            # Skip if this invoice is already saved (any
+                            # batch) - matched by the extracted Vendor
+                            # Invoice No., not the PDF's filename, so a
+                            # re-upload under a different filename is
+                            # still caught. Moved out of Input so it
+                            # doesn't get picked up and OCR'd again on
+                            # every future run.
+                            if inv_no in invoice_map:
+                                moved_to = (
+                                    None if multi
+                                    else config_store.move_pdf_to_status(
+                                        filename, "DUPLICATE", src_path=src_path
+                                    )
+                                )
+                                if job.mirror_folder and moved_to:
+                                    self._copy(moved_to, job.mirror_folder)
+                                records.append({
+                                    "file": filename,
+                                    "rel": rel,
+                                    "status": "skipped",
+                                    "format": fmt_name,
+                                    "format_status": "already_processed",
+                                    "reason": (
+                                        f"Invoice {inv_no} already processed → moved to DUPLICATE"
+                                        if moved_to else
+                                        f"Invoice {inv_no} already processed"
+                                    ),
+                                    "existing_batch": invoice_map[inv_no],
+                                    "moved_to": moved_to,
+                                })
+                                continue
+
+                            # Static values from the business template chosen
+                            # by the PDF's path: <Input>/<entity>/<name>/...
+                            static, tkey = template_store.static_for_path(
+                                job.source_folder, src_path
+                            )
+                            invoice_type = template_store.invoice_type_for_path(
+                                job.source_folder, src_path
+                            )
+
+                            # ---- BC relationship keys (Header/Line/Reservation) ----
+                            job._doc_seq += 1
+                            po_fmt = static.get("PO_Number_Format", "") or ""
+                            doc_type = (
+                                static.get("Purchase Header", {}).get("Document Type")
+                                or static.get("Purchase Line", {}).get("Document Type")
+                                or "Order"
+                            )
+                            doc_no = (
+                                f"{po_fmt}{job._doc_seq:06d}" if po_fmt
+                                else (data.get("invoice_no") or f"DOC{job._doc_seq:06d}")
+                            )
+                            data["Document Type"] = doc_type
+                            data["Document No."] = doc_no
+                            # Kept separately (not just parsed back out of
+                            # Document No.) so a Dashboard renumber later
+                            # can rebuild "prefix + new sequence" even for
+                            # a header whose invoice_no fallback doesn't
+                            # look like "PREFIX000123" at all.
+                            data["PO_Number_Format"] = po_fmt
+
+                            # ---- Service First: reservation (sf_items) +
+                            # HSN enrichment + validation. Sets data["sf_items"]
+                            # and vendor/header fields; returns the tracker
+                            # verdict (status / is_active / is_synced / reason).
+                            with job._lock:
+                                job.stage = "Syncing"
+                            if fmt_name is None:
+                                # Unrecognized format — no trained anchors
+                                # to trust for a Service First lookup.
+                                # Park it as NEW TEMPLATE instead of
+                                # guessing; new_format=True below still
+                                # triggers the same New_Format
+                                # training-copy as the per-item "SF
+                                # doesn't know this part" case.
+                                verdict = {"status": "NEW TEMPLATE", "is_active": False,
+                                           "is_synced": False, "new_format": True,
+                                           "reason": "Unrecognized invoice format — needs training"}
+                            elif invoice_type == "SERVICE":
+                                # SERVICE invoices never carry a Buyer Order
+                                # No. and have no Service First / reservation
+                                # concept — skip the SF calls and the
+                                # PO-driven verdict logic; ready for Load as-is.
+                                verdict = {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
+                            else:
+                                verdict = service_api.enrich_invoice(data)
+
+                            # SF's item-master lookup (GetHSNDetails) never
+                            # recognized a line's description at all — the
+                            # invoice still saves as NEW TEMPLATE below,
+                            # but also copy the source PDF into New_Format
+                            # so it shows up on the Training screen.
+                            if verdict.get("new_format") and job.unknown_folder:
+                                try:
+                                    self._copy(src_path, job.unknown_folder)
+                                    if job.mirror_folder:
+                                        self._copy(src_path, job.mirror_folder)
+                                except Exception:  # noqa: BLE001 - best-effort
+                                    traceback.print_exc()
+
+                            # ---- Payment Terms Code / Due Date ----
+                            # data["PaymentTermsName"] comes from Service
+                            # First (GRN only, when SF returned rows);
+                            # data["payment_terms_code"] already holds
+                            # whatever the PDF itself states (Mode/Terms
+                            # of Payment), set earlier in
+                            # build_invoice_json. Resolve the final code
+                            # + day count per the business rule, then
+                            # derive Due Date from Document Date.
+                            terms_code, terms_days = resolve_payment_terms(
+                                data.get("PaymentTermsName", ""),
+                                data.get("payment_terms_code", ""),
+                            )
+                            data["payment_terms_code"] = terms_code
+                            data["Due_Date"] = add_days_to_date(
+                                data.get("invoice_date", ""), terms_days
+                            )
+
+                            for it in data.get("items", []):
+                                line_no = it.get("Line_No", "")
+                                it["Document Type"] = doc_type
+                                it["Document No."] = doc_no
+                                it["Source Type"] = "39"
+                                it["Source Subtype"] = doc_type
+                                it["Source ID"] = doc_no
+                                it["Source Ref. No."] = line_no
+
+                            # Write the JSON into Output mirroring the Input
+                            # template structure: <Output>/<entity>/<name>/<file>.json
+                            # A file split into multiple invoices gets a
+                            # suffixed name for the 2nd+ one so they don't
+                            # overwrite each other.
+                            rel_dir_parts = [p for p in os.path.dirname(rel).split("/") if p]
+                            out_dir = os.path.join(job.output_folder, *rel_dir_parts)
+                            os.makedirs(out_dir, exist_ok=True)
+                            suffix = f"_{group_idx + 1}" if multi else ""
+                            out_path = os.path.join(
+                                out_dir,
+                                os.path.splitext(filename)[0] + suffix + ".json",
+                            )
+
+                            with open(out_path, "w", encoding="utf-8") as fp:
+                                json.dump(data, fp, indent=4, ensure_ascii=False)
+
+                            # Attach static after writing the clean JSON so
+                            # these internal keys stay out of the per-PDF file.
+                            data["_static"] = static
+                            data["_template_key"] = tkey
+
+                            rec = {
+                                "file": filename,
+                                # Path relative to the Input root, matching
+                                # the upload log's RelPath so the tracker can
+                                # resolve who initiated (uploaded) this file.
+                                "rel": rel,
+                                "status": "success",
+                                "output": out_path,
+                                "format": fmt_name,
+                                "format_status": "matched" if fmt_name else "unmatched",
+                                "batch": job.batch_name,
+                                "data": data,
+                                # Service First verdict -> per-invoice tracker
+                                # status / IsActive / IsSynced, applied in
+                                # _save_to_db.
+                                "_status": verdict["status"],
+                                "_isactive": verdict["is_active"],
+                                "_synced": verdict.get("is_synced", False),
+                                "_invoice_type": invoice_type,
+                            }
+                            if verdict.get("reason"):
+                                rec["reason"] = verdict["reason"]
+                            records.append(rec)
+
+                            # Mark this invoice seen so a duplicate later in
+                            # the same run is also skipped.
+                            if inv_no:
+                                invoice_map[inv_no] = job.batch_name
 
                 except Exception as exc:  # noqa: BLE001 - report, keep going
 
@@ -688,15 +679,17 @@ class JobManager:
             # Final data-completeness gate, checked for every invoice except
             # BUYER ORDER NO DOESN'T EXIST (that one has its own manual-entry
             # workflow — Buyer Order Entry — and can't have real Reservation
-            # Entry data without a PO to look up in SF in the first place):
+            # Entry data without a PO to look up in SF in the first place)
+            # and NEW TEMPLATE (unrecognized format — nothing to check until
+            # it's trained):
             #   - all mandatory Header/Line/Reservation fields filled ->
             #     READY TO LOAD, regardless of what Service First said
-            #     (PENDING IN SF / INCOMPLETE DATA verdicts are provisional,
+            #     (PENDING IN SF / DATA MISMATCH verdicts are provisional,
             #     not final, until the data itself is checked).
-            #   - anything missing -> INCOMPLETE DATA, with exactly which
+            #   - anything missing -> DATA MISMATCH, with exactly which
             #     field(s).
             for i, group in enumerate(grouped["groups"]):
-                if tracker["statuses"][i] == "BUYER ORDER NO DOESN'T EXIST":
+                if tracker["statuses"][i] in ("BUYER ORDER NO DOESN'T EXIST", "NEW TEMPLATE"):
                     continue
                 # InvoiceNo is a mandatory column but lives outside the
                 # sheet-mapped header row (it's stored separately — see
@@ -707,7 +700,7 @@ class JobManager:
                     header_for_check, group["lines"], group["reservations"]
                 )
                 if missing:
-                    tracker["statuses"][i] = "INCOMPLETE DATA"
+                    tracker["statuses"][i] = "DATA MISMATCH"
                     tracker["isactives"][i] = False
                     # Keep a more specific reason Service First already gave
                     # (e.g. "the pdf is a new format", "Nav item No not

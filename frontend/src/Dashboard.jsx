@@ -238,23 +238,15 @@ export default function Dashboard({ user }) {
   );
 
   // The Fields drill-down button is for anyone who administers data
-  // (Super Admin + Admin), unlike the INCOMPLETE DATA/NEW TEMPLATE label
-  // swap below, which is specifically about hiding technical status names
-  // from non-admin roles.
+  // (Super Admin + Admin).
   const canViewFields = isSuperAdmin || (user?.user_type || "").toLowerCase() === "admin";
-
-  // Non-super-admins see "INCOMPLETE DATA" relabeled as "NEW TEMPLATE"
-  // everywhere it's displayed (chart, breakdown, invoice lists) — the
-  // underlying status name/logic is unchanged, this is display-only.
-  const displayStatus = (s) => (!isSuperAdmin && s === "INCOMPLETE DATA") ? "NEW TEMPLATE" : s;
-  const displayStatusCounts = statusCounts.map((c) => ({ ...c, status: displayStatus(c.status) }));
 
   const invoiceColumns = [
     { key: "invoice_no", label: "Invoice No.", render: invoiceCell },
     { key: "file_name", label: "File" },
     { key: "vendor", label: "Vendor" },
     { key: "invoice_type", label: "Invoice Type" },
-    { key: "status", label: "Status", render: (row) => displayStatus(row.status) },
+    { key: "status", label: "Status" },
     { key: "batch", label: "Batch" },
     ...(canViewFields ? [{ key: "_fields", label: "", sortable: false,
       render: (row) => row.header_id ? (
@@ -307,7 +299,8 @@ export default function Dashboard({ user }) {
     { status: "BUYER ORDER NO DOESN'T EXIST", label: "Buyer Order No Doesn't Exist" },
     { status: "EXCLUDED", label: "Excluded" },
     { status: "PENDING IN SF", label: "Pending in SF" },
-    { status: "INCOMPLETE DATA", label: isSuperAdmin ? "Incomplete Data" : "New Template" },
+    { status: "DATA MISMATCH", label: "Data Mismatch" },
+    { status: "NEW TEMPLATE", label: "New Template" },
     { status: "READY TO LOAD", label: "Ready to Load" },
     { status: "LOADED", label: "Loaded" },
     { status: "POSTED", label: "Posted" },
@@ -427,11 +420,11 @@ export default function Dashboard({ user }) {
               <h3>Invoices by status</h3><div style={{ flex: 1 }} />
               <button className="btn btn-subtle btn-sm" onClick={loadStatusCounts}>Refresh</button>
             </div>
-            <StatusPie data={displayStatusCounts} onSlice={openStatusModal} />
+            <StatusPie data={statusCounts} onSlice={openStatusModal} />
           </div>
           <div className="card">
             <h3>Status breakdown</h3>
-            <StatusBars data={displayStatusCounts} onSlice={openStatusModal} />
+            <StatusBars data={statusCounts} onSlice={openStatusModal} />
           </div>
         </div>
       </div>

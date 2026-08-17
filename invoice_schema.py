@@ -221,13 +221,133 @@ _CITY_STOPWORDS = {
 }
 
 
+# Reference gazetteer of Indian city/town/locality names, used to recognize
+# a city that's actually two (or three) words - e.g. "T Nagar", "Navi
+# Mumbai", "New Delhi", "Anna Nagar" - which the single-last-word fallback
+# below would otherwise cut down to just "Nagar"/"Mumbai"/"Delhi". Lowercase,
+# multi-word entries as space-joined phrases. Not exhaustive, but covers
+# every state/UT capital, the major metros/tier-2 cities, and the common
+# business-district localities of the largest metros (Chennai, Mumbai,
+# Bengaluru, Delhi NCR, Hyderabad, Pune) that GST invoices frequently cite
+# in place of the formal city name.
+_KNOWN_CITIES = {
+    # State / UT capitals & major metros
+    "delhi", "new delhi", "mumbai", "bengaluru", "bangalore", "chennai",
+    "kolkata", "hyderabad", "pune", "ahmedabad", "surat", "jaipur",
+    "lucknow", "kanpur", "nagpur", "indore", "thane", "bhopal",
+    "visakhapatnam", "vadodara", "ghaziabad", "ludhiana", "agra", "nashik",
+    "faridabad", "meerut", "rajkot", "kalyan", "vasai", "varanasi",
+    "srinagar", "aurangabad", "dhanbad", "amritsar", "navi mumbai",
+    "allahabad", "prayagraj", "ranchi", "howrah", "coimbatore", "jabalpur",
+    "gwalior", "vijayawada", "jodhpur", "madurai", "raipur", "kota",
+    "guwahati", "chandigarh", "solapur", "hubli", "dharwad",
+    "hubli-dharwad", "bareilly", "moradabad", "mysore", "mysuru",
+    "gurgaon", "gurugram", "aligarh", "jalandhar", "tiruchirappalli",
+    "trichy", "bhubaneswar", "salem", "warangal", "bhiwandi", "saharanpur",
+    "gorakhpur", "guntur", "bikaner", "amravati", "noida", "greater noida",
+    "jamshedpur", "bhilai", "cuttack", "firozabad", "kochi", "cochin",
+    "nellore", "bhavnagar", "dehradun", "durgapur", "asansol", "rourkela",
+    "nanded", "kolhapur", "ajmer", "akola", "gulbarga", "kalaburagi",
+    "jamnagar", "ujjain", "siliguri", "jhansi", "ulhasnagar", "jammu",
+    "sangli", "belgaum", "belagavi", "mangalore", "mangaluru",
+    "tirunelveli", "malegaon", "gaya", "jalgaon", "udaipur", "davanagere",
+    "kozhikode", "calicut", "kurnool", "rajahmundry", "bokaro", "bellary",
+    "ballari", "patiala", "agartala", "bhagalpur", "muzaffarnagar",
+    "latur", "dhule", "rohtak", "korba", "bhilwara", "berhampur",
+    "muzaffarpur", "ahmednagar", "mathura", "kollam", "avadi", "kadapa",
+    "sambalpur", "bilaspur", "shahjahanpur", "satara", "bijapur",
+    "vijayapura", "rampur", "shivamogga", "shimoga", "chandrapur",
+    "junagadh", "thrissur", "alwar", "bardhaman", "burdwan", "nizamabad",
+    "parbhani", "tumkur", "tumakuru", "khammam", "panipat", "darbhanga",
+    "aizawl", "dewas", "karnal", "bathinda", "jalna", "eluru", "barabanki",
+    "purnia", "satna", "mau", "sonipat", "farrukhabad", "sagar", "durg",
+    "imphal", "ratlam", "hapur", "arrah", "anantapur", "karimnagar",
+    "etawah", "ambernath", "bharatpur", "begusarai", "gandhidham",
+    "puducherry", "pondicherry", "sikar", "thoothukudi", "tuticorin",
+    "rewa", "mirzapur", "raichur", "pali", "ramagundam", "haridwar",
+    "vizianagaram", "tenali", "nagercoil", "sri ganganagar", "thanjavur",
+    "bulandshahr", "katni", "sambhal", "singrauli", "nadiad", "secunderabad",
+    "yamunanagar", "bidhannagar", "pallavaram", "bidar", "munger",
+    "panchkula", "burhanpur", "kharagpur", "dindigul", "gandhinagar",
+    "hospet", "hosapete", "ambattur", "vellore", "machilipatnam", "shimla",
+    "udupi", "katihar", "mahbubnagar", "saharsa", "dibrugarh", "jorhat",
+    "hazaribagh", "bhimavaram", "guntakal", "panvel", "deoghar", "ongole",
+    "nandyal", "morena", "bhiwani", "porbandar", "palakkad", "anand",
+    "purulia", "baharampur", "barmer", "morvi", "morbi", "orai", "bahraich",
+    "sirsa", "danapur", "serampore", "guna", "jaunpur", "shivpuri",
+    "surendranagar", "unnao", "chittoor", "lakhimpur", "hindupur",
+    "bharuch", "arakkonam", "chittorgarh", "ratnagiri", "nagaon",
+    "cuddalore", "erode", "kanchipuram", "tirupati", "karaikudi",
+    "neyveli", "rajapalayam", "sivakasi", "namakkal", "krishnagiri",
+    "hosur", "pollachi", "nagapattinam", "virudhunagar", "ariyalur",
+    "perambalur", "villupuram",
+    # Chennai localities/areas commonly cited in place of "Chennai" itself
+    "t nagar", "anna nagar", "adyar", "guindy", "velachery", "porur",
+    "tambaram", "west tambaram", "east tambaram", "chromepet", "egmore",
+    "mylapore", "nungambakkam", "perambur", "kilpauk", "vadapalani",
+    "saidapet", "triplicane", "royapettah", "alwarpet", "nandanam",
+    "teynampet", "ashok nagar", "kk nagar", "kodambakkam", "choolaimedu",
+    "aminjikarai", "purasawalkam", "villivakkam", "selaiyur", "medavakkam",
+    "sholinganallur", "thoraipakkam", "perungudi", "navalur", "siruseri",
+    "padi", "korattur", "mogappair", "west mambalam", "mambalam",
+    "poonamallee", "redhills", "madhavaram", "manali", "ennore",
+    "royapuram", "washermanpet", "tondiarpet", "chetpet", "vepery",
+    "santhome", "besant nagar", "thiruvanmiyur", "kolathur",
+    # Mumbai localities
+    "andheri", "bandra", "borivali", "dadar", "malad", "goregaon",
+    "kandivali", "vile parle", "juhu", "powai", "chembur", "ghatkopar",
+    "kurla", "worli", "colaba", "lower parel", "vikhroli", "mulund",
+    "bhandup", "vashi", "nerul", "kharghar", "airoli", "belapur",
+    "mira road", "virar", "nalasopara", "dombivli",
+    # Bengaluru localities
+    "whitefield", "koramangala", "indiranagar", "jayanagar",
+    "malleshwaram", "rajajinagar", "hsr layout", "btm layout",
+    "electronic city", "marathahalli", "yelahanka", "hebbal",
+    "banashankari", "jp nagar", "basavanagudi", "peenya",
+    # Delhi NCR localities
+    "dwarka", "rohini", "pitampura", "karol bagh", "lajpat nagar",
+    "saket", "vasant kunj", "janakpuri", "rajouri garden",
+    "connaught place", "chandni chowk", "mayur vihar", "preet vihar",
+    "laxmi nagar", "okhla", "nehru place", "greater kailash", "hauz khas",
+    "model town", "shalimar bagh",
+    # Hyderabad localities
+    "gachibowli", "madhapur", "kukatpally", "ameerpet", "begumpet",
+    "banjara hills", "jubilee hills", "uppal", "lb nagar", "miyapur",
+    "kondapur",
+    # Pune localities
+    "hinjewadi", "kothrud", "baner", "wakad", "aundh", "hadapsar",
+    "viman nagar", "kharadi", "pimpri", "chinchwad", "wagholi", "katraj",
+}
+# Longest phrase (in words) present in the gazetteer, so the matcher below
+# knows how wide a window to try first.
+_KNOWN_CITY_MAX_WORDS = max(len(c.split()) for c in _KNOWN_CITIES)
+
+
+def _match_known_city(tokens):
+    """Look for the longest gazetteer entry ending at the tail of `tokens`,
+    trying wider windows first so a two-word city/locality ('T Nagar',
+    'Navi Mumbai') is preferred over the single trailing word it contains."""
+    n = len(tokens)
+    for width in range(min(_KNOWN_CITY_MAX_WORDS, n), 0, -1):
+        chunk = [t.strip(".:-–() ") for t in tokens[n - width:]]
+        if not all(re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", c) for c in chunk):
+            continue
+        phrase = " ".join(c.rstrip(".") for c in chunk).lower()
+        if phrase in _KNOWN_CITIES:
+            return " ".join(w.capitalize() for w in phrase.split())
+    return ""
+
+
 def _city(address, state_name=""):
-    """Best-effort city from an address. The city is usually the last plain
-    alphabetic word sitting just before the PIN code ('... Chennai - 600 017',
-    '... CHENNAI 600 017'); everything after the PIN (India / phone / Ext) is
-    ignored. Falls back to the last alphabetic word when no PIN is present
-    ('22 HABIBULLAH ROAD T.NAGAR CHENNAI'), skipping punctuation, phone/ext
-    tokens and state-name words ('... CHENNAI, TAMIL MADU -')."""
+    """Best-effort city from an address. Tries the known-city gazetteer
+    first (so multi-word cities/localities like 'T Nagar' or 'Navi Mumbai'
+    come back whole), then falls back to a single-word heuristic: the last
+    plain alphabetic word sitting just before the PIN code ('... Chennai -
+    600 017', '... CHENNAI 600 017'); everything after the PIN (India /
+    phone / Ext) is ignored. Falls back to the last alphabetic word when no
+    PIN is present ('22 HABIBULLAH ROAD T.NAGAR CHENNAI'), skipping
+    punctuation, phone/ext tokens and state-name words ('... CHENNAI, TAMIL
+    MADU -')."""
     if not address:
         return ""
     stop = set(_CITY_STOPWORDS)
@@ -249,6 +369,14 @@ def _city(address, state_name=""):
             cut = i
             break
     search = tokens[:cut] or tokens
+    # Drop stray punctuation-only tokens (a lone "-" separator left behind
+    # once the PIN itself is cut off) so they don't block a match at the
+    # tail - e.g. "... T Nagar - 600017" must search from "Nagar", not "-".
+    search = [t for t in search if re.search(r"[A-Za-z0-9]", t)]
+
+    known = _match_known_city(search)
+    if known:
+        return known
 
     for tok in reversed(search):
         cleaned = tok.strip(".:-–() ")
@@ -263,13 +391,55 @@ def _city(address, state_name=""):
     return ""
 
 
+# A line that's actually contact info (phone/GST/email/website) rather
+# than part of the postal address itself - GST invoice address blocks
+# frequently run a "Mobile: ...", "GSTIN: ...", "Email: ..." line right
+# after the real street address, which _address_lines() used to glue
+# straight into Address 2, inflating it well past BC's field length and
+# mixing contact data into an address field.
+_CONTACT_LINE_RE = re.compile(
+    r"@"                                                   # email
+    r"|\bwww\.|https?://"                                  # website
+    r"|\bgstin\b|\bgst\s*no\.?"                             # GST label
+    r"|\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]Z[A-Z\d]\b"        # GSTIN itself
+    r"|\b(?:ph|phone|mobile|mob|contact|tel|fax)\b\.?\s*:?" # phone label
+    r"|\budyam\b"                                           # Udyam label
+    r"|\budyam-[a-z]{2}-\d{2}-\d{7}\b"                      # Udyam reg. no.
+    r"|^\+?\d[\d\s\-]{8,14}\d$",                            # bare phone number
+    re.IGNORECASE,
+)
+
+
+def _strip_contact(line):
+    """Cut a line at the first phone/GST/email/website/Udyam marker, so
+    real address text OCR'd onto the same line as contact info (a common
+    layout - '...Mumbai - 400001 UDYAM : UDYAM-MH-19-0149863 ...email...')
+    keeps its street/city/PIN instead of the whole line being discarded.
+    Returns "" if the marker starts at (or before) the first real
+    character, i.e. the line is contact info start to finish."""
+    m = _CONTACT_LINE_RE.search(line)
+    if not m:
+        return line
+    cut = m.start()
+    # If the marker starts mid-word (the "@" inside "admin@x.com"), back up
+    # to the start of that word so a stray fragment ("admin") isn't left
+    # dangling in the kept prefix.
+    if cut > 0 and not line[cut - 1].isspace():
+        ws = line.rfind(" ", 0, cut)
+        cut = ws + 1 if ws != -1 else 0
+    return line[:cut].strip(" ,.-")
+
+
 def _address_lines(address):
-    """Split a possibly multi-line address into (line1, line2)."""
+    """Split a possibly multi-line address into (line1, line2), trimming
+    away any phone/GST/email/website/Udyam contact info found on a line
+    rather than an actual address line."""
 
     if not address:
         return "", ""
 
-    lines = [ln.strip() for ln in address.split("\n") if ln.strip()]
+    raw_lines = [ln.strip() for ln in address.split("\n") if ln.strip()]
+    lines = [s for s in (_strip_contact(ln) for ln in raw_lines) if s]
 
     line1 = lines[0] if lines else ""
     line2 = " ".join(lines[1:]) if len(lines) > 1 else ""

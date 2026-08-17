@@ -328,7 +328,7 @@ def build_rows_grouped(invoices, mapping=None):
 # deliberately NOT in these lists: they're saved blank on purpose (see
 # database.save_grouped) and only become real once the invoice is marked
 # Loaded — an invoice otherwise ready must not be downgraded to
-# INCOMPLETE DATA just because that future value isn't set yet.
+# DATA MISMATCH just because that future value isn't set yet.
 REQUIRED_HEADER_FIELDS = [
     "Pay-to Name", "Pay-to Address", "Ship-to Name", "Ship-to Address",
     "Posting Date", "Payment Terms Code", "Due Date", "Location Code",

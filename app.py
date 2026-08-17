@@ -569,7 +569,7 @@ def invoices_by_status(status_id: int):
 @app.get("/api/invoices/{header_id}/fields")
 def invoice_field_check(header_id: int):
     """Field-by-field mandatory-data breakdown for one invoice (Dashboard
-    'INCOMPLETE DATA' drill-down): every required column, its current
+    'DATA MISMATCH' drill-down): every required column, its current
     value, and whether it's missing."""
     import database
     try:
