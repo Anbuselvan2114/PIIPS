@@ -720,9 +720,36 @@ def fetch_batch(batch_name, sheet_cols):
                     r"^[S5]PRPUR/?", "", row.get("Consignment Note No.") or "",
                     flags=re.IGNORECASE)
 
+        # A freight/courier/forwarding line has no Navision item master
+        # entry - BC books it as a fixed service line. Re-applied here (not
+        # just at save time in excel_export.py's _freight_line_override) so
+        # a download is correct even for a batch saved before this fix, same
+        # reasoning as Consignment Note No. above.
+        part_header_ids = set()
+        if any(row.get("Type") == "Charge (Item)" for row in pl_r):
+            cur.execute(
+                "SELECT pt.Purchase_Header_ID FROM tbl_Purchase_Tracker pt "
+                "JOIN tbl_InvoiceType it ON it.InvoiceTypeId = pt.InvoiceTypeID "
+                "WHERE pt.BatchName = ? AND it.InvoiceTypeName = 'PART'",
+                batch_name,
+            )
+            part_header_ids = {r[0] for r in cur.fetchall()}
+
         for row in pl_r:
             if not (row.get("Document No.") or "").strip():
                 row["Document No."] = last_no_by_header.get(row.get("Purchase_Header_ID"), "")
+            if (row.get("Type") == "Charge (Item)"
+                    and row.get("Purchase_Header_ID") in part_header_ids):
+                if "No." in row:
+                    row["No."] = "FRIEGHT IN"
+                if "GST Group Type" in row:
+                    row["GST Group Type"] = "Service"
+                if "GST Group Code" in row:
+                    try:
+                        rate = float(row.get("GST %") or 0)
+                    except (TypeError, ValueError):
+                        rate = 0
+                    row["GST Group Code"] = f"Service {rate:g}%" if rate else "Service"
 
         for row in re_r:
             if not (row.get("Source ID") or "").strip():

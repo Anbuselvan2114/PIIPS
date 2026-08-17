@@ -489,6 +489,10 @@ class JobManager:
                             # these internal keys stay out of the per-PDF file.
                             data["_static"] = static
                             data["_template_key"] = tkey
+                            # So excel_export._link_override can special-case
+                            # PART invoices' freight/charge lines without a
+                            # separate lookup.
+                            data["_invoice_type"] = invoice_type
 
                             rec = {
                                 "file": filename,
