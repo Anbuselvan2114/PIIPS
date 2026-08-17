@@ -566,6 +566,35 @@ def _rate_near(text, keyword):
     return None
 
 
+# A page-footer note bleeding into the last item's description because the
+# table continues past a page break ("...LENOVO continued to page number 2
+# This is a Computer Generated Invoice") - generic boilerplate seen across
+# vendors, not any one template's quirk.
+_ITEM_FOOTER_RE = re.compile(
+    r"continued\s+to\s+page\s*(?:no\.?|number)?\s*\d+"
+    r"|this\s+is\s+an?\s+computer[\s-]*generated\s+invoice",
+    re.IGNORECASE,
+)
+
+
+def _clean_item_description(desc, serial):
+    """Strip OCR noise from an item's own description: a leading echo of
+    this row's serial number ('1. ', '2 ') - matched against the row's
+    actual SI so a genuine leading measurement ('18.5" TFT...') is never
+    mistaken for one - a trailing GST rate ('...ROLLER 18%', already
+    captured as its own field before this runs), and page-footer
+    boilerplate that bled in across a page break."""
+    desc = str(desc or "").strip()
+    if not desc:
+        return desc
+    desc = re.sub(rf"^{re.escape(str(serial))}\.?\s+", "", desc)
+    m = _ITEM_FOOTER_RE.search(desc)
+    if m:
+        desc = desc[:m.start()]
+    desc = re.sub(r"\s*\d{1,2}(?:\.\d+)?\s*%\s*$", "", desc)
+    return desc.strip(" ,.-")
+
+
 def _gst_rate_from_text(text):
     """
     Best-effort GST rate (%) read straight from the OCR text.
@@ -709,7 +738,7 @@ def build_invoice_json(result, pdf_path=""):
 
         qty_n = _num(it.get("Quantity"))
         amt_n = _num(it.get("Amount"))
-        desc = it.get("Description", "")
+        raw_desc = it.get("Description", "")
         is_charge = bool(it.get("charge"))
 
         # The invoice-level rate covers layouts with a proper tax-summary
@@ -717,10 +746,14 @@ def build_invoice_json(result, pdf_path=""):
         # layouts instead print the rate trailing the item's own description
         # ("... PICKUP ROLLER 18%") with nothing recognisable elsewhere on
         # the page - fall back to that per item when the invoice-level rate
-        # came back blank, rather than leaving GST % empty.
-        item_rate = rate if rate else _rate_near(desc, "")
+        # came back blank, rather than leaving GST % empty. Reads the raw
+        # description (before _clean_item_description below strips that
+        # same "18%" out as noise).
+        item_rate = rate if rate else _rate_near(raw_desc, "")
         # (keyword="" matches every line - the description is what we're
         # scanning here, not a labelled tax-summary line.)
+
+        desc = _clean_item_description(raw_desc, serial)
 
         items.append({
             "sl_no": serial,
