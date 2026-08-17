@@ -26,6 +26,7 @@ import re
 from datetime import datetime
 
 import requests
+from rapidfuzz import fuzz
 
 import config_store
 
@@ -45,6 +46,28 @@ def _base_url():
 
 def _clean(value):
     return str(value or "").strip().lower()
+
+
+# Vendor invoice wording and Navision's own catalog description are never
+# byte-identical ("1. HP LJ P1505 PICKUP ROLLER 18%" vs. Nav's "PICKUP
+# ROLLER - HP1505") - word order and vendor-added noise (numbering, GST %,
+# unit) differ even for the same part. token_set_ratio scores on the words
+# each shares regardless of order/duplication, so it tolerates that noise
+# while still catching a genuinely different part description.
+_DESC_MISMATCH_THRESHOLD = 45
+
+
+def _description_mismatch(nav_desc, pdf_desc):
+    """True if `nav_desc` (Nav_Part_Description) doesn't look like it
+    describes the same part as `pdf_desc` (the PDF's own item line). A
+    blank nav_desc always counts as a mismatch - nothing to compare."""
+    nav_desc = str(nav_desc or "").strip()
+    pdf_desc = str(pdf_desc or "").strip()
+    if not nav_desc:
+        return True
+    if not pdf_desc:
+        return False  # nothing on our side to compare against - don't flag
+    return fuzz.token_set_ratio(nav_desc.upper(), pdf_desc.upper()) < _DESC_MISMATCH_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +378,16 @@ def evaluate_invoice(data):
             nav = str(it.get("ProductNo") or it.get("Nav_Item_No") or "").strip()
             if not nav or nav.lower() == "null":
                 return fail("Nav Part Description not entered in SF GRN")
+            # SF resolved a Nav_Item_No, but its own Nav_Part_Description is
+            # either blank or describes something else entirely - trusting
+            # it (or the blank) would load the wrong part into BC, so this
+            # needs a human to confirm before it's ready.
+            if _description_mismatch(it.get("Nav_Part_Description"), it.get("Description")):
+                msg = ("Nav Part Description is empty or doesn't match the "
+                       "PDF's item description")
+                return {"status": "DATA MISMATCH", "is_active": False,
+                        "is_synced": is_synced, "errors": [msg],
+                        "reason": msg, "new_format": True}
 
         # Purchase Line is fine — now check the Reservation Entry side: every
         # row GetSparePurchaseItem returned must itself carry a Nav_Item_No

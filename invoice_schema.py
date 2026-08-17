@@ -644,6 +644,16 @@ def build_invoice_json(result, pdf_path=""):
         desc = it.get("Description", "")
         is_charge = bool(it.get("charge"))
 
+        # The invoice-level rate covers layouts with a proper tax-summary
+        # table or a general "IGST/CGST+SGST NN%" line in the OCR text. Some
+        # layouts instead print the rate trailing the item's own description
+        # ("... PICKUP ROLLER 18%") with nothing recognisable elsewhere on
+        # the page - fall back to that per item when the invoice-level rate
+        # came back blank, rather than leaving GST % empty.
+        item_rate = rate if rate else _rate_near(desc, "")
+        # (keyword="" matches every line - the description is what we're
+        # scanning here, not a labelled tax-summary line.)
+
         items.append({
             "sl_no": serial,
             "Description": desc,
@@ -660,9 +670,9 @@ def build_invoice_json(result, pdf_path=""):
             "Quantity": qty_n if qty_n is not None else "",
             "Amount": amt_n if amt_n is not None else "",
             "GST_Base_Amount": amt_n if amt_n is not None else "",
-            "TaxPercentage": rate if rate else "",
+            "TaxPercentage": item_rate if item_rate else "",
             "HSN_Percentage_Description": (
-                f"Goods {rate:g}%" if rate else ""
+                f"Goods {item_rate:g}%" if item_rate else ""
             ),
             "PartSpecification": desc,
             # Seed from the PDF's own table HSN/SAC column so it's used
