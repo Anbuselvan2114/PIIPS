@@ -406,38 +406,6 @@ class JobManager:
 
                             inv_no = (data.get("invoice_no") or "").strip()
 
-                            # Skip if this invoice is already saved (any
-                            # batch) - matched by the extracted Vendor
-                            # Invoice No., not the PDF's filename, so a
-                            # re-upload under a different filename is
-                            # still caught. Moved out of Input so it
-                            # doesn't get picked up and OCR'd again on
-                            # every future run.
-                            if inv_no in invoice_map:
-                                moved_to = (
-                                    None if multi
-                                    else config_store.move_pdf_to_status(
-                                        filename, "DUPLICATE", src_path=src_path
-                                    )
-                                )
-                                if job.mirror_folder and moved_to:
-                                    self._copy(moved_to, job.mirror_folder)
-                                records.append({
-                                    "file": filename,
-                                    "rel": rel,
-                                    "status": "skipped",
-                                    "format": fmt_name,
-                                    "format_status": "already_processed",
-                                    "reason": (
-                                        f"Invoice {inv_no} already processed → moved to DUPLICATE"
-                                        if moved_to else
-                                        f"Invoice {inv_no} already processed"
-                                    ),
-                                    "existing_batch": invoice_map[inv_no],
-                                    "moved_to": moved_to,
-                                })
-                                continue
-
                             # Static values from the business template chosen
                             # by the PDF's path: <Input>/<entity>/<name>/...
                             static, tkey = template_store.static_for_path(
@@ -468,15 +436,6 @@ class JobManager:
                             # look like "PREFIX000123" at all.
                             data["PO_Number_Format"] = po_fmt
 
-                            # Registered as soon as this invoice_no is
-                            # accepted (not deferred to _finish_group) so a
-                            # duplicate elsewhere later in this SAME run is
-                            # still caught by the check above, even though
-                            # PART invoices don't get their final verdict
-                            # until the batched Service First call below.
-                            if inv_no:
-                                invoice_map[inv_no] = job.batch_name
-
                             ctx = {
                                 "data": data, "filename": filename, "rel": rel,
                                 "fmt_name": fmt_name, "doc_type": doc_type,
@@ -485,6 +444,34 @@ class JobManager:
                                 "src_path": src_path, "inv_no": inv_no,
                                 "static": static, "tkey": tkey,
                             }
+
+                            # Already saved (any batch) - matched by the
+                            # extracted Vendor Invoice No., not the PDF's
+                            # filename, so a re-upload under a different
+                            # filename is still caught. Given a real tracker
+                            # row like every other outcome (not silently
+                            # skipped with none at all) so it's visible/
+                            # counted on the Dashboard; _move_by_status below
+                            # relocates the PDF into the DUPLICATE folder the
+                            # same way it does for every other status.
+                            if inv_no in invoice_map:
+                                verdict = {
+                                    "status": "DUPLICATE", "is_active": False,
+                                    "is_synced": False,
+                                    "reason": f"Invoice {inv_no} already processed "
+                                              f"in batch {invoice_map[inv_no]}",
+                                }
+                                records.append(_finish_group(ctx, verdict))
+                                continue
+
+                            # Registered as soon as this invoice_no is
+                            # accepted (not deferred to _finish_group) so a
+                            # duplicate elsewhere later in this SAME run is
+                            # still caught by the check above, even though
+                            # PART invoices don't get their final verdict
+                            # until the batched Service First call below.
+                            if inv_no:
+                                invoice_map[inv_no] = job.batch_name
 
                             if fmt_name is None or not inv_no:
                                 # Either the format itself is unrecognized,
@@ -704,9 +691,11 @@ class JobManager:
             # Final data-completeness gate, checked for every invoice except
             # BUYER ORDER NO DOESN'T EXIST (that one has its own manual-entry
             # workflow — Buyer Order Entry — and can't have real Reservation
-            # Entry data without a PO to look up in SF in the first place)
-            # and NEW TEMPLATE (unrecognized format — nothing to check until
-            # it's trained):
+            # Entry data without a PO to look up in SF in the first place),
+            # NEW TEMPLATE (unrecognized format — nothing to check until
+            # it's trained), and DUPLICATE (already-processed invoice,
+            # parked purely for visibility - its own data completeness is
+            # irrelevant, the real copy elsewhere is what matters):
             #   - all mandatory Header/Line/Reservation fields filled ->
             #     READY TO LOAD, regardless of what Service First said
             #     (PENDING IN SF / DATA MISMATCH verdicts are provisional,
@@ -714,7 +703,9 @@ class JobManager:
             #   - anything missing -> DATA MISMATCH, with exactly which
             #     field(s).
             for i, group in enumerate(grouped["groups"]):
-                if tracker["statuses"][i] in ("BUYER ORDER NO DOESN'T EXIST", "NEW TEMPLATE"):
+                if tracker["statuses"][i] in (
+                    "BUYER ORDER NO DOESN'T EXIST", "NEW TEMPLATE", "DUPLICATE",
+                ):
                     continue
                 # InvoiceNo is a mandatory column but lives outside the
                 # sheet-mapped header row (it's stored separately — see

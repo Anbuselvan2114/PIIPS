@@ -500,10 +500,26 @@ def _strip_contact(line):
     return line[:min(positions)].strip(" ,.-")
 
 
+def _cap(text, limit=50):
+    """Hard-cap a string to `limit` characters - Business Central's
+    Address/Address 2 fields are Text50, so a value any longer gets
+    rejected or silently truncated downstream regardless. This is a
+    safety net after the noise-stripping above (which already removes
+    most of what pushes a line past 50), not a substitute for it. Breaks
+    at the last space inside the limit when there is one, so a long line
+    isn't cut mid-word."""
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    return (text[:cut] if cut > 0 else text[:limit]).rstrip(" ,.-")
+
+
 def _address_lines(address):
     """Split a possibly multi-line address into (line1, line2), trimming
     away any phone/GST/email/website/Udyam contact info found on a line
-    rather than an actual address line."""
+    rather than an actual address line, and capping each to BC's 50-char
+    Address/Address 2 field limit."""
 
     if not address:
         return "", ""
@@ -514,7 +530,7 @@ def _address_lines(address):
     line1 = lines[0] if lines else ""
     line2 = " ".join(lines[1:]) if len(lines) > 1 else ""
 
-    return line1, line2
+    return _cap(line1), _cap(line2)
 
 
 def _num(value):
