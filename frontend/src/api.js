@@ -195,9 +195,6 @@ const sub = (subpath) =>
 export const getInputFiles = (subpath = "") =>
   request(`/api/input/files${sub(subpath)}`);
 
-export const openInputFolder = (subpath = "") =>
-  request(`/api/input/open${sub(subpath)}`, { method: "POST" });
-
 export const uploadInputFiles = async (fileList, subpath = "", user_id) => {
   const form = new FormData();
   for (const f of fileList) form.append("files", f);

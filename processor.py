@@ -313,33 +313,6 @@ class JobManager:
 
                             inv_no = (data.get("invoice_no") or "").strip()
 
-                            if not inv_no:
-                                # No Vendor Invoice No. extracted for this
-                                # invoice. Only move the source PDF back
-                                # to New_Format when it has no OTHER,
-                                # already-usable invoice split — moving
-                                # it would discard that other invoice.
-                                moved_to = (
-                                    None if multi
-                                    else self._move(src_path, job.unknown_folder)
-                                )
-                                if job.mirror_folder and moved_to:
-                                    self._copy(moved_to, job.mirror_folder)
-                                records.append({
-                                    "file": filename,
-                                    "rel": rel,
-                                    "status": "unknown",
-                                    "format": fmt_name,
-                                    "format_status": "unknown",
-                                    "reason": (
-                                        "Vendor Invoice No. not extracted → moved to New_Format for retraining"
-                                        if moved_to else
-                                        "Vendor Invoice No. not extracted for one invoice in this file"
-                                    ),
-                                    "moved_to": moved_to,
-                                })
-                                continue
-
                             # Skip if this invoice is already saved (any
                             # batch) - matched by the extracted Vendor
                             # Invoice No., not the PDF's filename, so a
@@ -408,17 +381,24 @@ class JobManager:
                             # verdict (status / is_active / is_synced / reason).
                             with job._lock:
                                 job.stage = "Syncing"
-                            if fmt_name is None:
-                                # Unrecognized format — no trained anchors
-                                # to trust for a Service First lookup.
-                                # Park it as NEW TEMPLATE instead of
-                                # guessing; new_format=True below still
-                                # triggers the same New_Format
-                                # training-copy as the per-item "SF
-                                # doesn't know this part" case.
+                            if fmt_name is None or not inv_no:
+                                # Either the format itself is unrecognized,
+                                # or no Vendor Invoice No. could be read off
+                                # this PDF at all - neither leaves anything
+                                # trustworthy to hand to Service First or to
+                                # generate a real Document No. from. Park it
+                                # as NEW TEMPLATE instead of guessing;
+                                # new_format=True below still triggers the
+                                # same New_Format training-copy as the
+                                # per-item "SF doesn't know this part" case.
+                                reason = (
+                                    "Unrecognized invoice format — needs training"
+                                    if fmt_name is None else
+                                    "Vendor Invoice No. not extracted — needs training"
+                                )
                                 verdict = {"status": "NEW TEMPLATE", "is_active": False,
                                            "is_synced": False, "new_format": True,
-                                           "reason": "Unrecognized invoice format — needs training"}
+                                           "reason": reason}
                             elif invoice_type == "SERVICE":
                                 # SERVICE invoices never carry a Buyer Order
                                 # No. and have no Service First / reservation

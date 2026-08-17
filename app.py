@@ -938,24 +938,6 @@ def input_files(subpath: str = ""):
     return {"folder": folder, "files": items}
 
 
-@app.post("/api/input/open")
-def open_input_folder(subpath: str = ""):
-    """Open the (template) folder in the server's file explorer."""
-
-    folder = _input_subdir(subpath)
-    os.makedirs(folder, exist_ok=True)
-
-    try:
-        os.startfile(folder)  # noqa: S606 - Windows Explorer
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not open the folder on the server: {exc}",
-        )
-
-    return {"folder": folder, "opened": True}
-
-
 @app.post("/api/input/upload")
 def upload_input(subpath: str = "", user_id: Optional[int] = None,
                  files: List[UploadFile] = File(...)):

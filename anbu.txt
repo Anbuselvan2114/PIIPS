@@ -1,0 +1,11 @@
+--UAT
+Set-Location "E:\PIIPS_Application"; (Get-Content ".\requirements.txt") | ForEach-Object { if ($_ -match '^opencv-python==') { 'opencv-python==4.6.0.66' } elseif ($_ -match '^opencv-python-headless==') { $null } else { $_ } } | Set-Content ".\requirements.txt"; & ".\venv\Scripts\python.exe" -m pip install -r ".\requirements.txt"
+Get-OdbcDriver | Where-Object Name -like "*ODBC Driver 17*"
+
+Set-Location "E:\PIIPS_Application\required_softwares\nssm-2.24\win64"; .\nssm.exe restart PIIPS_Backend
+
+--live
+Set-Location "E:\Source\piips"; if (-not (Test-Path ".\venv\Scripts\python.exe")) { py -3.10 -m venv ".\venv" }; (Get-Content ".\requirements.txt") | ForEach-Object { if ($_ -match '^opencv-python==') { 'opencv-python==4.6.0.66' } elseif ($_ -match '^opencv-python-headless==') { $null } else { $_ } } | Set-Content ".\requirements.txt"; & ".\venv\Scripts\python.exe" -m pip install --upgrade pip; & ".\venv\Scripts\python.exe" -m pip install -r ".\requirements.txt"
+Get-OdbcDriver | Where-Object Name -like "*ODBC Driver 17*"
+Set-Location "E:\Source\piips\required_softwares\nssm-2.24\win64"; .\nssm.exe restart PIIPS_Backend
+
