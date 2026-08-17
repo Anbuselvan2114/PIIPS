@@ -435,9 +435,18 @@ def evaluate_invoice(data):
                 return {"status": "DATA MISMATCH", "is_active": False,
                         "is_synced": is_synced, "errors": [msg],
                         "reason": msg, "new_format": True}
+            # SF resolved a Nav_Item_No/ProductNo above but it (or the raw
+            # HSN lookup) ended up literally blank or the string "null" -
+            # a mandatory, Service-First-sourced Purchase Line field with
+            # nothing in it, same class of gap as the two checks around
+            # this one, so it's DATA MISMATCH too rather than the generic
+            # PENDING IN SF.
             nav = str(it.get("ProductNo") or it.get("Nav_Item_No") or "").strip()
             if not nav or nav.lower() == "null":
-                return fail("Nav Part Description not entered in SF GRN")
+                msg = "The field [No.] is blank in Purchase Line table"
+                return {"status": "DATA MISMATCH", "is_active": False,
+                        "is_synced": is_synced, "errors": [msg],
+                        "reason": msg, "new_format": True}
             # SF resolved a Nav_Item_No, but its own Nav_Part_Description is
             # either blank or describes something else entirely - trusting
             # it (or the blank) would load the wrong part into BC, so this
