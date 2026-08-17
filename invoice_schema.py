@@ -459,7 +459,9 @@ _CONTACT_LINE_RE = re.compile(
     r"|\budyam-[a-z]{2}-\d{2}-\d{7}\b"                      # Udyam reg. no.
     r"|\bnear\b"                                            # landmark ("Near Casino Theatre")
     r"|\bintercom\b"                                        # intercom number
-    r"|^\+?\d[\d\s\-]{8,14}\d$",                            # bare phone number
+    r"|\bdays\b"                                            # payment-terms fragment ("... 30 Days Credit")
+    r"|\biso\s*certified\b|\biso\s*9001\b"                  # ISO certification boilerplate
+    r"|\b\d[\d\-]{7,13}\d\b",                               # bare phone number, labelled or not
     re.IGNORECASE,
 )
 
