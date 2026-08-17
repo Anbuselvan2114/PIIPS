@@ -391,12 +391,12 @@ def _city(address, state_name=""):
     return ""
 
 
-# A line that's actually contact info (phone/GST/email/website) rather
-# than part of the postal address itself - GST invoice address blocks
-# frequently run a "Mobile: ...", "GSTIN: ...", "Email: ..." line right
-# after the real street address, which _address_lines() used to glue
-# straight into Address 2, inflating it well past BC's field length and
-# mixing contact data into an address field.
+# A line that's actually contact info (phone/GST/email/website) or a
+# landmark/intercom note rather than part of the postal address itself -
+# GST invoice address blocks frequently run a "Mobile: ...", "GSTIN: ...",
+# "Near <landmark>", "Intercom-<no>" bit right after the real street
+# address, which _address_lines() used to glue straight into Address 2,
+# inflating it well past BC's field length and mixing non-address data in.
 _CONTACT_LINE_RE = re.compile(
     r"@"                                                   # email
     r"|\bwww\.|https?://"                                  # website
@@ -405,18 +405,21 @@ _CONTACT_LINE_RE = re.compile(
     r"|\b(?:ph|phone|mobile|mob|contact|tel|fax)\b\.?\s*:?" # phone label
     r"|\budyam\b"                                           # Udyam label
     r"|\budyam-[a-z]{2}-\d{2}-\d{7}\b"                      # Udyam reg. no.
+    r"|\bnear\b"                                            # landmark ("Near Casino Theatre")
+    r"|\bintercom\b"                                        # intercom number
     r"|^\+?\d[\d\s\-]{8,14}\d$",                            # bare phone number
     re.IGNORECASE,
 )
 
 
 def _strip_contact(line):
-    """Cut a line at the first phone/GST/email/website/Udyam marker, so
-    real address text OCR'd onto the same line as contact info (a common
-    layout - '...Mumbai - 400001 UDYAM : UDYAM-MH-19-0149863 ...email...')
-    keeps its street/city/PIN instead of the whole line being discarded.
-    Returns "" if the marker starts at (or before) the first real
-    character, i.e. the line is contact info start to finish."""
+    """Cut a line at the first phone/GST/email/website/Udyam/landmark/
+    intercom marker, so real address text OCR'd onto the same line as that
+    noise (a common layout - '...CHENNAI- 600 002 Near Casino Theatre,
+    Intercom-8236 / 8374') keeps its street/city/PIN instead of the whole
+    line being discarded. Returns "" if the marker starts at (or before)
+    the first real character, i.e. the line is non-address noise start to
+    finish."""
     m = _CONTACT_LINE_RE.search(line)
     if not m:
         return line
