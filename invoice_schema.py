@@ -338,6 +338,49 @@ def _match_known_city(tokens):
     return ""
 
 
+def _any_known_city(tokens):
+    """Like _match_known_city, but tries every possible end position, not
+    just the very tail - a fallback for when trailing non-address junk
+    after the real city (no genuine PIN to cut at) defeats the tail
+    anchor, e.g. '... New Delhi Pin' with a literal word instead of a
+    real PIN. Walks end positions right to left, widest-first at each, so
+    a later, longer match ('New Delhi') is always preferred over an
+    earlier or shorter one ('Nehru Place', or bare 'Delhi') - the same
+    right-anchored preference _match_known_city has, just not limited to
+    only the true last token."""
+    n = len(tokens)
+    for end in range(n, 0, -1):
+        for width in range(min(_KNOWN_CITY_MAX_WORDS, end), 0, -1):
+            chunk = [t.strip(".:-–() ") for t in tokens[end - width:end]]
+            if not all(re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", c) for c in chunk):
+                continue
+            phrase = " ".join(c.rstrip(".") for c in chunk).lower()
+            if phrase in _KNOWN_CITIES:
+                return " ".join(w.capitalize() for w in phrase.split())
+    return ""
+
+
+def _first_city_pos(line):
+    """Character position where a known city/locality name (the same
+    gazetteer _city() matches against) begins in `line`, or -1 if none
+    found. Everything from that point on - the city itself, state, PIN,
+    any contact info trailing it - belongs in the dedicated City/Pincode
+    columns, not Address 2, so callers cut the line there."""
+    tokens = list(re.finditer(r"[A-Za-z][A-Za-z.'-]*", line))
+    n = len(tokens)
+    for i in range(n):
+        for width in range(min(_KNOWN_CITY_MAX_WORDS, n - i), 0, -1):
+            # A trailing "-" glued onto the token itself ("CHENNAI-600002"
+            # split on the digit run leaves "CHENNAI-") must not survive
+            # into the lookup, or it'll never match the plain gazetteer key.
+            phrase = " ".join(
+                t.group().rstrip(".-").lower() for t in tokens[i:i + width]
+            )
+            if phrase in _KNOWN_CITIES:
+                return tokens[i].start()
+    return -1
+
+
 def _city(address, state_name=""):
     """Best-effort city from an address. Tries the known-city gazetteer
     first (so multi-word cities/localities like 'T Nagar' or 'Navi Mumbai'
@@ -368,13 +411,22 @@ def _city(address, state_name=""):
         ):
             cut = i
             break
+        # City and PIN glued with no space at all ("CHENNAI-600008",
+        # "MUMBAI-400703") - .strip() above can't separate them since the
+        # digits aren't at a token edge. Keep the alpha prefix (the city)
+        # so it's still available to match below, but cut right after it.
+        glued = re.match(r"^([A-Za-z][A-Za-z.'-]*?)-?(\d{6})$", t0)
+        if glued:
+            tokens[i] = glued.group(1)
+            cut = i + 1
+            break
     search = tokens[:cut] or tokens
     # Drop stray punctuation-only tokens (a lone "-" separator left behind
     # once the PIN itself is cut off) so they don't block a match at the
     # tail - e.g. "... T Nagar - 600017" must search from "Nagar", not "-".
     search = [t for t in search if re.search(r"[A-Za-z0-9]", t)]
 
-    known = _match_known_city(search)
+    known = _match_known_city(search) or _any_known_city(search)
     if known:
         return known
 
@@ -414,23 +466,36 @@ _CONTACT_LINE_RE = re.compile(
 
 def _strip_contact(line):
     """Cut a line at the first phone/GST/email/website/Udyam/landmark/
-    intercom marker, so real address text OCR'd onto the same line as that
-    noise (a common layout - '...CHENNAI- 600 002 Near Casino Theatre,
-    Intercom-8236 / 8374') keeps its street/city/PIN instead of the whole
-    line being discarded. Returns "" if the marker starts at (or before)
-    the first real character, i.e. the line is non-address noise start to
-    finish."""
+    intercom marker OR the start of a recognized city/locality name,
+    whichever comes first - the City/Pincode columns already carry that
+    information, so Address 2 shouldn't repeat city/state/PIN or whatever
+    trails them ('...Nehru Place New Delhi-110019 ISO Certified -
+    9001:2015 Days' keeps only 'Nehru Place'). Returns "" if the cut point
+    is at (or before) the first real character, i.e. the line is nothing
+    but that noise start to finish."""
+    contact_cut = -1
     m = _CONTACT_LINE_RE.search(line)
-    if not m:
+    if m:
+        contact_cut = m.start()
+        # If the marker starts mid-word (the "@" inside "admin@x.com"),
+        # back up to the start of that word so a stray fragment ("admin")
+        # isn't left dangling in the kept prefix. Any of the usual
+        # separators counts as a word boundary, not just a space - real
+        # addresses are as often comma-separated ("...400001,UDYAM...")
+        # as space-separated.
+        if contact_cut > 0 and not line[contact_cut - 1] in " ,.-":
+            wb = max(line.rfind(c, 0, contact_cut) for c in " ,.-")
+            contact_cut = wb + 1 if wb != -1 else 0
+
+    # _first_city_pos already returns the start of a clean token (the regex
+    # it scans with requires a letter first), so it never needs the same
+    # backing-up treatment.
+    city_cut = _first_city_pos(line)
+
+    positions = [p for p in (contact_cut, city_cut) if p != -1]
+    if not positions:
         return line
-    cut = m.start()
-    # If the marker starts mid-word (the "@" inside "admin@x.com"), back up
-    # to the start of that word so a stray fragment ("admin") isn't left
-    # dangling in the kept prefix.
-    if cut > 0 and not line[cut - 1].isspace():
-        ws = line.rfind(" ", 0, cut)
-        cut = ws + 1 if ws != -1 else 0
-    return line[:cut].strip(" ,.-")
+    return line[:min(positions)].strip(" ,.-")
 
 
 def _address_lines(address):
