@@ -116,6 +116,7 @@ export default function Dashboard({ user }) {
     getBatches().then((r) => setBatches(r.batches || [])).catch(() => {});
   const loadStatusCounts = () =>
     getStatusCounts().then((r) => setStatusCounts(r.counts || [])).catch(() => {});
+  const statusTotal = statusCounts.reduce((s, d) => s + (d.count || 0), 0);
 
   useEffect(() => {
     (async () => {
@@ -407,13 +408,22 @@ export default function Dashboard({ user }) {
         <div style={{ flex: "0 0 300px", maxWidth: 340, display: "flex", flexDirection: "column", gap: 16 }}>
           <div className="card">
             <div className="card-title-row">
-              <h3>Invoices by status</h3><div style={{ flex: 1 }} />
+              <h3>Invoices by status</h3>
+              <span className="badge badge-success" style={{ marginLeft: 8 }}>
+                {statusTotal} total
+              </span>
+              <div style={{ flex: 1 }} />
               <button className="btn btn-subtle btn-sm" onClick={loadStatusCounts}>Refresh</button>
             </div>
             <StatusPie data={statusCounts} onSlice={openStatusModal} />
           </div>
           <div className="card">
-            <h3>Status breakdown</h3>
+            <div className="card-title-row">
+              <h3>Status breakdown</h3>
+              <span className="badge badge-success" style={{ marginLeft: 8 }}>
+                {statusTotal} total
+              </span>
+            </div>
             <StatusBars data={statusCounts} onSlice={openStatusModal} />
           </div>
         </div>

@@ -8,10 +8,18 @@
 const API_BASE = import.meta?.env?.VITE_API_BASE ?? "";
 
 async function request(path, options = {}) {
-  const res = await fetch(API_BASE + path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  let res;
+  try {
+    res = await fetch(API_BASE + path, {
+      headers: { "Content-Type": "application/json" },
+      ...options,
+    });
+  } catch {
+    // fetch() itself throwing (not the server returning an error status)
+    // means the request never reached the server at all - a raw browser
+    // message like "Failed to fetch" means nothing to an end user.
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
 
   if (!res.ok) {
     let detail;
@@ -225,10 +233,15 @@ export const uploadInputFiles = async (fileList, subpath = "", user_id) => {
     `/api/input/upload${q}` +
     (user_id != null ? `${q ? "&" : "?"}user_id=${user_id}` : "");
 
-  const res = await fetch(API_BASE + url, {
-    method: "POST",
-    body: form, // let the browser set the multipart Content-Type/boundary
-  });
+  let res;
+  try {
+    res = await fetch(API_BASE + url, {
+      method: "POST",
+      body: form, // let the browser set the multipart Content-Type/boundary
+    });
+  } catch {
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
 
   if (!res.ok) {
     let detail;

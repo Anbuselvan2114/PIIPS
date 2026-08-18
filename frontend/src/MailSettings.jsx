@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getMailSettings, saveMailSettings } from "./api";
+import { PasswordInput } from "./components";
 
 export default function MailSettings({ user }) {
   const [username, setUsername] = useState("");
@@ -85,9 +86,9 @@ export default function MailSettings({ user }) {
           </div>
           <div className="field">
             <label className="label">Password</label>
-            <input type="password" value={password} autoComplete="new-password"
-                   onChange={(e) => setPassword(e.target.value)}
-                   placeholder={passwordSet ? "•••••• (unchanged)" : "password"} />
+            <PasswordInput value={password} autoComplete="new-password"
+                           onChange={(e) => setPassword(e.target.value)}
+                           placeholder={passwordSet ? "•••••• (unchanged)" : "password"} />
             {passwordSet && (
               <div className="hint" style={{ marginTop: 4 }}>
                 Leave blank to keep the current password.

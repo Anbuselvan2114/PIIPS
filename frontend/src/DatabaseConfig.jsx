@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getDbConfig, saveDbConfig } from "./api";
+import { PasswordInput } from "./components";
 
 // Fields stacked vertically instead of the shared ".row"'s default
 // side-by-side layout.
@@ -109,9 +110,9 @@ export default function DatabaseConfig({ user }) {
             </div>
             <div className="field">
               <label className="label">Password</label>
-              <input type="password" value={password} autoComplete="new-password"
-                     onChange={(e) => setPassword(e.target.value)}
-                     placeholder={passwordSet ? "•••••• (unchanged)" : "password"} />
+              <PasswordInput value={password} autoComplete="new-password"
+                             onChange={(e) => setPassword(e.target.value)}
+                             placeholder={passwordSet ? "•••••• (unchanged)" : "password"} />
               {passwordSet && (
                 <div className="hint" style={{ marginTop: 4 }}>
                   Leave blank to keep the current password.

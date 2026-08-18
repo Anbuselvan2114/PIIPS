@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useState } from "react";
+import { createRoot } from "react-dom/client";
 import { invoicePdfUrl } from "./api";
 
 // PIIPS logo — a monogram "P" (source: logo/PIIPS-logo.svg) on an indigo-to-
@@ -36,6 +37,30 @@ export function Logo({ size = 40 }) {
         <rect x="176" y="370" width="42" height="10" rx="5" />
       </g>
     </svg>
+  );
+}
+
+// Password field with a show/hide toggle ("eye" button) - drop-in
+// replacement for a bare <input type="password">. `icon` is optional (a
+// leading glyph like Login.jsx's 🔒); omitted, it's just the input + toggle.
+export function PasswordInput({
+  value, onChange, placeholder, icon, onPaste, autoComplete, autoFocus, disabled,
+}) {
+  const [show, setShow] = useState(false);
+  return (
+    <div className="input-group">
+      {icon && <span className="ico">{icon}</span>}
+      <input type={show ? "text" : "password"} value={value} onChange={onChange}
+             placeholder={placeholder} onPaste={onPaste} autoComplete={autoComplete}
+             autoFocus={autoFocus} disabled={disabled} />
+      <button type="button" onClick={() => setShow((s) => !s)} disabled={disabled}
+              aria-label={show ? "Hide password" : "Show password"}
+              title={show ? "Hide password" : "Show password"}
+              style={{ background: "none", border: "none", cursor: disabled ? "not-allowed" : "pointer",
+                       padding: 0, color: "var(--muted)", fontSize: 16, lineHeight: 1, flex: "0 0 auto" }}>
+        {show ? "🙈" : "👁️"}
+      </button>
+    </div>
   );
 }
 
@@ -187,4 +212,62 @@ export function PdfModal({ file, onClose }) {
       </div>
     </Modal>
   );
+}
+
+// The dialog UI behind confirmDialog() below - a small themed card, not the
+// browser's native confirm() box.
+function ConfirmDialog({ message, confirmLabel, cancelLabel, danger, onResolve }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onResolve(false); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onResolve]);
+
+  return (
+    <div onClick={() => onResolve(false)}
+         style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,.55)", zIndex: 2000,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  padding: 16, animation: "piips-fade-in .15s ease-out" }}>
+      <div onClick={(e) => e.stopPropagation()} className="card"
+           style={{ width: "min(380px, 100%)", margin: 0, textAlign: "center",
+                    animation: "piips-pop-in .15s ease-out" }}>
+        <div style={{ fontSize: 34, lineHeight: 1, marginBottom: 4 }}>
+          {danger ? "⚠️" : "❓"}
+        </div>
+        <div style={{ color: "var(--text)", fontSize: 15, lineHeight: 1.5, margin: "10px 0 18px" }}>
+          {String(message).split("\n").map((line, i) => <div key={i}>{line}</div>)}
+        </div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+          <button className="btn btn-subtle" onClick={() => onResolve(false)} autoFocus>
+            {cancelLabel}
+          </button>
+          <button className={`btn ${danger ? "btn-danger" : "btn-primary"}`} onClick={() => onResolve(true)}>
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Promise-based replacement for window.confirm(message) - same call shape
+// (await it, treat the result as a boolean) but renders the app's own
+// themed dialog instead of the browser's native box. Mounts itself into a
+// throwaway DOM node and cleans up after resolving.
+// Sample: if (!(await confirmDialog("Delete this template?"))) return;
+export function confirmDialog(message, { confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false } = {}) {
+  return new Promise((resolve) => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const cleanup = (result) => {
+      root.unmount();
+      host.remove();
+      resolve(result);
+    };
+    root.render(
+      <ConfirmDialog message={message} confirmLabel={confirmLabel} cancelLabel={cancelLabel}
+                     danger={danger} onResolve={cleanup} />
+    );
+  });
 }

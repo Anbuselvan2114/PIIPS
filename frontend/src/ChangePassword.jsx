@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { changePassword } from "./api";
-import { Logo } from "./components";
+import { Logo, PasswordInput } from "./components";
 
 // Shown instead of the app shell whenever the logged-in user still has
 // must_change_password set (a freshly-created account, or one that just
@@ -42,27 +42,19 @@ export default function ChangePassword({ user, onDone, onLogout }) {
 
         <div className="field">
           <label className="label">Current (temporary) password</label>
-          <div className="input-group">
-            <span className="ico">🔒</span>
-            <input type="password" value={current} onChange={(e) => setCurrent(e.target.value)} autoFocus placeholder="Temporary password" />
-          </div>
+          <PasswordInput icon="🔒" value={current} onChange={(e) => setCurrent(e.target.value)}
+                         autoFocus placeholder="Temporary password" />
         </div>
         <div className="field">
           <label className="label">New password</label>
-          <div className="input-group">
-            <span className="ico">🔒</span>
-            <input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="New password" />
-          </div>
+          <PasswordInput icon="🔒" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="New password" />
           <div className="hint" style={{ marginTop: 4 }}>
             At least 5 characters, with an uppercase letter, a lowercase letter, a number, and a special character.
           </div>
         </div>
         <div className="field">
           <label className="label">Confirm new password</label>
-          <div className="input-group">
-            <span className="ico">🔒</span>
-            <input type="password" value={pw2} onChange={(e) => setPw2(e.target.value)} placeholder="Confirm new password" />
-          </div>
+          <PasswordInput icon="🔒" value={pw2} onChange={(e) => setPw2(e.target.value)} placeholder="Confirm new password" />
         </div>
 
         {error && <div className="alert alert-danger">{error}</div>}

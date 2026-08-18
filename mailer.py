@@ -7,6 +7,8 @@ No third-party package is used - stdlib smtplib/email only, matching the
 rest of this codebase's preference for no unnecessary dependencies.
 """
 
+import base64
+import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -17,6 +19,26 @@ import database
 class MailError(Exception):
     """Raised when a mail could not be sent (not configured, or the SMTP
     server rejected the connection/login/send)."""
+
+
+def _load_logo_data_uri():
+    """The app icon, inlined as a base64 data: URI. A src="<base_url>/..."
+    reference doesn't work in an email - the recipient's mail client fetches
+    it from wherever THEY are (a different device/network than whichever
+    host happened to be in the request that triggered the mail), so it
+    renders as a broken-image placeholder. Embedding the bytes directly
+    has no such dependency. Returns "" if the file isn't found (logo cell
+    then falls back to the emoji)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "public", "icon-192.png")
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return ""
+    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+
+
+_LOGO_DATA_URI = _load_logo_data_uri()
 
 
 def send_mail(to_addr, subject, html_body):
@@ -54,11 +76,11 @@ def send_mail(to_addr, subject, html_body):
 _FONT = "font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
 
 
-def _shell(accent, heading, body_html, footer_note="", base_url=""):
+def _shell(accent, heading, body_html, footer_note=""):
     logo_cell = (
-        f'<img src="{base_url}/icon-192.png" width="36" height="36" '
+        f'<img src="{_LOGO_DATA_URI}" width="36" height="36" '
         f'style="display:block;border-radius:9px;" alt="PIIPS">'
-        if base_url else "🧾"
+        if _LOGO_DATA_URI else "🧾"
     )
     return f"""\
 <!doctype html>
@@ -166,7 +188,7 @@ below - you'll be asked to set your own password the first time you log in.
 {_password_chip(password)}
 {_button("Sign in to PIIPS", login_url)}
 """
-    return _shell("#7c3aed", "Your PIIPS account is ready", body, base_url=login_url)
+    return _shell("#7c3aed", "Your PIIPS account is ready", body)
 
 
 def password_reset_email_html(username, password, login_url=""):
@@ -180,7 +202,7 @@ own password the first time you log in.
   If you did not request this, contact your administrator immediately.
 </p>
 """
-    return _shell("#7c3aed", "Your PIIPS password was reset", body, base_url=login_url)
+    return _shell("#7c3aed", "Your PIIPS password was reset", body)
 
 
 def deactivation_email_html(username, login_url=""):
@@ -191,7 +213,7 @@ by an administrator. You will not be able to sign in until it is reactivated.
   If you believe this is a mistake, contact your administrator.
 </p>
 """
-    return _shell("#dc2626", "Account deactivated", body, base_url=login_url)
+    return _shell("#dc2626", "Account deactivated", body)
 
 
 def activation_email_html(username, login_url=""):
@@ -200,4 +222,4 @@ Your PIIPS account (<b>{username}</b>) has been <b style="color:#16a34a;">reacti
 You can sign in again.
 {_button("Sign in to PIIPS", login_url)}
 """
-    return _shell("#16a34a", "Account reactivated", body, base_url=login_url)
+    return _shell("#16a34a", "Account reactivated", body)

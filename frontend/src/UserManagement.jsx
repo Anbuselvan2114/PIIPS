@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getUsers, createUser, setUserActive, adminResetPassword } from "./api";
-import { DataTable } from "./components";
+import { DataTable, confirmDialog, PasswordInput } from "./components";
 
 // Fields stacked vertically instead of the shared ".row"'s default
 // side-by-side layout — scoped here so other pages that reuse ".row"
@@ -47,7 +47,10 @@ export default function UserManagement({ user }) {
 
   const toggle = async (u) => {
     const action = u.IsActive ? "inactivate" : "give access to";
-    if (!window.confirm(`Are you sure you want to ${action} "${u.UserName}"?`)) return;
+    const ok = await confirmDialog(`Are you sure you want to ${action} "${u.UserName}"?`, {
+      confirmLabel: u.IsActive ? "Inactivate" : "Give access", danger: u.IsActive,
+    });
+    if (!ok) return;
     try {
       const r = await setUserActive(u.UserId, !u.IsActive, user?.user_id);
       setMessage({ ok: true, text: `"${u.UserName}" ${u.IsActive ? "deactivated" : "activated"}.${emailNote(r)}` });
@@ -56,7 +59,10 @@ export default function UserManagement({ user }) {
   };
 
   const resetPw = async (u) => {
-    if (!window.confirm(`Send "${u.UserName}" a new auto-generated password by email?`)) return;
+    const ok = await confirmDialog(`Send "${u.UserName}" a new auto-generated password by email?`, {
+      confirmLabel: "Send password",
+    });
+    if (!ok) return;
     try {
       const r = await adminResetPassword(user?.user_id, u.UserId);
       setMessage({ ok: true, text: `New password emailed to "${u.UserName}".${emailNote(r)}` });
@@ -117,11 +123,11 @@ export default function UserManagement({ user }) {
           </div>
           <div className="field">
             <label className="label">New password</label>
-            <input type="password" value={assignPw.next} onChange={(e) => setAssignPw({ ...assignPw, next: e.target.value })} placeholder="New password" />
+            <PasswordInput value={assignPw.next} onChange={(e) => setAssignPw({ ...assignPw, next: e.target.value })} placeholder="New password" />
           </div>
           <div className="field">
             <label className="label">Confirm new password</label>
-            <input type="password" value={assignPw.confirm} onChange={(e) => setAssignPw({ ...assignPw, confirm: e.target.value })} placeholder="Confirm new password" />
+            <PasswordInput value={assignPw.confirm} onChange={(e) => setAssignPw({ ...assignPw, confirm: e.target.value })} placeholder="Confirm new password" />
           </div>
           <button type="submit" className="btn btn-primary" disabled={assignPwBusy || !assignPw.target_user_id || !assignPw.next} style={{ alignSelf: "flex-start" }}>
             {assignPwBusy ? "Saving…" : "Change password"}
