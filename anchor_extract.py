@@ -264,6 +264,14 @@ def extract(header_rows, footer_rows, page_width):
     # unrelated content that only happen to share a row.
     claimed_rows = set()
 
+    # First row (not claimed on its left side) where "Invoice No." or
+    # "Dated" was anchored on the RIGHT half of the page - the common
+    # Tally-style layout prints this metadata alongside the buyer block,
+    # not the seller's own letterhead. Used below only as a last-resort
+    # structural marker when a document has no textual "Bill To"/"Ship
+    # To" label at all.
+    meta_row = None
+
     # ------------------------------------------------------------------
     # Right-value / below-value anchored fields
     # ------------------------------------------------------------------
@@ -305,7 +313,23 @@ def extract(header_rows, footer_rows, page_width):
                         fields[field] = val
                         if anchor["x"] < divider:
                             claimed_rows.add(ri)
+                        elif field in ("Invoice No.", "Dated") and meta_row is None:
+                            meta_row = ri
                     break
+
+    # Dated fallback: some layouts print the document date right next to
+    # the Invoice No. value with no "Date"/"Dated" label of its own (e.g.
+    # "Inv No.PW/GST/26-27-041   04/08/2026") - the label-anchored pass
+    # above never finds a "Dated" anchor there at all. When that's happened
+    # (no "Dated" field, but an Invoice No. row was recorded), look for a
+    # bare date-shaped token on that same row.
+    if "Dated" not in fields and meta_row is not None:
+        row_text = _row_text(rows[meta_row])
+        inv_no = fields.get("Invoice No.", "")
+        for m in DATE_RE.finditer(row_text):
+            if m.group(0) not in inv_no:
+                fields["Dated"] = m.group(0)
+                break
 
     # Seller Name fallback: some letterheads put the company's own brand
     # name as the very first line of the page wherever the logo sits
@@ -330,145 +354,177 @@ def extract(header_rows, footer_rows, page_width):
     # ------------------------------------------------------------------
     # Party blocks: Seller (top), then Buyer / Consignee by marker.
     # ------------------------------------------------------------------
-    section = "Seller"
-    # A party's Name may already be set by the anchored-field pass above
-    # (e.g. "Vendor Name"/"Customer Name" on a claimed row) — start that
-    # party as already-named so the next unclaimed line becomes its
-    # Address, not a second (silently dropped) Name.
-    named = {p: bool(fields.get(f"{p} Name")) for p in ("Seller", "Buyer", "Consignee")}
+    def _party_pass(forced_switch_row=None):
+        """One left-column scan, classifying each line as Seller/Buyer/
+        Consignee content. Returns (fields, any_marker_switch). Seeded
+        fresh from the outer `fields` each call so a retry (see below)
+        starts clean rather than compounding a failed first attempt.
+        `forced_switch_row` is only used on that retry, to force the
+        Seller->Buyer switch at the invoice-metadata row when the
+        document has no textual section marker at all."""
+        out = dict(fields)
+        section = "Seller"
+        # A party's Name may already be set by the anchored-field pass
+        # above (e.g. "Vendor Name"/"Customer Name" on a claimed row) —
+        # start that party as already-named so the next unclaimed line
+        # becomes its Address, not a second (silently dropped) Name.
+        named = {p: bool(out.get(f"{p} Name")) for p in ("Seller", "Buyer", "Consignee")}
+        any_switch = False
 
-    for ri, row in enumerate(rows):
-        if ri in claimed_rows:
-            continue
-        left = sorted([w for w in row if w["x"] < divider], key=lambda w: w["x"])
-        if not left:
-            continue
-        text = " ".join(w["text"].strip() for w in left).strip()
-        if not text:
-            continue
-        low = text.lower()
+        for ri, row in enumerate(rows):
+                if ri in claimed_rows:
+                    continue
+                left = sorted([w for w in row if w["x"] < divider], key=lambda w: w["x"])
+                if not left:
+                    continue
+                text = " ".join(w["text"].strip() for w in left).strip()
+                if not text:
+                    continue
+                low = text.lower()
 
-        # section change?
-        switched = False
-        for name, marks in SECTION_MARKERS:
-            if any(m in low for m in marks):
-                section = name
-                switched = True
-                break
-        if not switched:
-            stripped = low.strip(" :,-.")
-            for name, marks in EXACT_SECTION_MARKERS:
-                if stripped in marks:
-                    section = name
-                    switched = True
-                    break
-        if switched:
-            continue
+                # section change?
+                switched = False
+                for name, marks in SECTION_MARKERS:
+                    if any(m in low for m in marks):
+                        section = name
+                        switched = True
+                        break
+                if not switched:
+                    stripped = low.strip(" :,-.")
+                    for name, marks in EXACT_SECTION_MARKERS:
+                        if stripped in marks:
+                            section = name
+                            switched = True
+                            break
+                if switched:
+                    any_switch = True
+                    continue
 
-        # Structural fallback for a missing section-header row: some PDFs'
-        # born-digital text layer omits "Billed to"/"Shipped to" entirely
-        # (rendered as an image/graphic, not real text), so the marker
-        # check above never fires — but the Buyer/Consignee block's first
-        # content row still follows right after the Seller block. Detect it
-        # structurally instead: its right-side column (a mirrored Ship-to
-        # copy) duplicates this row's left-side text — a shape no genuine
-        # Seller-block metadata row has (those pair a left LABEL with a
-        # right VALUE, never identical text on both sides).
-        if section == "Seller" and named["Seller"]:
-            right = sorted([w for w in row if w["x"] >= divider], key=lambda w: w["x"])
-            right_text = " ".join(w["text"].strip() for w in right).strip()
-            if right_text and re.sub(r"\s+", "", low) == re.sub(r"\s+", "", right_text.lower()):
-                section = "Buyer"
+                # Structural fallback for a missing section-header row: some
+                # PDFs' born-digital text layer omits "Billed to"/"Shipped
+                # to" entirely (rendered as an image/graphic, not real
+                # text), so the marker check above never fires — but the
+                # Buyer/Consignee block's first content row still follows
+                # right after the Seller block. Detect it structurally
+                # instead: its right-side column (a mirrored Ship-to copy)
+                # duplicates this row's left-side text — a shape no genuine
+                # Seller-block metadata row has (those pair a left LABEL
+                # with a right VALUE, never identical text on both sides).
+                if section == "Seller" and named["Seller"]:
+                    right = sorted([w for w in row if w["x"] >= divider], key=lambda w: w["x"])
+                    right_text = " ".join(w["text"].strip() for w in right).strip()
+                    if right_text and re.sub(r"\s+", "", low) == re.sub(r"\s+", "", right_text.lower()):
+                        section = "Buyer"
+                        any_switch = True
+                    elif forced_switch_row is not None and ri >= forced_switch_row:
+                        # Last resort, only tried on retry: no textual or
+                        # structural marker exists anywhere in this
+                        # document, so treat the row carrying the Invoice
+                        # No./Dated metadata as the seller/buyer boundary -
+                        # the common Tally-style layout prints that
+                        # metadata alongside the buyer block, not the
+                        # seller's own letterhead.
+                        section = "Buyer"
 
-        # GSTIN on this line -> party gstin
-        g = GSTIN_RE.search(text.replace(" ", ""))
-        if "gstin" in low or "uin" in low or g:
-            val = ""
-            if g:
-                val = g.group(1)
-            else:
-                # OCR sometimes splits the GSTIN (state code separated from
-                # the 13-char core). Reconstruct: <state code> + <core>.
-                alnum = re.sub(r"[^A-Z0-9]", "", text.upper())
-                alnum = alnum.replace("GSTIN", "").replace("UIN", "")
-                core = re.search(r"[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]", alnum)
-                if core:
-                    rest = alnum.replace(core.group(0), "")
-                    st = re.search(r"\d{2}", rest)
-                    val = (st.group(0) if st else "") + core.group(0)
-            if val:
-                fields.setdefault(f"{section} GSTIN/UIN", val)
-            continue
+                # GSTIN on this line -> party gstin
+                g = GSTIN_RE.search(text.replace(" ", ""))
+                if "gstin" in low or "uin" in low or g:
+                    val = ""
+                    if g:
+                        val = g.group(1)
+                    else:
+                        # OCR sometimes splits the GSTIN (state code separated from
+                        # the 13-char core). Reconstruct: <state code> + <core>.
+                        alnum = re.sub(r"[^A-Z0-9]", "", text.upper())
+                        alnum = alnum.replace("GSTIN", "").replace("UIN", "")
+                        core = re.search(r"[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]", alnum)
+                        if core:
+                            rest = alnum.replace(core.group(0), "")
+                            st = re.search(r"\d{2}", rest)
+                            val = (st.group(0) if st else "") + core.group(0)
+                    if val:
+                        out.setdefault(f"{section} GSTIN/UIN", val)
+                    continue
 
-        # State. Matches "state name"/"state code" (Tally-style), a bare
-        # "State" label (word-bounded — \b so "Estate" in an address line
-        # is never mistaken for it), or "place of supply".
-        if (
-            "state name" in low or "state code" in low
-            or "place of supply" in low
-            or re.search(r"\bstate\b", low)
-        ):
-            fields.setdefault(
-                f"{section} State Name",
-                _clean_value(text.split(":", 1)[-1]),
-            )
-            continue
+                # State. Matches "state name"/"state code" (Tally-style), a bare
+                # "State" label (word-bounded — \b so "Estate" in an address line
+                # is never mistaken for it), or "place of supply".
+                if (
+                    "state name" in low or "state code" in low
+                    or "place of supply" in low
+                    or re.search(r"\bstate\b", low)
+                ):
+                    out.setdefault(
+                        f"{section} State Name",
+                        _clean_value(text.split(":", 1)[-1]),
+                    )
+                    continue
 
-        # Skip a bare phone/mobile number line (no label word at all, so
-        # _label_start below wouldn't catch it) — never real name/address
-        # content.
-        if _looks_like_phone_line(text):
-            continue
+                # Skip a bare phone/mobile number line (no label word at all, so
+                # _label_start below wouldn't catch it) — never real name/address
+                # content.
+                if _looks_like_phone_line(text):
+                    continue
 
-        # Skip a bare website URL line (e.g. "www.careinfotech.co.in") —
-        # never real name/address content either.
-        if _looks_like_url_line(text):
-            continue
+                # Skip a bare website URL line (e.g. "www.careinfotech.co.in") —
+                # never real name/address content either.
+                if _looks_like_url_line(text):
+                    continue
 
-        # Skip a bare hex-hash fragment (e.g. the wrapped second half of an
-        # IRN, with no "IRN"/"Ack No." label of its own on that line).
-        if _looks_like_hash_fragment(text):
-            continue
+                # Skip a bare hex-hash fragment (e.g. the wrapped second half of an
+                # IRN, with no "IRN"/"Ack No." label of its own on that line).
+                if _looks_like_hash_fragment(text):
+                    continue
 
-        # Skip the GST e-Invoice QR-code block lines entirely (label AND
-        # value) — unlike other one-line labels below (e.g. "Address:Plot
-        # No 53..." where the tail after the label IS the real value), the
-        # IRN hash / Ack No. / Ack Date values are never name/address
-        # content, so nothing after these labels should be kept either.
-        # Same for "Reverse Charge : N" / "Credit Days : 0" — standard
-        # Tally/GST metadata captions, never part of the seller's address.
-        if low.startswith(("irn", "ack no", "ack date", "e-invoice",
-                            "reverse charge", "credit days")):
-            continue
+                # Skip the GST e-Invoice QR-code block lines entirely (label AND
+                # value) — unlike other one-line labels below (e.g. "Address:Plot
+                # No 53..." where the tail after the label IS the real value), the
+                # IRN hash / Ack No. / Ack Date values are never name/address
+                # content, so nothing after these labels should be kept either.
+                # Same for "Reverse Charge : N" / "Credit Days : 0" — standard
+                # Tally/GST metadata captions, never part of the seller's address.
+                if low.startswith(("irn", "ack no", "ack date", "e-invoice",
+                                    "reverse charge", "credit days")):
+                    continue
 
-        # Skip pure labels / titles / contact lines. A label phrase can
-        # appear PARTWAY through an address-continuation line (e.g.
-        # "...Maharashtra 421101, Phone: 8983834716 email: ...") — trim at
-        # that point and keep the genuine address text before it, instead
-        # of discarding real address/state/pincode content along with the
-        # incidental label that happens to trail it on the same OCR row.
-        # When the label sits at the very start (e.g. "Address:Plot No 53
-        # block R2..." glued into one OCR token, no separate value line),
-        # keep whatever follows the label instead of dropping the row
-        # outright — that tail IS the value.
-        span = _label_span(text)
-        if span is not None:
-            start, end = span
-            if start == 0:
-                text = text[end:].lstrip(" :,-.")
-            else:
-                text = text[:start].rstrip(" ,;:-")
-            if not text:
-                continue
-            low = text.lower()
+                # Skip pure labels / titles / contact lines. A label phrase can
+                # appear PARTWAY through an address-continuation line (e.g.
+                # "...Maharashtra 421101, Phone: 8983834716 email: ...") — trim at
+                # that point and keep the genuine address text before it, instead
+                # of discarding real address/state/pincode content along with the
+                # incidental label that happens to trail it on the same OCR row.
+                # When the label sits at the very start (e.g. "Address:Plot No 53
+                # block R2..." glued into one OCR token, no separate value line),
+                # keep whatever follows the label instead of dropping the row
+                # outright — that tail IS the value.
+                span = _label_span(text)
+                if span is not None:
+                    start, end = span
+                    if start == 0:
+                        text = text[end:].lstrip(" :,-.")
+                    else:
+                        text = text[:start].rstrip(" ,;:-")
+                    if not text:
+                        continue
+                    low = text.lower()
 
-        # First non-label line = party name; rest = address
-        if not named[section]:
-            fields.setdefault(f"{section} Name", text)
-            named[section] = True
-        else:
-            key = f"{section} Address"
-            fields[key] = (fields.get(key, "") + "\n" + text).strip() if fields.get(key) else text
+                # First non-label line = party name; rest = address
+                if not named[section]:
+                    out.setdefault(f"{section} Name", text)
+                    named[section] = True
+                else:
+                    key = f"{section} Address"
+                    out[key] = (out.get(key, "") + "\n" + text).strip() if out.get(key) else text
+
+        return out, any_switch
+
+    party_fields, any_switch = _party_pass()
+    if not any_switch and not party_fields.get("Buyer Name") and meta_row is not None:
+        # No textual or structural section marker fired anywhere in this
+        # document - retry once, using the invoice-metadata row as the
+        # seller/buyer boundary instead.
+        party_fields, _ = _party_pass(forced_switch_row=meta_row)
+    fields.update(party_fields)
 
     # (Seller GSTIN fallback is applied in ocr_engine after all pages/bands
     # are merged, where the full invoice text is available.)
