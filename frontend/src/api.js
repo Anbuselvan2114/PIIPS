@@ -166,24 +166,45 @@ export const login = (username, password) =>
     body: JSON.stringify({ username, password }),
   });
 
-export const resetPassword = (username, new_password) =>
-  request("/api/reset-password", {
+export const forgotPassword = (username_or_email) =>
+  request("/api/forgot-password", {
     method: "POST",
-    body: JSON.stringify({ username, new_password }),
+    body: JSON.stringify({ username_or_email }),
+  });
+
+export const changePassword = (user_id, current_password, new_password) =>
+  request("/api/change-password", {
+    method: "POST",
+    body: JSON.stringify({ user_id, current_password, new_password }),
   });
 
 export const getUsers = () => request("/api/users");
 
-export const createUser = (username, password, user_type_id) =>
+export const createUser = (username, email, user_type_id, created_by) =>
   request("/api/users", {
     method: "POST",
-    body: JSON.stringify({ username, password, user_type_id }),
+    body: JSON.stringify({ username, email, user_type_id, created_by }),
   });
 
-export const setUserActive = (user_id, is_active) =>
+export const setUserActive = (user_id, is_active, modified_by) =>
   request("/api/users/active", {
     method: "POST",
-    body: JSON.stringify({ user_id, is_active }),
+    body: JSON.stringify({ user_id, is_active, modified_by }),
+  });
+
+export const adminResetPassword = (user_id, target_user_id) =>
+  request("/api/users/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ user_id, target_user_id }),
+  });
+
+export const getMailSettings = (user_id) =>
+  request(`/api/mail-settings${user_id != null ? `?user_id=${user_id}` : ""}`);
+
+export const saveMailSettings = (payload) =>
+  request("/api/mail-settings", {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
 
 export const clearFormats = () =>

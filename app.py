@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -49,6 +49,8 @@ def _bootstrap_menu_storage():
         if (config_store.load_config().get("db_connection") or "").strip():
             database.migrate_menu_json(BASE_DIR)
             database.migrate_template_invoice_type()
+            database.init_mail_settings_table()
+            database.ensure_default_super_admin()
     except Exception:  # noqa: BLE001 - never block startup on DB issues
         traceback.print_exc()
 
@@ -1282,9 +1284,20 @@ class LoginModel(BaseModel):
     password: str
 
 
-class ResetModel(BaseModel):
-    username: str
+class ForgotPasswordModel(BaseModel):
+    username_or_email: str
+
+
+class ChangePasswordModel(BaseModel):
+    user_id: int
+    current_password: str
     new_password: str
+
+
+def _base_url(request: Request):
+    """The app's own base URL, derived from the incoming request (works
+    unmodified on localhost/UAT/Live - never hard-coded)."""
+    return str(request.base_url).rstrip("/")
 
 
 @app.post("/api/login")
@@ -1302,18 +1315,62 @@ def api_login(payload: LoginModel):
     return user
 
 
-@app.post("/api/reset-password")
-def api_reset_password(payload: ResetModel):
+@app.post("/api/forgot-password")
+def api_forgot_password(payload: ForgotPasswordModel, request: Request):
+    """Self-service password reset: email a new auto-generated password to
+    the account's registered address. Always returns the same generic
+    response regardless of whether the account exists, so this endpoint
+    can't be used to enumerate valid usernames/emails."""
     import database
-    name = (payload.username or "").strip()
-    if not name or not payload.new_password:
-        raise HTTPException(status_code=400, detail="Username and new password are required.")
+    import mailer
+
+    name_or_email = (payload.username_or_email or "").strip()
+    generic = {"ok": True, "message": "If that account exists, a new password has been emailed to it."}
+    if not name_or_email:
+        return generic
+
     try:
-        n = database.reset_password(name, payload.new_password)
+        user = database.get_user_by_email(name_or_email) if "@" in name_or_email \
+            else database.get_user(name_or_email)
+    except Exception:  # noqa: BLE001
+        return generic
+
+    if not user or not user["IsActive"] or not user.get("Email"):
+        return generic
+
+    temp_password = database.generate_temp_password()
+    try:
+        database.reset_password(user["UserName"], temp_password, force_change=True)
+    except Exception:  # noqa: BLE001
+        return generic
+
+    try:
+        mailer.send_mail(
+            user["Email"], "Your PIIPS password was reset",
+            mailer.password_reset_email_html(user["UserName"], temp_password, _base_url(request)),
+        )
+    except mailer.MailError:
+        pass  # generic response either way - the password was still reset
+
+    return generic
+
+
+@app.post("/api/change-password")
+def api_change_password(payload: ChangePasswordModel):
+    """Change a user's own password (requires the current one) - used both
+    for the forced first-login change and a normal self-service change."""
+    import database
+    user = database.get_user_by_id(payload.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if not database.verify_password(payload.current_password or "", user["Password"] or ""):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+    try:
+        database.reset_password(user["UserName"], payload.new_password, force_change=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    if not n:
-        raise HTTPException(status_code=404, detail=f"User '{name}' not found.")
     return {"ok": True}
 
 
@@ -1323,13 +1380,24 @@ def api_reset_password(payload: ResetModel):
 
 class UserCreateModel(BaseModel):
     username: str
-    password: str
+    email: str
     user_type_id: int
+    created_by: Optional[int] = None
 
 
 class UserActiveModel(BaseModel):
     user_id: int
     is_active: bool
+    modified_by: Optional[int] = None
+
+
+class UserResetPasswordModel(BaseModel):
+    user_id: int          # the acting admin/super admin
+    target_user_id: int   # whose password is being reset
+
+
+def _email_result(email_sent, email_error):
+    return {"email_sent": email_sent, "email_error": email_error}
 
 
 @app.get("/api/users")
@@ -1345,27 +1413,156 @@ def api_list_users():
 
 
 @app.post("/api/users")
-def api_create_user(payload: UserCreateModel):
+def api_create_user(payload: UserCreateModel, request: Request):
+    """Create a user. The admin never chooses a password - one is always
+    auto-generated and emailed to the address given here."""
     import database
+    import mailer
+
     name = (payload.username or "").strip()
-    if not name or not payload.password:
-        raise HTTPException(status_code=400, detail="Username and password are required.")
+    email = (payload.email or "").strip()
+    if not name or not email:
+        raise HTTPException(status_code=400, detail="Username and email are required.")
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
     try:
-        database.create_user(name, payload.password, payload.user_type_id)
+        temp_password = database.create_user(name, payload.user_type_id, email, payload.created_by)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    return {"ok": True}
+
+    email_sent, email_error = True, None
+    try:
+        mailer.send_mail(
+            email, "Your PIIPS account is ready",
+            mailer.welcome_email_html(name, temp_password, _base_url(request)),
+        )
+    except mailer.MailError as exc:
+        email_sent, email_error = False, str(exc)
+
+    return {"ok": True, **_email_result(email_sent, email_error)}
 
 
 @app.post("/api/users/active")
-def api_set_user_active(payload: UserActiveModel):
+def api_set_user_active(payload: UserActiveModel, request: Request):
     import database
+    import mailer
+
     try:
-        database.set_user_active(payload.user_id, payload.is_active)
+        user = database.get_user_by_id(payload.user_id)
+        database.set_user_active(payload.user_id, payload.is_active, payload.modified_by)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    email_sent, email_error = False, None
+    if user and user.get("Email"):
+        html = (
+            mailer.activation_email_html(user["UserName"], _base_url(request))
+            if payload.is_active
+            else mailer.deactivation_email_html(user["UserName"], _base_url(request))
+        )
+        try:
+            mailer.send_mail(user["Email"], "Your PIIPS account status changed", html)
+            email_sent = True
+        except mailer.MailError as exc:
+            email_error = str(exc)
+
+    return {"ok": True, **_email_result(email_sent, email_error)}
+
+
+@app.post("/api/users/reset-password")
+def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
+    """Admin-triggered password reset for another user (distinct from the
+    self-service /api/forgot-password). An Admin may reset anyone except a
+    Super Admin; only a Super Admin may reset a Super Admin's password."""
+    import database
+    import mailer
+
+    caller_role = database.get_user_role(payload.user_id)
+    if not caller_role or not caller_role["active"] or caller_role["role"].lower() not in ("admin", "super admin"):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+
+    target = database.get_user_by_id(payload.target_user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    target_role = database.get_user_role(payload.target_user_id)
+    if (target_role and (target_role["role"] or "").lower() == "super admin"
+            and caller_role["role"].lower() != "super admin"):
+        raise HTTPException(status_code=403, detail="Only a Super Admin can reset a Super Admin's password.")
+
+    temp_password = database.generate_temp_password()
+    try:
+        database.reset_password(target["UserName"], temp_password, force_change=True, modified_by=payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    email_sent, email_error = False, None
+    if target.get("Email"):
+        try:
+            mailer.send_mail(
+                target["Email"], "Your PIIPS password was reset",
+                mailer.password_reset_email_html(target["UserName"], temp_password, _base_url(request)),
+            )
+            email_sent = True
+        except mailer.MailError as exc:
+            email_error = str(exc)
+
+    return {"ok": True, **_email_result(email_sent, email_error)}
+
+
+class MailSettingsModel(BaseModel):
+    user_id: Optional[int] = None
+    username: str
+    email: str
+    password: Optional[str] = None   # blank/None = keep existing
+    smtp_host: str
+    smtp_port: int
+
+
+@app.get("/api/mail-settings")
+def get_mail_settings_api(user_id: Optional[int] = None):
+    import database
+    _require_developer(user_id)
+    s = database.get_mail_settings()
+    if not s:
+        return {"username": "", "email": "", "smtp_host": "", "smtp_port": 587, "password_set": False}
+    return {
+        "username": s["UserName"], "email": s["EmailID"],
+        "smtp_host": s["SMTPHost"], "smtp_port": s["SMTPPort"],
+        "password_set": bool(s["Password"]),
+    }
+
+
+@app.post("/api/mail-settings")
+def save_mail_settings_api(payload: MailSettingsModel):
+    import database
+    import smtplib
+
+    _require_developer(payload.user_id)
+
+    username = (payload.username or "").strip()
+    email = (payload.email or "").strip()
+    host = (payload.smtp_host or "").strip()
+    if not username or not email or not host or not payload.smtp_port:
+        raise HTTPException(status_code=400, detail="Username, email, SMTP host and port are required.")
+
+    password = payload.password
+    current = database.get_mail_settings()
+    test_password = password if password else (current["Password"] if current else "")
+    if not test_password:
+        raise HTTPException(status_code=400, detail="Password is required.")
+
+    try:
+        with smtplib.SMTP(host, int(payload.smtp_port), timeout=15) as smtp:
+            smtp.starttls()
+            smtp.login(email, test_password)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Could not connect: {exc}")
+
+    database.save_mail_settings(username, email, password, host, payload.smtp_port)
     return {"ok": True}
 
 

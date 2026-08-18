@@ -14,6 +14,8 @@ import BuyerOrderEntry from "./BuyerOrderEntry";
 import Lifecycle from "./Lifecycle";
 import Login from "./Login";
 import ForgotPassword from "./ForgotPassword";
+import ChangePassword from "./ChangePassword";
+import MailSettings from "./MailSettings";
 import Manuals from "./Manuals";
 import Publish from "./Publish";
 
@@ -24,7 +26,7 @@ const MENU = [
   ["manual", "Manual", "📖", "Main"],
   ["buyerorder", "Buyer Order Entry", "✎", "Review"],
   ["load", "Load", "📥", "Accounts"],
-  ["post", "Post", "📤", "Accounts"],
+  ["post", "Post", "📮", "Accounts"],
   ["complete", "Complete", "✅", "Accounts"],
   ["configuration", "Folder Configuration", "⚙", "Setup"],
   ["dbconfig", "Database Configuration", "🗄", "Setup"],
@@ -34,6 +36,7 @@ const MENU = [
   ["mapping", "Field Mapping", "🔗", "Mapping"],
   ["training", "Model Training", "🧠", "Admin"],
   ["users", "User Management", "👤", "Admin"],
+  ["mailsettings", "Mail Server Setting", "✉", "Admin"],
   ["publish", "Publish", "🚀", "Admin"],
 ];
 
@@ -59,10 +62,22 @@ const PAGES = {
   template: Template, users: UserManagement, dbconfig: DatabaseConfig,
   apiconfig: ApiConfiguration, buyerorder: BuyerOrderEntry,
   load: Load, post: Post, complete: Complete, manual: Manuals,
-  publish: Publish,
+  publish: Publish, mailsettings: MailSettings,
 };
 
 const loadUser = () => {
+  // A "Sign in to PIIPS" link from a welcome/password-reset email carries
+  // ?signout=1 - it's often opened in the same browser an admin just used
+  // to create the account, so any session already active here must be
+  // cleared instead of silently showing that admin's own dashboard.
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("signout") === "1") {
+    localStorage.removeItem("piips_user");
+    params.delete("signout");
+    const rest = params.toString();
+    window.history.replaceState({}, "", window.location.pathname + (rest ? `?${rest}` : ""));
+    return null;
+  }
   try { return JSON.parse(localStorage.getItem("piips_user")); } catch { return null; }
 };
 
@@ -78,6 +93,27 @@ export default function App() {
     localStorage.setItem("piips_theme", theme);
   }, [theme]);
 
+  // Casual deterrents only, not real security - DevTools is a feature of
+  // the user's own browser and cannot be blocked from the page they're
+  // viewing (a different shortcut, the browser menu, or an external tool
+  // always gets there). Anything that actually matters is enforced
+  // server-side regardless of what's visible here.
+  useEffect(() => {
+    const blockContextMenu = (e) => e.preventDefault();
+    const blockDevToolsKeys = (e) => {
+      const key = e.key.toUpperCase();
+      if (key === "F12") { e.preventDefault(); return; }
+      if (e.ctrlKey && e.shiftKey && (key === "I" || key === "J" || key === "C")) { e.preventDefault(); return; }
+      if (e.ctrlKey && key === "U") { e.preventDefault(); }
+    };
+    document.addEventListener("contextmenu", blockContextMenu);
+    document.addEventListener("keydown", blockDevToolsKeys);
+    return () => {
+      document.removeEventListener("contextmenu", blockContextMenu);
+      document.removeEventListener("keydown", blockDevToolsKeys);
+    };
+  }, []);
+
   const toggleCollapsed = () => {
     setCollapsed((c) => { localStorage.setItem("piips_collapsed", c ? "0" : "1"); return !c; });
   };
@@ -92,6 +128,22 @@ export default function App() {
   }
 
   const logout = () => { localStorage.removeItem("piips_user"); setUser(null); setAuthView("login"); };
+
+  // A freshly-created account, or one that just went through Forgot
+  // password, must set its own password before doing anything else.
+  if (user.must_change_password) {
+    return (
+      <ChangePassword
+        user={user}
+        onLogout={logout}
+        onDone={() => {
+          const updated = { ...user, must_change_password: false };
+          localStorage.setItem("piips_user", JSON.stringify(updated));
+          setUser(updated);
+        }}
+      />
+    );
+  }
 
   const allowed = ROLE_MENUS[(user.user_type || "").toLowerCase()] || ROLE_MENUS.user;
   const menu = MENU.filter(([k]) => allowed.includes(k));

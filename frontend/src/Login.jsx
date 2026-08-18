@@ -41,7 +41,8 @@ export default function Login({ onSuccess, onForgot }) {
           <label className="label">Password</label>
           <div className="input-group">
             <span className="ico">🔒</span>
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+                   onPaste={(e) => e.preventDefault()} placeholder="Password" />
           </div>
         </div>
 
