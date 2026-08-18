@@ -43,7 +43,7 @@ _ROBOCOPY_XD = [
     "logs", "output", "New_Format", "model_backups", "old",
     "sample_input", "manuals", "announcement_media",
 ]
-_ROBOCOPY_XF = ["config.json", "config_nonencrypted.json", "*.log", "*.pyc"]
+_ROBOCOPY_XF = ["config.json", "config_nonencrypted.json", "PIIPS.sql", "*.log", "*.pyc"]
 
 
 class PublishError(Exception):
