@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoicePdfUrl } from "./api";
+import { invoicePdfUrl, getActiveAnnouncements, announcementImageUrl } from "./api";
 
 // PIIPS logo — a monogram "P" (source: logo/PIIPS-logo.svg) on an indigo-to-
 // magenta gradient badge; the P's counter doubles as a precision-target dot,
@@ -270,4 +270,99 @@ export function confirmDialog(message, { confirmLabel = "Confirm", cancelLabel =
                      danger={danger} onResolve={cleanup} />
     );
   });
+}
+
+const READ_KEY = "piips_read_announcements";
+
+function loadRead() {
+  try { return new Set(JSON.parse(localStorage.getItem(READ_KEY)) || []); }
+  catch { return new Set(); }
+}
+
+// Dispatched by Announcement.jsx right after a successful publish/stop, so
+// the Super Admin who just acted sees the bell update immediately instead
+// of waiting out the poll interval below.
+export const ANNOUNCEMENT_CHANGED_EVENT = "piips:announcements-changed";
+
+// Bell icon (topbar, next to the theme dropdown) - every logged-in user
+// gets a red dot when a new site-wide announcement (Super Admin >
+// Announcement) is active. Clicking it opens a pop-up with the content;
+// it never disturbs the page layout the way an inline banner would.
+// Announcements stay visible in the pop-up (re-openable) until their end
+// date/time passes or a Super Admin stops them - the dot just tracks
+// whether THIS browser has opened the bell since the announcement went up.
+// There's no push/realtime channel, so a short poll is what makes it show
+// up for everyone ELSE without them refreshing.
+export function AnnouncementBell() {
+  const [items, setItems] = useState([]);
+  const [read, setRead] = useState(loadRead);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    const load = () => getActiveAnnouncements().then((r) => setItems(r.announcements || [])).catch(() => {});
+    load();
+    const id = setInterval(load, 15_000);
+    window.addEventListener(ANNOUNCEMENT_CHANGED_EVENT, load);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener(ANNOUNCEMENT_CHANGED_EVENT, load);
+    };
+  }, []);
+
+  const unread = items.filter((a) => !read.has(a.Id));
+
+  const openPopup = () => {
+    setOpen(true);
+    const next = new Set(read);
+    items.forEach((a) => next.add(a.Id));
+    setRead(next);
+    localStorage.setItem(READ_KEY, JSON.stringify([...next]));
+  };
+
+  return (
+    <>
+      <button onClick={openPopup} title="Announcements"
+              style={{ position: "relative", background: "none", border: "none", cursor: "pointer",
+                       fontSize: 19, lineHeight: 1, padding: 6, color: "var(--text)" }}>
+        🔔
+        {unread.length > 0 && (
+          <span style={{
+            position: "absolute", top: 2, right: 2, width: 9, height: 9, borderRadius: "50%",
+            background: "var(--danger)", border: "2px solid var(--surface)",
+          }} />
+        )}
+      </button>
+
+      {open && (
+        <Modal title="📣 Announcements" onClose={() => setOpen(false)} width={520}>
+          {items.length === 0 ? (
+            <div className="empty">No active announcements.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              {items.map((a) => (
+                <div key={a.Id} style={{ borderLeft: "4px solid #7c3aed", paddingLeft: 14 }}>
+                  <div style={{ fontWeight: 700 }}>{a.Title}</div>
+                  {a.BodyText && (
+                    <div style={{ color: "var(--muted)", fontSize: 13.5, whiteSpace: "pre-wrap", marginTop: 4 }}>
+                      {a.BodyText}
+                    </div>
+                  )}
+                  {a.ImagePath && (
+                    <img src={announcementImageUrl(a.ImagePath)} alt=""
+                         style={{ maxWidth: "100%", maxHeight: 260, marginTop: 8, borderRadius: 8, display: "block" }} />
+                  )}
+                  {a.VideoUrl && (
+                    <div style={{ marginTop: 8 }}>
+                      <a href={a.VideoUrl} target="_blank" rel="noreferrer" className="btn-link">▶ Watch video</a>
+                    </div>
+                  )}
+                  <div className="hint" style={{ marginTop: 6 }}>Until {a.EndDateTime}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
+      )}
+    </>
+  );
 }

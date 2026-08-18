@@ -2945,6 +2945,129 @@ def ensure_default_super_admin():
 
 
 # ---------------------------------------------------------------------------
+# Announcements (Super Admin only) - site-wide notices shown to every
+# logged-in user until EndDateTime passes or a Super Admin stops one early.
+# ---------------------------------------------------------------------------
+
+def init_announcement_table():
+    """Create tbl_Announcement if missing. Sample: init_announcement_table()"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.tables WHERE name = 'tbl_Announcement'
+            )
+            CREATE TABLE tbl_Announcement (
+                Id              INT IDENTITY(1,1) PRIMARY KEY,
+                Title           NVARCHAR(200) NOT NULL,
+                BodyText        NVARCHAR(MAX) NULL,
+                ImagePath       NVARCHAR(500) NULL,
+                VideoUrl        NVARCHAR(500) NULL,
+                EndDateTime     DATETIME NOT NULL,
+                IsActive        BIT NOT NULL DEFAULT 1,
+                CreatedById     INT NULL,
+                CreatedDatetime DATETIME NOT NULL DEFAULT GETDATE(),
+                StoppedById     INT NULL,
+                StoppedDatetime DATETIME NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_announcement(title, body_text, image_path, video_url, end_datetime, created_by=None):
+    """Create an announcement. Sample:
+    create_announcement('Maintenance', 'Down 10-11 PM', None, None, '2026-08-20 22:00:00', 11)"""
+    init_announcement_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO tbl_Announcement "
+            "(Title, BodyText, ImagePath, VideoUrl, EndDateTime, IsActive, CreatedById, CreatedDatetime) "
+            "OUTPUT INSERTED.Id "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, GETDATE())",
+            title, body_text, image_path, video_url, end_datetime, created_by,
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        return new_id
+    finally:
+        conn.close()
+
+
+def list_announcements():
+    """Every announcement, newest first (Super Admin management view).
+    Sample: list_announcements()"""
+    init_announcement_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT Id, Title, BodyText, ImagePath, VideoUrl, EndDateTime, IsActive, "
+            "CreatedById, CreatedDatetime, StoppedById, StoppedDatetime "
+            "FROM tbl_Announcement ORDER BY Id DESC"
+        )
+        cols = [d[0] for d in cur.description]
+        out = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            d["IsActive"] = bool(d["IsActive"])
+            for k in ("EndDateTime", "CreatedDatetime", "StoppedDatetime"):
+                if d.get(k) is not None:
+                    d[k] = str(d[k])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def get_active_announcements():
+    """Announcements every logged-in user should currently see: IsActive
+    and not yet past EndDateTime. Sample: get_active_announcements()"""
+    init_announcement_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT Id, Title, BodyText, ImagePath, VideoUrl, EndDateTime "
+            "FROM tbl_Announcement WHERE IsActive = 1 AND EndDateTime > GETDATE() "
+            "ORDER BY Id DESC"
+        )
+        cols = [d[0] for d in cur.description]
+        out = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            d["EndDateTime"] = str(d["EndDateTime"])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def stop_announcement(announcement_id, user_id=None):
+    """Deactivate an announcement immediately (Super Admin). Sample:
+    stop_announcement(3, 11)"""
+    init_announcement_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE tbl_Announcement SET IsActive = 0, StoppedById = ?, StoppedDatetime = GETDATE() "
+            "WHERE Id = ?",
+            user_id, announcement_id,
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Password hashing (stdlib PBKDF2-SHA256)
 # ---------------------------------------------------------------------------
 

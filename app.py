@@ -1,12 +1,13 @@
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
 import shutil
+import uuid
 from datetime import datetime
 
 import config_store
@@ -1610,6 +1611,111 @@ def save_mail_settings_api(payload: MailSettingsModel):
 
     database.save_mail_settings(username, email, password, host, payload.smtp_port)
     return {"ok": True}
+
+
+# ==========================================================================
+# Announcements (Super Admin only) - site-wide notices for every user
+# ==========================================================================
+
+ANNOUNCEMENT_MEDIA_DIR = os.path.join(BASE_DIR, "announcement_media")
+os.makedirs(ANNOUNCEMENT_MEDIA_DIR, exist_ok=True)
+_ANNOUNCEMENT_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+
+@app.get("/api/announcements/active")
+def api_active_announcements():
+    """Announcements every logged-in user should currently see - no role
+    gate, any authenticated session can call this."""
+    import database
+    try:
+        return {"announcements": database.get_active_announcements()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/announcements")
+def api_list_announcements(user_id: Optional[int] = None):
+    """All announcements, including expired/stopped (Super Admin management view)."""
+    import database
+    _require_developer(user_id)
+    try:
+        return {"announcements": database.list_announcements()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.post("/api/announcements")
+def api_create_announcement(
+    title: str = Form(...),
+    body_text: str = Form(""),
+    video_url: str = Form(""),
+    end_datetime: str = Form(...),   # "YYYY-MM-DDTHH:MM" from <input type="datetime-local">
+    user_id: Optional[int] = Form(None),
+    image: Optional[UploadFile] = File(None),
+):
+    """Create a site-wide announcement (Super Admin only). Content is
+    flexible - plain text, an optional uploaded image (a screenshot, a
+    QR code, whatever), and/or an optional video URL, all shown together
+    in the notification banner every user sees until end_datetime passes
+    or a Super Admin stops it early."""
+    import database
+
+    _require_developer(user_id)
+
+    title = title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required.")
+    if not end_datetime:
+        raise HTTPException(status_code=400, detail="End date/time is required.")
+    end_dt = end_datetime.replace("T", " ")
+    if len(end_dt) == 16:   # "YYYY-MM-DD HH:MM" -> add seconds
+        end_dt += ":00"
+
+    image_path = None
+    if image is not None and image.filename:
+        ext = os.path.splitext(image.filename)[1].lower()
+        if ext not in _ANNOUNCEMENT_IMAGE_EXTS:
+            raise HTTPException(status_code=400, detail=f"Unsupported image type: {ext or '(none)'}")
+        stored_name = f"{uuid.uuid4().hex}{ext}"
+        dest = os.path.join(ANNOUNCEMENT_MEDIA_DIR, stored_name)
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(image.file, f)
+        image_path = stored_name
+
+    try:
+        new_id = database.create_announcement(
+            title, body_text.strip() or None, image_path, video_url.strip() or None, end_dt, user_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    return {"ok": True, "id": new_id}
+
+
+class AnnouncementStopModel(BaseModel):
+    user_id: Optional[int] = None
+
+
+@app.post("/api/announcements/{announcement_id}/stop")
+def api_stop_announcement(announcement_id: int, payload: AnnouncementStopModel):
+    """Stop/remove an announcement immediately (Super Admin only)."""
+    import database
+    _require_developer(payload.user_id)
+    try:
+        n = database.stop_announcement(announcement_id, payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not n:
+        raise HTTPException(status_code=404, detail="Announcement not found.")
+    return {"ok": True}
+
+
+if os.path.isdir(ANNOUNCEMENT_MEDIA_DIR):
+    app.mount(
+        "/announcement_media",
+        StaticFiles(directory=ANNOUNCEMENT_MEDIA_DIR),
+        name="announcement_media",
+    )
 
 
 # ==========================================================================

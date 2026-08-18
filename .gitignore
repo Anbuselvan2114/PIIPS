@@ -14,6 +14,7 @@ format_model.json
 model_backups/
 New_Format/
 output/
+announcement_media/
 *.log
 
 # Sample invoice PDFs and generated manuals — not tracked in git

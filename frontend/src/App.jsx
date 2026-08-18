@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Logo } from "./components";
+import { Logo, AnnouncementBell } from "./components";
 import Dashboard from "./Dashboard";
 import Configuration from "./Configuration";
 import DatabaseConfig from "./DatabaseConfig";
@@ -16,6 +16,7 @@ import Login from "./Login";
 import ForgotPassword from "./ForgotPassword";
 import ChangePassword from "./ChangePassword";
 import MailSettings from "./MailSettings";
+import Announcement from "./Announcement";
 import Manuals from "./Manuals";
 import Publish from "./Publish";
 
@@ -37,6 +38,7 @@ const MENU = [
   ["training", "Model Training", "🧠", "Admin"],
   ["users", "User Management", "👤", "Admin"],
   ["mailsettings", "Mail Server Setting", "✉", "Admin"],
+  ["announcement", "Announcement", "📣", "Admin"],
   ["publish", "Publish", "🚀", "Admin"],
 ];
 
@@ -62,7 +64,7 @@ const PAGES = {
   template: Template, users: UserManagement, dbconfig: DatabaseConfig,
   apiconfig: ApiConfiguration, buyerorder: BuyerOrderEntry,
   load: Load, post: Post, complete: Complete, manual: Manuals,
-  publish: Publish, mailsettings: MailSettings,
+  publish: Publish, mailsettings: MailSettings, announcement: Announcement,
 };
 
 const loadUser = () => {
@@ -202,6 +204,7 @@ export default function App() {
           <button className="toggle" onClick={toggleCollapsed} title={collapsed ? "Expand menu" : "Collapse menu"}>☰</button>
           <h1>{title}</h1>
           <div style={{ flex: 1 }} />
+          <AnnouncementBell />
           <label className="theme-select" title="Theme">
             <span className="ico">🎨</span>
             <select value={theme} onChange={(e) => setTheme(e.target.value)}>

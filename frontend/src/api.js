@@ -215,6 +215,42 @@ export const saveMailSettings = (payload) =>
     body: JSON.stringify(payload),
   });
 
+export const getActiveAnnouncements = () => request("/api/announcements/active");
+
+export const getAnnouncements = (user_id) =>
+  request(`/api/announcements${user_id != null ? `?user_id=${user_id}` : ""}`);
+
+export const createAnnouncement = async ({ title, body_text, video_url, end_datetime, user_id, image }) => {
+  const form = new FormData();
+  form.append("title", title);
+  form.append("body_text", body_text || "");
+  form.append("video_url", video_url || "");
+  form.append("end_datetime", end_datetime);
+  if (user_id != null) form.append("user_id", user_id);
+  if (image) form.append("image", image);
+
+  let res;
+  try {
+    res = await fetch(API_BASE + "/api/announcements", { method: "POST", body: form });
+  } catch {
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
+  if (!res.ok) {
+    let detail;
+    try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
+    throw new Error((typeof detail === "string" ? detail : detail?.message) || `Request failed (${res.status})`);
+  }
+  return res.json();
+};
+
+export const stopAnnouncement = (announcement_id, user_id) =>
+  request(`/api/announcements/${announcement_id}/stop`, {
+    method: "POST",
+    body: JSON.stringify({ user_id }),
+  });
+
+export const announcementImageUrl = (path) => `${API_BASE}/announcement_media/${encodeURIComponent(path)}`;
+
 export const clearFormats = () =>
   request("/api/formats", { method: "DELETE" });
 
