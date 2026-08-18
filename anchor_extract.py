@@ -17,7 +17,10 @@ import re
 
 # Fields whose value sits to the right of (or below) a label anchor.
 RIGHT_FIELDS = {
-    "Invoice No.": ["invoice no", "invoice number", "invoice #", "inv no", "bill no"],
+    "Invoice No.": [
+        "invoice no", "invoice number", "invoice #", "inv no", "bill no",
+        "invioce no",  # genuine vendor-template typo seen on a real invoice, not an OCR artifact
+    ],
     "Dated": ["dated", "invoice date", "date"],
     "Buyer's Order No.": [
         "p.o. no", "p.o no", "po no", "buyer's order no",
@@ -52,7 +55,7 @@ EXACT_SECTION_MARKERS = [
 # Phrases that identify a token/row as a label (so it is never taken as a
 # value, and so party-name detection skips them).
 LABEL_WORDS = [
-    "invoice no", "invoice number", "dated", "invoice date", "place of supply",
+    "invoice no", "invoice number", "invioce no", "dated", "invoice date", "place of supply",
     # bare "Date" as its own grid-column header (e.g. "Invoice No. | Date"
     # with the values in the row below) — without this, a right-scan for
     # "Invoice No." keeps going past its own column into "Date"'s and

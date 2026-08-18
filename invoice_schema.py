@@ -639,6 +639,14 @@ def _gst_rate_from_text(text):
     return _rate_near(text, "gst")
 
 
+# A right-scan for Invoice No. can occasionally run past its own value into
+# a date sitting further along the same OCR row with no label in between to
+# stop at (e.g. "Invioce No: 1413    03.08.2026", where the trailing date
+# belongs to a different column entirely) - strip a trailing date pattern
+# rather than keeping it glued onto the number.
+_TRAILING_DATE_RE = re.compile(r"\s+\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*$")
+
+
 # ---------------------------------------------------------------------------
 # Main mapper
 # ---------------------------------------------------------------------------
@@ -822,7 +830,7 @@ def build_invoice_json(result, pdf_path=""):
     # ---- assembled schema ------------------------------------------------
 
     data = {
-        "invoice_no": fields.get("Invoice No.", ""),
+        "invoice_no": _TRAILING_DATE_RE.sub("", fields.get("Invoice No.", "") or "").strip(),
         "invoice_date": _normalize_date(fields.get("Dated", "")),
         "buyer_name": buyer_name_v,
         "buyer_gstin": buyer_gstin_v,
