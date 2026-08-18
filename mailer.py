@@ -145,13 +145,18 @@ def _button(label, url):
 """
 
 
-def welcome_email_html(username, password, login_url=""):
+def welcome_email_html(username, password, login_url="", user_type=""):
+    type_row = f"""\
+  <tr><td style="color:#64748b;font-size:13px;padding-bottom:2px;padding-top:10px;">Account type</td></tr>
+  <tr><td style="font-weight:700;color:#0f172a;font-size:15px;">{user_type}</td></tr>
+""" if user_type else ""
     body = f"""\
 Your PIIPS account has been created. Sign in with the temporary password
 below - you'll be asked to set your own password the first time you log in.
 <table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:14px;">
   <tr><td style="color:#64748b;font-size:13px;padding-bottom:2px;">Username</td></tr>
   <tr><td style="font-weight:700;color:#0f172a;font-size:15px;">{username}</td></tr>
+{type_row}
 </table>
 {_password_chip(password)}
 {_button("Sign in to PIIPS", login_url)}

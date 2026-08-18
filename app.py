@@ -1433,11 +1433,14 @@ def api_create_user(payload: UserCreateModel, request: Request):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
+    created = database.get_user(name)
+    user_type_name = (created or {}).get("UserTypeName", "")
+
     email_sent, email_error = True, None
     try:
         mailer.send_mail(
             email, "Your PIIPS account is ready",
-            mailer.welcome_email_html(name, temp_password, _base_url(request)),
+            mailer.welcome_email_html(name, temp_password, _base_url(request), user_type_name),
         )
     except mailer.MailError as exc:
         email_sent, email_error = False, str(exc)
