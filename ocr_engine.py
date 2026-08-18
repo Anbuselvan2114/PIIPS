@@ -100,6 +100,10 @@ def _looks_like_photo_page(image):
 # Indian GSTIN: 2-digit state code + 10-char PAN + entity/check chars (15 total).
 _GSTIN_RE = re.compile(r"\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]{2}")
 
+# A physical-dimension spec with no unit word of its own (e.g. `18.5"` for a
+# monitor's screen size) - digits then a bare inch/feet mark, nothing else.
+_SIZE_SPEC_RE = re.compile(r'^\d+(\.\d+)?["\']$')
+
 
 def _norm_gstin(value):
     """Uppercase, alphanumerics only — for comparing GSTIN values."""
@@ -2698,7 +2702,17 @@ class OCREngine:
                 # Charge line / description continuation
                 # ----------------------------------
 
-                has_text = any(c.isalpha() for c in row_text)
+                # A bare physical-dimension spec ("18.5\"") has no letters
+                # either, so it fails the isalpha() check below same as a
+                # leaked tax/summary number does - but its trailing inch
+                # mark makes it unambiguous (a plain number or a percent
+                # figure like "18%" never has one), so it can safely count
+                # as real content without reopening the regression a
+                # broader "any non-numeric token" rule caused earlier.
+                has_text = (
+                    any(c.isalpha() for c in row_text)
+                    or any(_SIZE_SPEC_RE.match(w["text"].strip()) for w in words)
+                )
 
                 EXCLUDE_KW = ("output", "igst", "cgst", "sgst", "tax amount",
                               "total", "round off", "round-off", "roundoff",
