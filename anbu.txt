@@ -1,11 +1,123 @@
 --UAT
-Set-Location "E:\PIIPS_Application"; (Get-Content ".\requirements.txt") | ForEach-Object { if ($_ -match '^opencv-python==') { 'opencv-python==4.6.0.66' } elseif ($_ -match '^opencv-python-headless==') { $null } else { $_ } } | Set-Content ".\requirements.txt"; & ".\venv\Scripts\python.exe" -m pip install -r ".\requirements.txt"
-Get-OdbcDriver | Where-Object Name -like "*ODBC Driver 17*"
-
-Set-Location "E:\PIIPS_Application\required_softwares\nssm-2.24\win64"; .\nssm.exe restart PIIPS_Backend
+    --Move files
+        robocopy "D:\WorkSpace\Projects\Python\PIIPS" "\\10.0.1.210\E$\PIIPS_Application" /E /Z /R:3 /W:5 /PURGE /XD "venv" "__pycache__" ".git" "logs" ".claude" /XF "config.json"
+    --- installing dependency
+        Set-Location "E:\PIIPS_Application"; (Get-Content ".\requirements.txt") | ForEach-Object { if ($_ -match '^opencv-python==') { 'opencv-python==4.6.0.66' } elseif ($_ -match '^opencv-python-headless==') { $null } else { $_ } } | Set-Content ".\requirements.txt"; & ".\venv\Scripts\python.exe" -m pip install -r ".\requirements.txt"
+        Get-OdbcDriver | Where-Object Name -like "*ODBC Driver 17*" 
+        Set-Location "E:\PIIPS_Application\required_softwares\nssm-2.24\win64"; .\nssm.exe restart PIIPS_Backend
+    --restarting service
+        PS E:\PIIPS_Application\required_softwares\nssm-2.24\win64> Restart-Service PIIPS_Backend
 
 --live
-Set-Location "E:\Source\piips"; if (-not (Test-Path ".\venv\Scripts\python.exe")) { py -3.10 -m venv ".\venv" }; (Get-Content ".\requirements.txt") | ForEach-Object { if ($_ -match '^opencv-python==') { 'opencv-python==4.6.0.66' } elseif ($_ -match '^opencv-python-headless==') { $null } else { $_ } } | Set-Content ".\requirements.txt"; & ".\venv\Scripts\python.exe" -m pip install --upgrade pip; & ".\venv\Scripts\python.exe" -m pip install -r ".\requirements.txt"
-Get-OdbcDriver | Where-Object Name -like "*ODBC Driver 17*"
-Set-Location "E:\Source\piips\required_softwares\nssm-2.24\win64"; .\nssm.exe restart PIIPS_Backend
+    --Move files
+        # 1. Copy PIIPS application
+      robocopy "D:\WorkSpace\Projects\Python\PIIPS" "\\10.0.1.218\E$\Source\piips" /E /Z /R:3 /W:5 /PURGE /XD "venv" "__pycache__" ".git" "logs" ".claude" /XF "config.json"
+    # 2. Update OpenCV dependency
 
+        Set-Location "E:\Source\piips"
+
+        (Get-Content ".\requirements.txt") | ForEach-Object {
+            if ($_ -match '^opencv-python==') {
+                'opencv-python==4.6.0.66'
+            }
+            elseif ($_ -match '^opencv-python-headless==') {
+                $null
+            }
+            else {
+                $_
+            }
+        } | Set-Content ".\requirements.txt"
+        --"E:\Python310\python.exe" -m pip install -r "E:\Source\piips\requirements.txt"
+        
+        cd E:\Source\piips
+
+        & "E:\Source\piips\venv\Scripts\python.exe" -m pip install -r "E:\Source\piips\requirements.txt"
+    --create environment
+        & "E:\Python310\python.exe" -m venv "E:\Source\piips\venv"
+    
+    --installing uvicorn
+        & "E:\Source\piips\venv\Scripts\python.exe" -m pip install uvicorn
+
+    --Check whether ODBC Driver 17 is installed
+        Get-OdbcDriver | Where-Object Name -like "*ODBC Driver 17*"
+
+    --install fast api
+        & "E:\Source\piips\venv\Scripts\python.exe" -m pip install fastapi
+    
+    --verify fast api
+        & "E:\Source\piips\venv\Scripts\python.exe" -c "import fastapi; print(fastapi.__version__)"
+
+    --checking the site working
+        cd E:\Source\piips
+
+        & "E:\Source\piips\venv\Scripts\python.exe" -m uvicorn main:app --host 127.0.0.1 --port 8000
+    --create backend service for nssm
+        $AppRoot="E:\Source\piips"; $Python="$AppRoot\venv\Scripts\python.exe"; $Nssm="$AppRoot\required_softwares\nssm-2.24\win64\nssm.exe"; $Service="PIIPS_Backend"; $Log="$AppRoot\logs"; New-Item -ItemType Directory -Force $Log | Out-Null; & $Nssm install $Service $Python; & $Nssm set $Service AppDirectory $AppRoot; & $Nssm set $Service AppParameters "-m uvicorn main:app --host 127.0.0.1 --port 8000"; & $Nssm set $Service Start SERVICE_AUTO_START; & $Nssm set $Service AppStdout "$Log\piips_stdout.log"; & $Nssm set $Service AppStderr "$Log\piips_stderr.log"; & $Nssm start $Service; Start-Sleep 3; Get-Service $Service; netstat -ano | findstr :8000
+
+    --nssm setup
+        $ErrorActionPreference = "Stop"
+
+        $AppRoot = "E:\Source\piips"
+        $Python = "$AppRoot\venv\Scripts\python.exe"
+        $Nssm = "$AppRoot\required_softwares\nssm-2.24\win64\nssm.exe"
+        $ServiceName = "PIIPS_Backend"
+        $LogDir = "$AppRoot\logs"
+
+        Write-Host "=== PIIPS NSSM LIVE SETUP ===" -ForegroundColor Cyan
+
+        # Check required files
+        if (!(Test-Path $Python)) {
+            throw "Python venv not found: $Python"
+        }
+
+        if (!(Test-Path $Nssm)) {
+            throw "NSSM not found: $Nssm"
+        }
+
+        # Create log folder
+        New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+        # Install service if it does not exist
+        & $Nssm status $ServiceName 2>$null
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Installing NSSM service..." -ForegroundColor Yellow
+            & $Nssm install $ServiceName $Python
+        }
+
+        # Configure service
+        & $Nssm set $ServiceName Application $Python
+        & $Nssm set $ServiceName AppDirectory $AppRoot
+        & $Nssm set $ServiceName AppParameters "-m uvicorn main:app --host 127.0.0.1 --port 8000"
+
+        # Automatic startup
+        & $Nssm set $ServiceName Start SERVICE_AUTO_START
+
+        # Logs
+        & $Nssm set $ServiceName AppStdout "$LogDir\piips_stdout.log"
+        & $Nssm set $ServiceName AppStderr "$LogDir\piips_stderr.log"
+
+        # Restart service
+        Write-Host "Starting PIIPS_Backend..." -ForegroundColor Yellow
+        & $Nssm restart $ServiceName
+
+        Start-Sleep -Seconds 3
+
+        # Check service
+        Get-Service $ServiceName
+
+        Write-Host ""
+        Write-Host "=== PIIPS BACKEND STATUS ===" -ForegroundColor Green
+        & $Nssm status $ServiceName
+
+        Write-Host ""
+        Write-Host "=== CHECK PORT 8000 ===" -ForegroundColor Green
+        netstat -ano | findstr :8000
+
+        Write-Host ""
+        Write-Host "PIIPS Backend configured successfully." -ForegroundColor Green
+        Write-Host "Application Root : $AppRoot"
+        Write-Host "Python           : $Python"
+        Write-Host "Uvicorn          : 127.0.0.1:8000"
+        Write-Host "IIS Domain       : https://piips.precisionit.co.in:8010"
+                
