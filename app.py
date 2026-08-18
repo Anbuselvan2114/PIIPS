@@ -1318,8 +1318,24 @@ class ChangePasswordModel(BaseModel):
 
 
 def _base_url(request: Request):
-    """The app's own base URL, derived from the incoming request (works
-    unmodified on localhost/UAT/Live - never hard-coded)."""
+    """The app's own public-facing base URL. Prefers the Origin/Referer
+    header sent by the caller's browser - that reflects the actual URL the
+    admin is signed in on (e.g. https://piips.precisionit.co.in:8010) -
+    over request.base_url, which reflects Uvicorn's own view of itself
+    behind the IIS reverse proxy (http://127.0.0.1:8000) and is wrong
+    unless IIS forwards proxy headers that Uvicorn is configured to trust,
+    which it isn't here. Falls back to request.base_url for non-browser
+    callers with neither header. Works unmodified on localhost/UAT/Live -
+    never hard-coded."""
+    origin = request.headers.get("origin")
+    if origin:
+        return origin.rstrip("/")
+    referer = request.headers.get("referer")
+    if referer:
+        from urllib.parse import urlsplit
+        parts = urlsplit(referer)
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}"
     return str(request.base_url).rstrip("/")
 
 
@@ -1479,6 +1495,23 @@ def api_set_user_active(payload: UserActiveModel, request: Request):
 
     try:
         user = database.get_user_by_id(payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    if not payload.is_active:
+        if payload.modified_by == payload.user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can't deactivate your own account.",
+            )
+        if user and user["UserName"] == database.DEFAULT_SUPER_ADMIN_USERNAME:
+            raise HTTPException(
+                status_code=403,
+                detail=f"'{database.DEFAULT_SUPER_ADMIN_USERNAME}' is the account guaranteed to "
+                       "always be available and can't be deactivated.",
+            )
+
+    try:
         database.set_user_active(payload.user_id, payload.is_active, payload.modified_by)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")

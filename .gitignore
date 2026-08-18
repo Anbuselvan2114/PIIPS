@@ -18,9 +18,11 @@ announcement_media/
 *.log
 
 # Sample invoice PDFs and generated manuals — not tracked in git
-# (PIIPS_UAT_Deployment_Guide.pdf is the exception - tracked deliberately)
+# (PIIPS_UAT_Deployment_Guide.pdf is the exception - tracked deliberately,
+# so it stays in sync with the app for whoever clones the repo fresh)
 sample_input/
 manuals/
+!manuals/PIIPS_UAT_Deployment_Guide.pdf
 
 # Deployment bootstrap script — contains a real password hash and full
 # business template data; a local artifact only, not version-controlled.

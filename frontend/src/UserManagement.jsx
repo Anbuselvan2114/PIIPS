@@ -187,9 +187,22 @@ export default function UserManagement({ user }) {
               render: (r) => <span className={`badge ${r._u.IsActive ? "badge-success" : "badge-danger"}`}>{r.active}</span> },
             { key: "created", label: "Created" },
             { key: "_action", label: "Action", sortable: false,
-              render: (r) => (
+              render: (r) => {
+                // Deactivating your own row, or the default Sadmin account,
+                // is blocked server-side too - disabled here so the button
+                // doesn't invite a click that can only fail.
+                const lockedFromDeactivate = r._u.IsActive
+                  && (r._u.UserId === user?.user_id || r._u.UserName === "Sadmin");
+                return (
                 <div style={{ display: "flex", gap: 6 }}>
-                  <button className={`btn btn-sm ${r._u.IsActive ? "btn-danger" : "btn-success"}`} onClick={() => toggle(r._u)}>
+                  <button className={`btn btn-sm ${r._u.IsActive ? "btn-danger" : "btn-success"}`}
+                          onClick={() => toggle(r._u)}
+                          disabled={lockedFromDeactivate}
+                          title={lockedFromDeactivate
+                            ? (r._u.UserName === "Sadmin"
+                                ? "Sadmin is always available and can't be deactivated."
+                                : "You can't deactivate your own account.")
+                            : undefined}>
                     {r._u.IsActive ? "Inactivate" : "Give access"}
                   </button>
                   {canAssignFor(r._u) && (
@@ -198,7 +211,7 @@ export default function UserManagement({ user }) {
                     </button>
                   )}
                 </div>
-              ) },
+              );} },
           ]} />
       </div>
     </div>
