@@ -199,6 +199,11 @@ def _hsn_lookup_items(data, order_no):
 def _apply_hsn_map(data, order_no, hsn_map):
     """Enrich this invoice's line items (item no., HSN, tax) from an
     already-fetched {(po_lower, part_lower): row} map - no API call."""
+    # Only blank a not-yet-confirmed No. when SF integration is actually
+    # active - build_invoice_json's PDF-HSN fallback is the real, intended
+    # value when SF isn't configured at all (nothing to defer to), not a
+    # placeholder standing in for an unconfirmed match.
+    sf_active = bool(_base_url())
     items = data.get("items", []) or []
     for item in items:
         if item.get("_charge"):
@@ -209,7 +214,13 @@ def _apply_hsn_map(data, order_no, hsn_map):
         # recognize this line's description -> flag it as a new template
         # needing manual review/retraining, regardless of any later
         # GetSparePurchaseItem positional fallback in enrich_invoice.
-        item["_hsn_nav_item_no_missing"] = not (info and str(info.get("Nav_Item_No") or "").strip())
+        missing = not (info and str(info.get("Nav_Item_No") or "").strip())
+        item["_hsn_nav_item_no_missing"] = missing
+        if missing and sf_active:
+            # SF couldn't confirm this line at all - don't leave the PDF's
+            # raw HSN/SAC code sitting in No. looking like a real match;
+            # blank it so a saved No. always means SF actually confirmed it.
+            item["ProductNo"] = ""
         if not info:
             continue
         # Only overwrite a field when SF actually has a value for it — an SF
@@ -309,6 +320,16 @@ def _apply_sf_to_invoice(data, order_no, rows, hsn_map):
     GetSparePurchaseItem rows for this invoice's PO and the (possibly
     much larger, batch-wide) GetHSNDetails map, enrich `data` in place
     and return its verdict. No HTTP calls."""
+    # GetHSNDetails/GetHSNDetails-derived fields (item code, GST %,
+    # description) don't depend on GetSparePurchaseItem succeeding - the
+    # two are separate calls (see fetch_sf_batch) and GetSparePurchaseItem
+    # is, in practice, the far less reliable of the two (frequent
+    # timeouts). Apply HSN data unconditionally so a missing/failed
+    # reservation lookup never discards HSN data that was fetched fine -
+    # the invoice can still fail its verdict below for lacking reservation
+    # data, but its Purchase Line fields won't be blanked out for it.
+    _apply_hsn_map(data, order_no, hsn_map)
+
     if rows:
         apply_sf_item_defaults(rows)
         data["sf_items"] = rows
@@ -317,8 +338,6 @@ def _apply_sf_to_invoice(data, order_no, rows, hsn_map):
         first = rows[0]
         for dest, src in _HEADER_FROM_SF.items():
             data[dest] = first.get(src, "")
-
-        _apply_hsn_map(data, order_no, hsn_map)
 
         # Link each reservation row to its Purchase Line item so
         # Reservation Entry.Source Ref. No. = Purchase Line.Line No. for
@@ -337,15 +356,20 @@ def _apply_sf_to_invoice(data, order_no, rows, hsn_map):
                 sf["Line_No"] = it.get("Line_No", "")
                 matched.add(id(it))
 
-        # Fallback: the HSN lookup can fail to resolve any Nav_Item_No at
-        # all (external API unavailable/no match), leaving both sides of
-        # that join key blank. Fall back to positional matching (same
-        # sequence on the PO) and backfill Nav_Item_No onto the Purchase
-        # Line item too, so No. and Item No. still agree. Reservation
-        # Entry rows are per-unit (see _link_override's Quantity note), so
-        # a line item with Quantity > 1 legitimately has multiple
-        # reservation rows for the same item — expand each unmatched item
-        # by its own quantity before pairing positionally.
+        # Any SF reservation row not yet matched by Nav_Item_No still needs
+        # a Line_No so Reservation Entry.Source Ref. No. can point at
+        # *some* Purchase Line row - pair the remainder positionally
+        # (same sequence on the PO) purely for that cross-reference.
+        # Reservation Entry rows are per-unit (see _link_override's
+        # Quantity note), so a line item with Quantity > 1 legitimately
+        # has multiple reservation rows for the same item — expand each
+        # unmatched item by its own quantity before pairing.
+        #
+        # Deliberately does NOT backfill Nav_Item_No/ProductNo from this
+        # pairing (unlike the confirmed Nav_Item_No match above) - a
+        # same-position SF row is not a confirmed identity match, only a
+        # sequence coincidence, and No. must only ever hold a value SF
+        # actually confirmed by description (see _apply_hsn_map).
         unmatched_sf = [sf for sf in rows if not sf.get("Line_No")]
         expanded_items = []
         for it in items:
@@ -358,10 +382,6 @@ def _apply_sf_to_invoice(data, order_no, rows, hsn_map):
             expanded_items.extend([it] * qty)
         if unmatched_sf and len(unmatched_sf) == len(expanded_items):
             for sf, it in zip(unmatched_sf, expanded_items):
-                nav_no = sf.get("Nav_Item_No", "")
-                if nav_no and not it.get("Nav_Item_No"):
-                    it["Nav_Item_No"] = nav_no
-                    it["ProductNo"] = it.get("ProductNo") or nav_no
                 sf["Line_No"] = it.get("Line_No", "")
     else:
         data.setdefault("sf_items", [])
