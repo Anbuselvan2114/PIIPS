@@ -231,16 +231,6 @@ export default function Dashboard({ user }) {
       ) },
   ];
 
-  // "developer" is a legacy alias for "super admin" (pre-rename sessions),
-  // matching how App.jsx's ROLE_MENUS treats the two roles as equivalent.
-  const isSuperAdmin = ["super admin", "developer"].includes(
-    (user?.user_type || "").toLowerCase()
-  );
-
-  // The Fields drill-down button is for anyone who administers data
-  // (Super Admin + Admin).
-  const canViewFields = isSuperAdmin || (user?.user_type || "").toLowerCase() === "admin";
-
   const invoiceColumns = [
     { key: "invoice_no", label: "Invoice No.", render: invoiceCell },
     { key: "file_name", label: "File" },
@@ -248,12 +238,12 @@ export default function Dashboard({ user }) {
     { key: "invoice_type", label: "Invoice Type" },
     { key: "status", label: "Status" },
     { key: "batch", label: "Batch" },
-    ...(canViewFields ? [{ key: "_fields", label: "", sortable: false,
+    { key: "_fields", label: "", sortable: false,
       render: (row) => row.header_id ? (
         <button className="btn btn-subtle btn-sm" onClick={() => openFieldCheck(row)}>
           Fields
         </button>
-      ) : null }] : []),
+      ) : null },
   ];
   // Include/Exclude only makes sense once an invoice is actually staged
   // for export (READY TO LOAD), or to undo a previous exclude (EXCLUDED) —
