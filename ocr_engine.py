@@ -2245,9 +2245,10 @@ class OCREngine:
 
 
         def is_hsn(value):
-
+            # GST HSN codes are validly 4, 6 or 8 digits depending on the
+            # supplier's turnover slab — not always the full 6-8 digit form.
             return re.match(
-                r"^\d{6,10}$",
+                r"^\d{4,10}$",
                 value.strip()
             ) is not None
 
@@ -2560,6 +2561,22 @@ class OCREngine:
                             value_cols,
                             key=lambda c: abs(word["x"] - value_cols[c])
                         )
+
+
+                        # A 4+ digit token whose nearest column is Quantity
+                        # is almost never a genuine quantity (real order
+                        # quantities run 1-3 digits) - it's an HSN/SAC code
+                        # that landed a few pixels closer to the Quantity
+                        # header than its own, likely because the data row's
+                        # column boundary drifted slightly from the header
+                        # row's. Reroute it before the distance tie-break
+                        # locks it into the wrong column.
+                        if (
+                            col == "Quantity"
+                            and "HSN" in value_cols
+                            and re.match(r"^\d{4,10}[A-Za-z]?$", txt)
+                        ):
+                            col = "HSN"
 
 
                         # HSN / SAC code (4, 6 or 8 digits, optional letter)
@@ -2903,7 +2920,7 @@ class OCREngine:
             elif "qty" in txt or "quantity" in txt:
                 columns["Quantity"] = x
 
-            elif txt == "rate" or "price" in txt:
+            elif "rate" in txt or "price" in txt:
                 columns["Rate"] = x
 
             elif txt == "per":

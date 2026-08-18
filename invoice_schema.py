@@ -83,7 +83,7 @@ def _normalize_date(value):
 
     # dd-Mon-yy  or  dd-Mon-yyyy
     match = re.match(
-        r"(\d{1,2})[-/ ]+([A-Za-z]{3,})[-/ ]+(\d{2,4})",
+        r"(\d{1,2})[-/. ]+([A-Za-z]{3,})[-/. ]+(\d{2,4})",
         value
     )
 
@@ -94,9 +94,9 @@ def _normalize_date(value):
             year = "20" + year
         return f"{int(day):02d}-{mon}-{year}"
 
-    # dd-mm-yyyy / dd/mm/yy
+    # dd-mm-yyyy / dd/mm/yy / dd.mm.yyyy
     match = re.match(
-        r"(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})",
+        r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})",
         value
     )
 
