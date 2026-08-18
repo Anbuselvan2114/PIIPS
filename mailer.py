@@ -54,7 +54,12 @@ def send_mail(to_addr, subject, html_body):
 _FONT = "font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
 
 
-def _shell(accent, heading, body_html, footer_note=""):
+def _shell(accent, heading, body_html, footer_note="", base_url=""):
+    logo_cell = (
+        f'<img src="{base_url}/icon-192.png" width="36" height="36" '
+        f'style="display:block;border-radius:9px;" alt="PIIPS">'
+        if base_url else "🧾"
+    )
     return f"""\
 <!doctype html>
 <html>
@@ -66,11 +71,11 @@ def _shell(accent, heading, body_html, footer_note=""):
                  style="max-width:480px;width:100%;background:#ffffff;border-radius:14px;
                         overflow:hidden;box-shadow:0 2px 10px rgba(15,23,42,0.08);">
             <tr>
-              <td style="background:linear-gradient(135deg,#22d3ee,#0e7490);padding:28px 32px;">
+              <td style="background:linear-gradient(135deg,#4c1d95,#c026d3);padding:28px 32px;">
                 <table role="presentation" cellpadding="0" cellspacing="0">
                   <tr>
                     <td style="width:36px;height:36px;background:#ffffff;border-radius:9px;
-                               text-align:center;vertical-align:middle;font-size:18px;">🧾</td>
+                               text-align:center;vertical-align:middle;font-size:18px;">{logo_cell}</td>
                     <td style="padding-left:12px;color:#ffffff;font-size:20px;font-weight:700;{_FONT}">
                       PIIPS
                     </td>
@@ -111,10 +116,10 @@ def _password_chip(password):
     return f"""\
 <table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px 0;width:100%;">
   <tr>
-    <td style="background:#f0fdfa;border:1px dashed #0e7490;border-radius:10px;
+    <td style="background:#faf5ff;border:1px dashed #7c3aed;border-radius:10px;
                padding:14px 18px;text-align:center;">
       <span style="font-family:Consolas,Menlo,monospace;font-size:18px;
-                    letter-spacing:1px;color:#0e7490;font-weight:700;">{password}</span>
+                    letter-spacing:1px;color:#6d28d9;font-weight:700;">{password}</span>
     </td>
   </tr>
 </table>
@@ -134,7 +139,7 @@ def _button(label, url):
     return f"""\
 <table role="presentation" cellpadding="0" cellspacing="0" style="margin:22px 0 4px;">
   <tr>
-    <td style="background:#0e7490;border-radius:8px;">
+    <td style="background:#7c3aed;border-radius:8px;">
       <a href="{href}" style="display:inline-block;padding:11px 24px;color:#ffffff;
                               font-size:14px;font-weight:600;text-decoration:none;{_FONT}">
         {label}
@@ -161,7 +166,7 @@ below - you'll be asked to set your own password the first time you log in.
 {_password_chip(password)}
 {_button("Sign in to PIIPS", login_url)}
 """
-    return _shell("#0e7490", "Your PIIPS account is ready", body)
+    return _shell("#7c3aed", "Your PIIPS account is ready", body, base_url=login_url)
 
 
 def password_reset_email_html(username, password, login_url=""):
@@ -175,7 +180,7 @@ own password the first time you log in.
   If you did not request this, contact your administrator immediately.
 </p>
 """
-    return _shell("#0e7490", "Your PIIPS password was reset", body)
+    return _shell("#7c3aed", "Your PIIPS password was reset", body, base_url=login_url)
 
 
 def deactivation_email_html(username, login_url=""):
@@ -186,7 +191,7 @@ by an administrator. You will not be able to sign in until it is reactivated.
   If you believe this is a mistake, contact your administrator.
 </p>
 """
-    return _shell("#dc2626", "Account deactivated", body)
+    return _shell("#dc2626", "Account deactivated", body, base_url=login_url)
 
 
 def activation_email_html(username, login_url=""):
@@ -195,4 +200,4 @@ Your PIIPS account (<b>{username}</b>) has been <b style="color:#16a34a;">reacti
 You can sign in again.
 {_button("Sign in to PIIPS", login_url)}
 """
-    return _shell("#16a34a", "Account reactivated", body)
+    return _shell("#16a34a", "Account reactivated", body, base_url=login_url)
