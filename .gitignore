@@ -14,12 +14,17 @@ format_model.json
 model_backups/
 New_Format/
 output/
+announcement_media/
 *.log
 
 # Sample invoice PDFs and generated manuals — not tracked in git
 # (PIIPS_UAT_Deployment_Guide.pdf is the exception - tracked deliberately)
 sample_input/
 manuals/
+
+# Deployment bootstrap script — contains a real password hash and full
+# business template data; a local artifact only, not version-controlled.
+PIIPS.sql
 PIIPS_Developer_Manual.pdf
 PIIPS_User_Manual_Accounts.pdf
 PIIPS_User_Manual_Admin.pdf

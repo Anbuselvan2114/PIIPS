@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { getInputFiles, openInputFolder, uploadInputFiles, getTemplates } from "./api";
+import { getInputFiles, uploadInputFiles, getTemplates } from "./api";
 import { DataTable } from "./components";
 
 export default function InputFiles({ user }) {
@@ -35,13 +35,6 @@ export default function InputFiles({ user }) {
   const requireTpl = () => {
     if (!tpl) { setError("Select a template first."); setNotice(null); return false; }
     return true;
-  };
-
-  const onOpen = async () => {
-    if (!requireTpl()) return;
-    setError(null); setNotice(null);
-    try { await openInputFolder(subpath); setNotice("Opened the template folder on the server."); }
-    catch (e) { setError(e.message); }
   };
 
   const upload = async (fileList) => {
@@ -87,8 +80,7 @@ export default function InputFiles({ user }) {
         </div>
 
         <div className="row" style={{ alignItems: "center" }}>
-          <button className="btn btn-primary" onClick={onOpen} disabled={!tpl}>Open Folder</button>
-          <button className="btn btn-ghost" onClick={() => { if (requireTpl()) fileRef.current?.click(); }} disabled={busy || !tpl}>
+          <button className="btn btn-primary" onClick={() => { if (requireTpl()) fileRef.current?.click(); }} disabled={busy || !tpl}>
             {busy ? "Copying…" : "Upload PDFs"}
           </button>
           <input ref={fileRef} type="file" multiple

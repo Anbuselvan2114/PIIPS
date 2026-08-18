@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getFields, saveFields } from "./api";
+import { confirmDialog } from "./components";
 
 export default function CreateField({ user }) {
   const [columns, setColumns] = useState({});
@@ -35,16 +36,22 @@ export default function CreateField({ user }) {
     if (cols.includes(name)) { setMessage({ ok: false, text: `"${name}" already exists on this sheet.` }); return; }
     setCols([...cols, name]); setNewField(""); setMessage(null);
   };
-  const removeField = (name) => {
+  const removeField = async (name) => {
     if (!isDeletable(name)) return;
-    if (window.confirm(`Delete column "${name}" from ${active}?`)) setCols(cols.filter((c) => c !== name));
+    if (await confirmDialog(`Delete column "${name}" from ${active}?`, { confirmLabel: "Delete", danger: true })) {
+      setCols(cols.filter((c) => c !== name));
+    }
   };
   const onDrop = (to) => {
     const from = dragFrom.current; dragFrom.current = null;
     if (from === null || from === to) return;
     const next = [...cols]; const [m] = next.splice(from, 1); next.splice(to, 0, m); setCols(next);
   };
-  const resetSheet = () => { if (window.confirm(`Reset ${active} columns back to the template?`)) setCols([...(template[active] || [])]); };
+  const resetSheet = async () => {
+    if (await confirmDialog(`Reset ${active} columns back to the template?`, { confirmLabel: "Reset" })) {
+      setCols([...(template[active] || [])]);
+    }
+  };
   const onSave = async () => {
     setMessage(null);
     try { await saveFields(columns, user?.user_id); setMessage({ ok: true, text: "Fields saved." }); }

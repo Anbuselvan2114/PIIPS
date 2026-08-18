@@ -116,6 +116,7 @@ export default function Dashboard({ user }) {
     getBatches().then((r) => setBatches(r.batches || [])).catch(() => {});
   const loadStatusCounts = () =>
     getStatusCounts().then((r) => setStatusCounts(r.counts || [])).catch(() => {});
+  const statusTotal = statusCounts.reduce((s, d) => s + (d.count || 0), 0);
 
   useEffect(() => {
     (async () => {
@@ -231,37 +232,19 @@ export default function Dashboard({ user }) {
       ) },
   ];
 
-  // "developer" is a legacy alias for "super admin" (pre-rename sessions),
-  // matching how App.jsx's ROLE_MENUS treats the two roles as equivalent.
-  const isSuperAdmin = ["super admin", "developer"].includes(
-    (user?.user_type || "").toLowerCase()
-  );
-
-  // The Fields drill-down button is for anyone who administers data
-  // (Super Admin + Admin), unlike the INCOMPLETE DATA/NEW TEMPLATE label
-  // swap below, which is specifically about hiding technical status names
-  // from non-admin roles.
-  const canViewFields = isSuperAdmin || (user?.user_type || "").toLowerCase() === "admin";
-
-  // Non-super-admins see "INCOMPLETE DATA" relabeled as "NEW TEMPLATE"
-  // everywhere it's displayed (chart, breakdown, invoice lists) — the
-  // underlying status name/logic is unchanged, this is display-only.
-  const displayStatus = (s) => (!isSuperAdmin && s === "INCOMPLETE DATA") ? "NEW TEMPLATE" : s;
-  const displayStatusCounts = statusCounts.map((c) => ({ ...c, status: displayStatus(c.status) }));
-
   const invoiceColumns = [
     { key: "invoice_no", label: "Invoice No.", render: invoiceCell },
     { key: "file_name", label: "File" },
     { key: "vendor", label: "Vendor" },
     { key: "invoice_type", label: "Invoice Type" },
-    { key: "status", label: "Status", render: (row) => displayStatus(row.status) },
+    { key: "status", label: "Status" },
     { key: "batch", label: "Batch" },
-    ...(canViewFields ? [{ key: "_fields", label: "", sortable: false,
+    { key: "_fields", label: "", sortable: false,
       render: (row) => row.header_id ? (
         <button className="btn btn-subtle btn-sm" onClick={() => openFieldCheck(row)}>
           Fields
         </button>
-      ) : null }] : []),
+      ) : null },
   ];
   // Include/Exclude only makes sense once an invoice is actually staged
   // for export (READY TO LOAD), or to undo a previous exclude (EXCLUDED) —
@@ -307,7 +290,8 @@ export default function Dashboard({ user }) {
     { status: "BUYER ORDER NO DOESN'T EXIST", label: "Buyer Order No Doesn't Exist" },
     { status: "EXCLUDED", label: "Excluded" },
     { status: "PENDING IN SF", label: "Pending in SF" },
-    { status: "INCOMPLETE DATA", label: isSuperAdmin ? "Incomplete Data" : "New Template" },
+    { status: "DATA MISMATCH", label: "Data Mismatch" },
+    { status: "NEW TEMPLATE", label: "New Template" },
     { status: "READY TO LOAD", label: "Ready to Load" },
     { status: "LOADED", label: "Loaded" },
     { status: "POSTED", label: "Posted" },
@@ -424,14 +408,23 @@ export default function Dashboard({ user }) {
         <div style={{ flex: "0 0 300px", maxWidth: 340, display: "flex", flexDirection: "column", gap: 16 }}>
           <div className="card">
             <div className="card-title-row">
-              <h3>Invoices by status</h3><div style={{ flex: 1 }} />
+              <h3>Invoices by status</h3>
+              <span className="badge badge-success" style={{ marginLeft: 8 }}>
+                {statusTotal} total
+              </span>
+              <div style={{ flex: 1 }} />
               <button className="btn btn-subtle btn-sm" onClick={loadStatusCounts}>Refresh</button>
             </div>
-            <StatusPie data={displayStatusCounts} onSlice={openStatusModal} />
+            <StatusPie data={statusCounts} onSlice={openStatusModal} />
           </div>
           <div className="card">
-            <h3>Status breakdown</h3>
-            <StatusBars data={displayStatusCounts} onSlice={openStatusModal} />
+            <div className="card-title-row">
+              <h3>Status breakdown</h3>
+              <span className="badge badge-success" style={{ marginLeft: 8 }}>
+                {statusTotal} total
+              </span>
+            </div>
+            <StatusBars data={statusCounts} onSlice={openStatusModal} />
           </div>
         </div>
       </div>

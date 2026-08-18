@@ -1,12 +1,13 @@
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
 import shutil
+import uuid
 from datetime import datetime
 
 import config_store
@@ -49,6 +50,8 @@ def _bootstrap_menu_storage():
         if (config_store.load_config().get("db_connection") or "").strip():
             database.migrate_menu_json(BASE_DIR)
             database.migrate_template_invoice_type()
+            database.init_mail_settings_table()
+            database.ensure_default_super_admin()
     except Exception:  # noqa: BLE001 - never block startup on DB issues
         traceback.print_exc()
 
@@ -569,7 +572,7 @@ def invoices_by_status(status_id: int):
 @app.get("/api/invoices/{header_id}/fields")
 def invoice_field_check(header_id: int):
     """Field-by-field mandatory-data breakdown for one invoice (Dashboard
-    'INCOMPLETE DATA' drill-down): every required column, its current
+    'DATA MISMATCH' drill-down): every required column, its current
     value, and whether it's missing."""
     import database
     try:
@@ -709,7 +712,9 @@ class LifecycleModel(BaseModel):
 def lifecycle_advance(payload: LifecycleModel):
     """Advance the selected invoices to a lifecycle stage's target status
     (Load→LOADED, Post→POSTED, Complete→COMPLETED) and move each PDF into its
-    new status folder."""
+    new status folder. Posted/Completed invoices are also archived into
+    <Folder Path>/ALL_INVOICES as "<Invoice No.>_<Vendor Name>.pdf" (a copy,
+    the original stays in its status folder)."""
     stage = (payload.stage or "").lower()
     if stage not in _LIFECYCLE:
         raise HTTPException(status_code=400, detail="Unknown stage")
@@ -720,12 +725,32 @@ def lifecycle_advance(payload: LifecycleModel):
             payload.header_ids, spec["from"], spec["to"], payload.user_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    for fname in res.get("files", []):
+
+    files = res.get("files", [])
+    for fname in files:
         try:
             config_store.move_pdf_to_status(fname, spec["to"])
         except Exception:  # noqa: BLE001 - file move is best-effort
             import traceback
             traceback.print_exc()
+
+    if spec["to"] in ("POSTED", "COMPLETED") and files:
+        try:
+            meta = {m["file_name"]: m for m in database.invoices_by_header_ids(res.get("header_ids", []))}
+            for fname in files:
+                m = meta.get(fname)
+                if not m:
+                    continue
+                inv_no = config_store._safe_folder(m.get("invoice_no") or "NoInvoiceNo")
+                vendor = config_store._safe_folder(m.get("vendor") or "UnknownVendor")
+                ext = os.path.splitext(fname)[1] or ".pdf"
+                dest_name = f"{inv_no}_{vendor}{ext}"
+                new_src = os.path.join(config_store.status_folder(spec["to"]), fname)
+                config_store.copy_pdf_to_all_invoices(new_src, dest_name)
+        except Exception:  # noqa: BLE001 - archive copy is best-effort
+            import traceback
+            traceback.print_exc()
+
     return {"ok": True, "count": res.get("count", 0), "to": spec["to"]}
 
 
@@ -936,24 +961,6 @@ def input_files(subpath: str = ""):
             items.append({"name": name, "size": os.path.getsize(path)})
 
     return {"folder": folder, "files": items}
-
-
-@app.post("/api/input/open")
-def open_input_folder(subpath: str = ""):
-    """Open the (template) folder in the server's file explorer."""
-
-    folder = _input_subdir(subpath)
-    os.makedirs(folder, exist_ok=True)
-
-    try:
-        os.startfile(folder)  # noqa: S606 - Windows Explorer
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not open the folder on the server: {exc}",
-        )
-
-    return {"folder": folder, "opened": True}
 
 
 @app.post("/api/input/upload")
@@ -1300,9 +1307,20 @@ class LoginModel(BaseModel):
     password: str
 
 
-class ResetModel(BaseModel):
-    username: str
+class ForgotPasswordModel(BaseModel):
+    username_or_email: str
+
+
+class ChangePasswordModel(BaseModel):
+    user_id: int
+    current_password: str
     new_password: str
+
+
+def _base_url(request: Request):
+    """The app's own base URL, derived from the incoming request (works
+    unmodified on localhost/UAT/Live - never hard-coded)."""
+    return str(request.base_url).rstrip("/")
 
 
 @app.post("/api/login")
@@ -1320,18 +1338,62 @@ def api_login(payload: LoginModel):
     return user
 
 
-@app.post("/api/reset-password")
-def api_reset_password(payload: ResetModel):
+@app.post("/api/forgot-password")
+def api_forgot_password(payload: ForgotPasswordModel, request: Request):
+    """Self-service password reset: email a new auto-generated password to
+    the account's registered address. Always returns the same generic
+    response regardless of whether the account exists, so this endpoint
+    can't be used to enumerate valid usernames/emails."""
     import database
-    name = (payload.username or "").strip()
-    if not name or not payload.new_password:
-        raise HTTPException(status_code=400, detail="Username and new password are required.")
+    import mailer
+
+    name_or_email = (payload.username_or_email or "").strip()
+    generic = {"ok": True, "message": "If that account exists, a new password has been emailed to it."}
+    if not name_or_email:
+        return generic
+
     try:
-        n = database.reset_password(name, payload.new_password)
+        user = database.get_user_by_email(name_or_email) if "@" in name_or_email \
+            else database.get_user(name_or_email)
+    except Exception:  # noqa: BLE001
+        return generic
+
+    if not user or not user["IsActive"] or not user.get("Email"):
+        return generic
+
+    temp_password = database.generate_temp_password()
+    try:
+        database.reset_password(user["UserName"], temp_password, force_change=True)
+    except Exception:  # noqa: BLE001
+        return generic
+
+    try:
+        mailer.send_mail(
+            user["Email"], "Your PIIPS password was reset",
+            mailer.password_reset_email_html(user["UserName"], temp_password, _base_url(request)),
+        )
+    except mailer.MailError:
+        pass  # generic response either way - the password was still reset
+
+    return generic
+
+
+@app.post("/api/change-password")
+def api_change_password(payload: ChangePasswordModel):
+    """Change a user's own password (requires the current one) - used both
+    for the forced first-login change and a normal self-service change."""
+    import database
+    user = database.get_user_by_id(payload.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if not database.verify_password(payload.current_password or "", user["Password"] or ""):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+    try:
+        database.reset_password(user["UserName"], payload.new_password, force_change=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    if not n:
-        raise HTTPException(status_code=404, detail=f"User '{name}' not found.")
     return {"ok": True}
 
 
@@ -1341,13 +1403,25 @@ def api_reset_password(payload: ResetModel):
 
 class UserCreateModel(BaseModel):
     username: str
-    password: str
+    email: str
     user_type_id: int
+    created_by: Optional[int] = None
 
 
 class UserActiveModel(BaseModel):
     user_id: int
     is_active: bool
+    modified_by: Optional[int] = None
+
+
+class UserResetPasswordModel(BaseModel):
+    user_id: int          # the acting admin/super admin
+    target_user_id: int   # whose password is being reset
+    new_password: Optional[str] = None   # None = auto-generate
+
+
+def _email_result(email_sent, email_error):
+    return {"email_sent": email_sent, "email_error": email_error}
 
 
 @app.get("/api/users")
@@ -1363,28 +1437,285 @@ def api_list_users():
 
 
 @app.post("/api/users")
-def api_create_user(payload: UserCreateModel):
+def api_create_user(payload: UserCreateModel, request: Request):
+    """Create a user. The admin never chooses a password - one is always
+    auto-generated and emailed to the address given here."""
     import database
+    import mailer
+
     name = (payload.username or "").strip()
-    if not name or not payload.password:
-        raise HTTPException(status_code=400, detail="Username and password are required.")
+    email = (payload.email or "").strip()
+    if not name or not email:
+        raise HTTPException(status_code=400, detail="Username and email are required.")
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
     try:
-        database.create_user(name, payload.password, payload.user_type_id)
+        temp_password = database.create_user(name, payload.user_type_id, email, payload.created_by)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    return {"ok": True}
+
+    created = database.get_user(name)
+    user_type_name = (created or {}).get("UserTypeName", "")
+
+    email_sent, email_error = True, None
+    try:
+        mailer.send_mail(
+            email, "Your PIIPS account is ready",
+            mailer.welcome_email_html(name, temp_password, _base_url(request), user_type_name),
+        )
+    except mailer.MailError as exc:
+        email_sent, email_error = False, str(exc)
+
+    return {"ok": True, **_email_result(email_sent, email_error)}
 
 
 @app.post("/api/users/active")
-def api_set_user_active(payload: UserActiveModel):
+def api_set_user_active(payload: UserActiveModel, request: Request):
     import database
+    import mailer
+
     try:
-        database.set_user_active(payload.user_id, payload.is_active)
+        user = database.get_user_by_id(payload.user_id)
+        database.set_user_active(payload.user_id, payload.is_active, payload.modified_by)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    email_sent, email_error = False, None
+    if user and user.get("Email"):
+        html = (
+            mailer.activation_email_html(user["UserName"], _base_url(request))
+            if payload.is_active
+            else mailer.deactivation_email_html(user["UserName"], _base_url(request))
+        )
+        try:
+            mailer.send_mail(user["Email"], "Your PIIPS account status changed", html)
+            email_sent = True
+        except mailer.MailError as exc:
+            email_error = str(exc)
+
+    return {"ok": True, **_email_result(email_sent, email_error)}
+
+
+@app.post("/api/users/reset-password")
+def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
+    """Admin-triggered password reset/assignment for another user (distinct
+    from the self-service /api/forgot-password). A Super Admin may target
+    anyone, including themselves. An Admin may target only plain User/
+    Accounts accounts - never themselves, another Admin, or a Super Admin.
+    `new_password` lets the caller assign a specific password directly
+    (e.g. the User Management "Change Password" form); omitted, one is
+    auto-generated (the per-row "Reset password" action). Either way the
+    target must change it on next login, and it's emailed to them."""
+    import database
+    import mailer
+
+    caller_role = database.get_user_role(payload.user_id)
+    if not caller_role or not caller_role["active"] or caller_role["role"].lower() not in ("admin", "super admin"):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    is_super_admin = caller_role["role"].lower() == "super admin"
+
+    target = database.get_user_by_id(payload.target_user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    if not is_super_admin:
+        target_role = database.get_user_role(payload.target_user_id)
+        target_role_name = (target_role["role"] or "").lower() if target_role else ""
+        if (payload.target_user_id == payload.user_id
+                or target_role_name in ("admin", "super admin")):
+            raise HTTPException(
+                status_code=403,
+                detail="Admins can only change the password of a regular User/Accounts account "
+                       "- not their own, another Admin's, or a Super Admin's.",
+            )
+
+    if payload.new_password:
+        try:
+            database.validate_password_policy(payload.new_password)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        new_password = payload.new_password
+    else:
+        new_password = database.generate_temp_password()
+
+    try:
+        database.reset_password(target["UserName"], new_password, force_change=True, modified_by=payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    email_sent, email_error = False, None
+    if target.get("Email"):
+        try:
+            mailer.send_mail(
+                target["Email"], "Your PIIPS password was reset",
+                mailer.password_reset_email_html(target["UserName"], new_password, _base_url(request)),
+            )
+            email_sent = True
+        except mailer.MailError as exc:
+            email_error = str(exc)
+
+    return {"ok": True, **_email_result(email_sent, email_error)}
+
+
+class MailSettingsModel(BaseModel):
+    user_id: Optional[int] = None
+    username: str
+    email: str
+    password: Optional[str] = None   # blank/None = keep existing
+    smtp_host: str
+    smtp_port: int
+
+
+@app.get("/api/mail-settings")
+def get_mail_settings_api(user_id: Optional[int] = None):
+    import database
+    _require_developer(user_id)
+    s = database.get_mail_settings()
+    if not s:
+        return {"username": "", "email": "", "smtp_host": "", "smtp_port": 587, "password_set": False}
+    return {
+        "username": s["UserName"], "email": s["EmailID"],
+        "smtp_host": s["SMTPHost"], "smtp_port": s["SMTPPort"],
+        "password_set": bool(s["Password"]),
+    }
+
+
+@app.post("/api/mail-settings")
+def save_mail_settings_api(payload: MailSettingsModel):
+    import database
+    import smtplib
+
+    _require_developer(payload.user_id)
+
+    username = (payload.username or "").strip()
+    email = (payload.email or "").strip()
+    host = (payload.smtp_host or "").strip()
+    if not username or not email or not host or not payload.smtp_port:
+        raise HTTPException(status_code=400, detail="Username, email, SMTP host and port are required.")
+
+    password = payload.password
+    current = database.get_mail_settings()
+    test_password = password if password else (current["Password"] if current else "")
+    if not test_password:
+        raise HTTPException(status_code=400, detail="Password is required.")
+
+    try:
+        with smtplib.SMTP(host, int(payload.smtp_port), timeout=15) as smtp:
+            smtp.starttls()
+            smtp.login(email, test_password)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Could not connect: {exc}")
+
+    database.save_mail_settings(username, email, password, host, payload.smtp_port)
     return {"ok": True}
+
+
+# ==========================================================================
+# Announcements (Super Admin only) - site-wide notices for every user
+# ==========================================================================
+
+ANNOUNCEMENT_MEDIA_DIR = os.path.join(BASE_DIR, "announcement_media")
+os.makedirs(ANNOUNCEMENT_MEDIA_DIR, exist_ok=True)
+_ANNOUNCEMENT_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+
+@app.get("/api/announcements/active")
+def api_active_announcements():
+    """Announcements every logged-in user should currently see - no role
+    gate, any authenticated session can call this."""
+    import database
+    try:
+        return {"announcements": database.get_active_announcements()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/announcements")
+def api_list_announcements(user_id: Optional[int] = None):
+    """All announcements, including expired/stopped (Super Admin management view)."""
+    import database
+    _require_developer(user_id)
+    try:
+        return {"announcements": database.list_announcements()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.post("/api/announcements")
+def api_create_announcement(
+    title: str = Form(...),
+    body_text: str = Form(""),
+    video_url: str = Form(""),
+    end_datetime: str = Form(...),   # "YYYY-MM-DDTHH:MM" from <input type="datetime-local">
+    user_id: Optional[int] = Form(None),
+    image: Optional[UploadFile] = File(None),
+):
+    """Create a site-wide announcement (Super Admin only). Content is
+    flexible - plain text, an optional uploaded image (a screenshot, a
+    QR code, whatever), and/or an optional video URL, all shown together
+    in the notification banner every user sees until end_datetime passes
+    or a Super Admin stops it early."""
+    import database
+
+    _require_developer(user_id)
+
+    title = title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required.")
+    if not end_datetime:
+        raise HTTPException(status_code=400, detail="End date/time is required.")
+    end_dt = end_datetime.replace("T", " ")
+    if len(end_dt) == 16:   # "YYYY-MM-DD HH:MM" -> add seconds
+        end_dt += ":00"
+
+    image_path = None
+    if image is not None and image.filename:
+        ext = os.path.splitext(image.filename)[1].lower()
+        if ext not in _ANNOUNCEMENT_IMAGE_EXTS:
+            raise HTTPException(status_code=400, detail=f"Unsupported image type: {ext or '(none)'}")
+        stored_name = f"{uuid.uuid4().hex}{ext}"
+        dest = os.path.join(ANNOUNCEMENT_MEDIA_DIR, stored_name)
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(image.file, f)
+        image_path = stored_name
+
+    try:
+        new_id = database.create_announcement(
+            title, body_text.strip() or None, image_path, video_url.strip() or None, end_dt, user_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    return {"ok": True, "id": new_id}
+
+
+class AnnouncementStopModel(BaseModel):
+    user_id: Optional[int] = None
+
+
+@app.post("/api/announcements/{announcement_id}/stop")
+def api_stop_announcement(announcement_id: int, payload: AnnouncementStopModel):
+    """Stop/remove an announcement immediately (Super Admin only)."""
+    import database
+    _require_developer(payload.user_id)
+    try:
+        n = database.stop_announcement(announcement_id, payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not n:
+        raise HTTPException(status_code=404, detail="Announcement not found.")
+    return {"ok": True}
+
+
+if os.path.isdir(ANNOUNCEMENT_MEDIA_DIR):
+    app.mount(
+        "/announcement_media",
+        StaticFiles(directory=ANNOUNCEMENT_MEDIA_DIR),
+        name="announcement_media",
+    )
 
 
 # ==========================================================================

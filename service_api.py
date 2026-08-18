@@ -26,6 +26,7 @@ import re
 from datetime import datetime
 
 import requests
+from rapidfuzz import fuzz
 
 import config_store
 
@@ -45,6 +46,28 @@ def _base_url():
 
 def _clean(value):
     return str(value or "").strip().lower()
+
+
+# Vendor invoice wording and Navision's own catalog description are never
+# byte-identical ("1. HP LJ P1505 PICKUP ROLLER 18%" vs. Nav's "PICKUP
+# ROLLER - HP1505") - word order and vendor-added noise (numbering, GST %,
+# unit) differ even for the same part. token_set_ratio scores on the words
+# each shares regardless of order/duplication, so it tolerates that noise
+# while still catching a genuinely different part description.
+_DESC_MISMATCH_THRESHOLD = 45
+
+
+def _description_mismatch(nav_desc, pdf_desc):
+    """True if `nav_desc` (Nav_Part_Description) doesn't look like it
+    describes the same part as `pdf_desc` (the PDF's own item line). A
+    blank nav_desc always counts as a mismatch - nothing to compare."""
+    nav_desc = str(nav_desc or "").strip()
+    pdf_desc = str(pdf_desc or "").strip()
+    if not nav_desc:
+        return True
+    if not pdf_desc:
+        return False  # nothing on our side to compare against - don't flag
+    return fuzz.token_set_ratio(nav_desc.upper(), pdf_desc.upper()) < _DESC_MISMATCH_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -158,19 +181,30 @@ _HEADER_FROM_SF = {
 }
 
 
-def _enrich_items(data, order_no):
-    """Enrich line items from the HSN API (item no., HSN, tax)."""
-    items = data.get("items", []) or []
-    hsn_items = []
-    for item in items:
+def _hsn_lookup_items(data, order_no):
+    """{'PartSpecification', 'PurchaseOrderNo'} rows this invoice needs
+    looked up in GetHSNDetails - no API call, just what to ask for. Split
+    out from _apply_hsn_map so a whole batch's items can be combined into
+    one GetHSNDetails call instead of one per invoice."""
+    items = []
+    for item in data.get("items", []) or []:
         if item.get("_charge"):
             continue  # freight / courier lines aren't Navision parts
         desc = str(item.get("Description", "")).strip()
         if desc:
-            hsn_items.append({"PartSpecification": desc, "PurchaseOrderNo": order_no})
-    if not hsn_items:
-        return
-    hsn_map = get_hsn_details(hsn_items)
+            items.append({"PartSpecification": desc, "PurchaseOrderNo": order_no})
+    return items
+
+
+def _apply_hsn_map(data, order_no, hsn_map):
+    """Enrich this invoice's line items (item no., HSN, tax) from an
+    already-fetched {(po_lower, part_lower): row} map - no API call."""
+    # Only blank a not-yet-confirmed No. when SF integration is actually
+    # active - build_invoice_json's PDF-HSN fallback is the real, intended
+    # value when SF isn't configured at all (nothing to defer to), not a
+    # placeholder standing in for an unconfirmed match.
+    sf_active = bool(_base_url())
+    items = data.get("items", []) or []
     for item in items:
         if item.get("_charge"):
             continue
@@ -180,27 +214,79 @@ def _enrich_items(data, order_no):
         # recognize this line's description -> flag it as a new template
         # needing manual review/retraining, regardless of any later
         # GetSparePurchaseItem positional fallback in enrich_invoice.
-        item["_hsn_nav_item_no_missing"] = not (info and str(info.get("Nav_Item_No") or "").strip())
+        missing = not (info and str(info.get("Nav_Item_No") or "").strip())
+        item["_hsn_nav_item_no_missing"] = missing
+        if missing and sf_active:
+            # SF couldn't confirm this line at all - don't leave the PDF's
+            # raw HSN/SAC code sitting in No. looking like a real match;
+            # blank it so a saved No. always means SF actually confirmed it.
+            item["ProductNo"] = ""
         if not info:
             continue
-        # Only overwrite ProductNo when SF actually has one — an SF match
-        # with no code must not blank out the PDF's own HSN/SAC value that
-        # build_invoice_json already seeded it with.
+        # Only overwrite a field when SF actually has a value for it — an SF
+        # match whose own record is missing a piece (no code, no tax rate,
+        # ...) must not blank out what build_invoice_json/the PDF already
+        # seeded it with. TaxPercentage in particular drives the "GST %"
+        # column, and SF's item master frequently has the Nav_Item_No but
+        # not a rate, which used to silently wipe out the PDF-derived rate.
         new_product_no = info.get("ProductNo") or info.get("Nav_Item_No", "")
         if new_product_no:
             item["ProductNo"] = new_product_no
         item["Nav_Item_No"] = info.get("Nav_Item_No", "")
-        item["PartSpecification"] = info.get("PartSpecification", "")
-        item["Nav_Part_Description"] = info.get("Nav_Part_Description", "")
-        item["HSN_Type"] = info.get("HSN_Type", "")
-        item["HSN_Percentage_Description"] = info.get("HSN_Percentage_Description", "")
-        item["TaxPercentage"] = info.get("TaxPercentage", "")
-        item["GST_%"] = info.get("TaxPercentage", "")
+        if info.get("PartSpecification"):
+            item["PartSpecification"] = info["PartSpecification"]
+        if info.get("Nav_Part_Description"):
+            item["Nav_Part_Description"] = info["Nav_Part_Description"]
+        if info.get("HSN_Type"):
+            item["HSN_Type"] = info["HSN_Type"]
+        if info.get("HSN_Percentage_Description"):
+            item["HSN_Percentage_Description"] = info["HSN_Percentage_Description"]
+        if info.get("TaxPercentage"):
+            item["TaxPercentage"] = info["TaxPercentage"]
+            item["GST_%"] = info["TaxPercentage"]
 
 
 # ---------------------------------------------------------------------------
-# Orchestration for one invoice
+# Orchestration
 # ---------------------------------------------------------------------------
+
+def fetch_sf_batch(invoices):
+    """
+    One-shot batched Service First lookup for a whole processing run - a
+    single GetSparePurchaseItem call covering every invoice's PO, and a
+    single GetHSNDetails call covering every invoice's items, instead of
+    two HTTP round trips per invoice. `invoices` is an iterable of invoice
+    `data` dicts (only buyer_order_no/items are read). Returns
+    (spare_map, hsn_map), both pass straight into apply_sf_batch.
+
+    Sample: fetch_sf_batch([{'buyer_order_no': 'SPRPUR/2026/04/27-83650', 'items': []}])
+    """
+    order_nos = []
+    hsn_items = []
+    for data in invoices:
+        order_no = (data.get("buyer_order_no") or "").strip()
+        if order_no:
+            order_nos.append(order_no)
+            hsn_items.extend(_hsn_lookup_items(data, order_no))
+
+    spare_map = get_spare_purchase_items(order_nos) if order_nos else {}
+    hsn_map = get_hsn_details(hsn_items) if hsn_items else {}
+    return spare_map, hsn_map
+
+
+def apply_sf_batch(data, spare_map, hsn_map):
+    """
+    Apply the results of a prior fetch_sf_batch() to one invoice and
+    evaluate it - the batched-run equivalent of enrich_invoice(), with no
+    HTTP calls of its own. Returns the same verdict shape enrich_invoice
+    does.
+
+    Sample: apply_sf_batch(data, spare_map, hsn_map)
+    """
+    order_no = (data.get("buyer_order_no") or "").strip()
+    rows = spare_map.get(_clean(order_no), []) if order_no else []
+    return _apply_sf_to_invoice(data, order_no, rows, hsn_map)
+
 
 def enrich_invoice(data):
     """
@@ -210,6 +296,11 @@ def enrich_invoice(data):
 
         {"status", "is_active", "is_synced", "errors", "reason"}
 
+    Makes its own HTTP calls for just this one invoice - for a whole batch
+    of invoices, use fetch_sf_batch()/apply_sf_batch() instead so the run
+    makes one GetSparePurchaseItem/GetHSNDetails call in total rather than
+    one pair per invoice.
+
     Sample: enrich_invoice({'buyer_order_no': 'SPRPUR/2026/04/27-83650', 'seller_gstin': '33AAAAA0000A1Z5', 'items': []})
     """
     order_no = (data.get("buyer_order_no") or "").strip()
@@ -217,6 +308,27 @@ def enrich_invoice(data):
     rows = []
     if _base_url() and order_no:
         rows = get_spare_purchase_items([order_no]).get(_clean(order_no), [])
+
+    hsn_items = _hsn_lookup_items(data, order_no) if rows else []
+    hsn_map = get_hsn_details(hsn_items) if hsn_items else {}
+
+    return _apply_sf_to_invoice(data, order_no, rows, hsn_map)
+
+
+def _apply_sf_to_invoice(data, order_no, rows, hsn_map):
+    """Shared by enrich_invoice() and apply_sf_batch(): given the
+    GetSparePurchaseItem rows for this invoice's PO and the (possibly
+    much larger, batch-wide) GetHSNDetails map, enrich `data` in place
+    and return its verdict. No HTTP calls."""
+    # GetHSNDetails/GetHSNDetails-derived fields (item code, GST %,
+    # description) don't depend on GetSparePurchaseItem succeeding - the
+    # two are separate calls (see fetch_sf_batch) and GetSparePurchaseItem
+    # is, in practice, the far less reliable of the two (frequent
+    # timeouts). Apply HSN data unconditionally so a missing/failed
+    # reservation lookup never discards HSN data that was fetched fine -
+    # the invoice can still fail its verdict below for lacking reservation
+    # data, but its Purchase Line fields won't be blanked out for it.
+    _apply_hsn_map(data, order_no, hsn_map)
 
     if rows:
         apply_sf_item_defaults(rows)
@@ -226,8 +338,6 @@ def enrich_invoice(data):
         first = rows[0]
         for dest, src in _HEADER_FROM_SF.items():
             data[dest] = first.get(src, "")
-
-        _enrich_items(data, order_no)
 
         # Link each reservation row to its Purchase Line item so
         # Reservation Entry.Source Ref. No. = Purchase Line.Line No. for
@@ -246,15 +356,20 @@ def enrich_invoice(data):
                 sf["Line_No"] = it.get("Line_No", "")
                 matched.add(id(it))
 
-        # Fallback: the HSN lookup can fail to resolve any Nav_Item_No at
-        # all (external API unavailable/no match), leaving both sides of
-        # that join key blank. Fall back to positional matching (same
-        # sequence on the PO) and backfill Nav_Item_No onto the Purchase
-        # Line item too, so No. and Item No. still agree. Reservation
-        # Entry rows are per-unit (see _link_override's Quantity note), so
-        # a line item with Quantity > 1 legitimately has multiple
-        # reservation rows for the same item — expand each unmatched item
-        # by its own quantity before pairing positionally.
+        # Any SF reservation row not yet matched by Nav_Item_No still needs
+        # a Line_No so Reservation Entry.Source Ref. No. can point at
+        # *some* Purchase Line row - pair the remainder positionally
+        # (same sequence on the PO) purely for that cross-reference.
+        # Reservation Entry rows are per-unit (see _link_override's
+        # Quantity note), so a line item with Quantity > 1 legitimately
+        # has multiple reservation rows for the same item — expand each
+        # unmatched item by its own quantity before pairing.
+        #
+        # Deliberately does NOT backfill Nav_Item_No/ProductNo from this
+        # pairing (unlike the confirmed Nav_Item_No match above) - a
+        # same-position SF row is not a confirmed identity match, only a
+        # sequence coincidence, and No. must only ever hold a value SF
+        # actually confirmed by description (see _apply_hsn_map).
         unmatched_sf = [sf for sf in rows if not sf.get("Line_No")]
         expanded_items = []
         for it in items:
@@ -267,10 +382,6 @@ def enrich_invoice(data):
             expanded_items.extend([it] * qty)
         if unmatched_sf and len(unmatched_sf) == len(expanded_items):
             for sf, it in zip(unmatched_sf, expanded_items):
-                nav_no = sf.get("Nav_Item_No", "")
-                if nav_no and not it.get("Nav_Item_No"):
-                    it["Nav_Item_No"] = nav_no
-                    it["ProductNo"] = it.get("ProductNo") or nav_no
                 sf["Line_No"] = it.get("Line_No", "")
     else:
         data.setdefault("sf_items", [])
@@ -331,20 +442,41 @@ def evaluate_invoice(data):
                 continue
             # GetHSNDetails (the item-master lookup) never resolved this
             # line's description at all -> SF has no idea what this part
-            # is. Treat the PDF as an unrecognized/new template: park the
-            # invoice as INCOMPLETE DATA (Purchase Line's [No.] stays
-            # blank) and flag it for retraining, rather than the generic
-            # "PENDING IN SF" used when SF simply hasn't received the part
-            # yet.
+            # is. The invoice's own FORMAT is still recognized (this only
+            # runs once fmt_model already matched it) - it's SF's item
+            # catalog that's incomplete, not the template, so this is a
+            # DATA MISMATCH (Purchase Line's [No.] stays blank), not a NEW
+            # TEMPLATE. Still flagged for retraining copy below, same as
+            # the genuine "PENDING IN SF" case, since a human should look at
+            # why SF doesn't know this part.
             if it.get("_hsn_nav_item_no_missing"):
                 msg = ("The field [No.] is blank in Purchase Line table — "
-                       "the pdf is a new format")
-                return {"status": "INCOMPLETE DATA", "is_active": False,
+                       "Service First doesn't recognize this item")
+                return {"status": "DATA MISMATCH", "is_active": False,
                         "is_synced": is_synced, "errors": [msg],
                         "reason": msg, "new_format": True}
+            # SF resolved a Nav_Item_No/ProductNo above but it (or the raw
+            # HSN lookup) ended up literally blank or the string "null" -
+            # a mandatory, Service-First-sourced Purchase Line field with
+            # nothing in it, same class of gap as the two checks around
+            # this one, so it's DATA MISMATCH too rather than the generic
+            # PENDING IN SF.
             nav = str(it.get("ProductNo") or it.get("Nav_Item_No") or "").strip()
             if not nav or nav.lower() == "null":
-                return fail("Nav Part Description not entered in SF GRN")
+                msg = "The field [No.] is blank in Purchase Line table"
+                return {"status": "DATA MISMATCH", "is_active": False,
+                        "is_synced": is_synced, "errors": [msg],
+                        "reason": msg, "new_format": True}
+            # SF resolved a Nav_Item_No, but its own Nav_Part_Description is
+            # either blank or describes something else entirely - trusting
+            # it (or the blank) would load the wrong part into BC, so this
+            # needs a human to confirm before it's ready.
+            if _description_mismatch(it.get("Nav_Part_Description"), it.get("Description")):
+                msg = ("Nav Part Description is empty or doesn't match the "
+                       "PDF's item description")
+                return {"status": "DATA MISMATCH", "is_active": False,
+                        "is_synced": is_synced, "errors": [msg],
+                        "reason": msg, "new_format": True}
 
         # Purchase Line is fine — now check the Reservation Entry side: every
         # row GetSparePurchaseItem returned must itself carry a Nav_Item_No

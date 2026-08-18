@@ -3,7 +3,7 @@ import {
   startTraining, getStatus, getBackups, restoreBackup, getActiveJob,
   getTrainFiles, trainFileUrl,
 } from "./api";
-import { DataTable } from "./components";
+import { DataTable, confirmDialog } from "./components";
 
 export default function Training() {
   const [job, setJob] = useState(null);
@@ -34,7 +34,7 @@ export default function Training() {
   }, []);
 
   const onRestore = async (name) => {
-    if (!window.confirm(`Restore model from backup:\n${name}?`)) return;
+    if (!(await confirmDialog(`Restore model from backup:\n${name}?`, { confirmLabel: "Restore" }))) return;
     setError(null); setNotice(null);
     try { const r = await restoreBackup(name); setNotice(r.message || `Restored ${name}`); setCurrent(name); }
     catch (e) { setError(e.message); }

@@ -41,9 +41,9 @@ BRANCH_FOR_ENV = {"uat": "Development", "live": "uat"}
 _ROBOCOPY_XD = [
     ".git", ".claude", "venv", ".venv", "__pycache__", "node_modules",
     "logs", "output", "New_Format", "model_backups", "old",
-    "sample_input", "manuals",
+    "sample_input", "manuals", "announcement_media",
 ]
-_ROBOCOPY_XF = ["config.json", "config_nonencrypted.json", "*.log", "*.pyc"]
+_ROBOCOPY_XF = ["config.json", "config_nonencrypted.json", "PIIPS.sql", "*.log", "*.pyc"]
 
 
 class PublishError(Exception):

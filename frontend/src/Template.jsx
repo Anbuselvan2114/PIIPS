@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getTemplates, saveTemplate, deleteTemplate } from "./api";
-import { DataTable } from "./components";
+import { DataTable, confirmDialog } from "./components";
 
 export default function Template({ user }) {
   const [data, setData] = useState(null);
@@ -24,7 +24,7 @@ export default function Template({ user }) {
 
   const onDelete = async (key, e) => {
     e.stopPropagation();
-    if (!window.confirm(`Delete template "${key}"?`)) return;
+    if (!(await confirmDialog(`Delete template "${key}"?`, { confirmLabel: "Delete", danger: true }))) return;
     await deleteTemplate(key, user?.user_id); refresh();
   };
 

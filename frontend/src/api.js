@@ -8,10 +8,18 @@
 const API_BASE = import.meta?.env?.VITE_API_BASE ?? "";
 
 async function request(path, options = {}) {
-  const res = await fetch(API_BASE + path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  let res;
+  try {
+    res = await fetch(API_BASE + path, {
+      headers: { "Content-Type": "application/json" },
+      ...options,
+    });
+  } catch {
+    // fetch() itself throwing (not the server returning an error status)
+    // means the request never reached the server at all - a raw browser
+    // message like "Failed to fetch" means nothing to an end user.
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
 
   if (!res.ok) {
     let detail;
@@ -166,25 +174,82 @@ export const login = (username, password) =>
     body: JSON.stringify({ username, password }),
   });
 
-export const resetPassword = (username, new_password) =>
-  request("/api/reset-password", {
+export const forgotPassword = (username_or_email) =>
+  request("/api/forgot-password", {
     method: "POST",
-    body: JSON.stringify({ username, new_password }),
+    body: JSON.stringify({ username_or_email }),
+  });
+
+export const changePassword = (user_id, current_password, new_password) =>
+  request("/api/change-password", {
+    method: "POST",
+    body: JSON.stringify({ user_id, current_password, new_password }),
   });
 
 export const getUsers = () => request("/api/users");
 
-export const createUser = (username, password, user_type_id) =>
+export const createUser = (username, email, user_type_id, created_by) =>
   request("/api/users", {
     method: "POST",
-    body: JSON.stringify({ username, password, user_type_id }),
+    body: JSON.stringify({ username, email, user_type_id, created_by }),
   });
 
-export const setUserActive = (user_id, is_active) =>
+export const setUserActive = (user_id, is_active, modified_by) =>
   request("/api/users/active", {
     method: "POST",
-    body: JSON.stringify({ user_id, is_active }),
+    body: JSON.stringify({ user_id, is_active, modified_by }),
   });
+
+export const adminResetPassword = (user_id, target_user_id, new_password) =>
+  request("/api/users/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ user_id, target_user_id, new_password: new_password || null }),
+  });
+
+export const getMailSettings = (user_id) =>
+  request(`/api/mail-settings${user_id != null ? `?user_id=${user_id}` : ""}`);
+
+export const saveMailSettings = (payload) =>
+  request("/api/mail-settings", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+export const getActiveAnnouncements = () => request("/api/announcements/active");
+
+export const getAnnouncements = (user_id) =>
+  request(`/api/announcements${user_id != null ? `?user_id=${user_id}` : ""}`);
+
+export const createAnnouncement = async ({ title, body_text, video_url, end_datetime, user_id, image }) => {
+  const form = new FormData();
+  form.append("title", title);
+  form.append("body_text", body_text || "");
+  form.append("video_url", video_url || "");
+  form.append("end_datetime", end_datetime);
+  if (user_id != null) form.append("user_id", user_id);
+  if (image) form.append("image", image);
+
+  let res;
+  try {
+    res = await fetch(API_BASE + "/api/announcements", { method: "POST", body: form });
+  } catch {
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
+  if (!res.ok) {
+    let detail;
+    try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
+    throw new Error((typeof detail === "string" ? detail : detail?.message) || `Request failed (${res.status})`);
+  }
+  return res.json();
+};
+
+export const stopAnnouncement = (announcement_id, user_id) =>
+  request(`/api/announcements/${announcement_id}/stop`, {
+    method: "POST",
+    body: JSON.stringify({ user_id }),
+  });
+
+export const announcementImageUrl = (path) => `${API_BASE}/announcement_media/${encodeURIComponent(path)}`;
 
 export const clearFormats = () =>
   request("/api/formats", { method: "DELETE" });
@@ -195,9 +260,6 @@ const sub = (subpath) =>
 export const getInputFiles = (subpath = "") =>
   request(`/api/input/files${sub(subpath)}`);
 
-export const openInputFolder = (subpath = "") =>
-  request(`/api/input/open${sub(subpath)}`, { method: "POST" });
-
 export const uploadInputFiles = async (fileList, subpath = "", user_id) => {
   const form = new FormData();
   for (const f of fileList) form.append("files", f);
@@ -207,10 +269,15 @@ export const uploadInputFiles = async (fileList, subpath = "", user_id) => {
     `/api/input/upload${q}` +
     (user_id != null ? `${q ? "&" : "?"}user_id=${user_id}` : "");
 
-  const res = await fetch(API_BASE + url, {
-    method: "POST",
-    body: form, // let the browser set the multipart Content-Type/boundary
-  });
+  let res;
+  try {
+    res = await fetch(API_BASE + url, {
+      method: "POST",
+      body: form, // let the browser set the multipart Content-Type/boundary
+    });
+  } catch {
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
 
   if (!res.ok) {
     let detail;

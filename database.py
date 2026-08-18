@@ -11,10 +11,13 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import string
 
 import pyodbc
 
 import config_store
+import secret_store
 
 
 ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
@@ -24,11 +27,13 @@ ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 STATUS_VALUES = [
     "INITIATED",
     "UNSUPPORTED",
+    "DUPLICATE",
     "EXTRACTED",
     "BUYER ORDER NO DOESN'T EXIST",
     "SF PROCESSED",
     "PENDING IN SF",
-    "INCOMPLETE DATA",
+    "DATA MISMATCH",      # renamed from "INCOMPLETE DATA" - see migration below
+    "NEW TEMPLATE",       # unrecognized-format PDFs, previously untracked entirely
     "READY TO LOAD",
     "LOADED",
     "POSTED",
@@ -718,9 +723,36 @@ def fetch_batch(batch_name, sheet_cols):
                     r"^[S5]PRPUR/?", "", row.get("Consignment Note No.") or "",
                     flags=re.IGNORECASE)
 
+        # A freight/courier/forwarding line has no Navision item master
+        # entry - BC books it as a fixed service line. Re-applied here (not
+        # just at save time in excel_export.py's _freight_line_override) so
+        # a download is correct even for a batch saved before this fix, same
+        # reasoning as Consignment Note No. above.
+        part_header_ids = set()
+        if any(row.get("Type") == "Charge (Item)" for row in pl_r):
+            cur.execute(
+                "SELECT pt.Purchase_Header_ID FROM tbl_Purchase_Tracker pt "
+                "JOIN tbl_InvoiceType it ON it.InvoiceTypeId = pt.InvoiceTypeID "
+                "WHERE pt.BatchName = ? AND it.InvoiceTypeName = 'PART'",
+                batch_name,
+            )
+            part_header_ids = {r[0] for r in cur.fetchall()}
+
         for row in pl_r:
             if not (row.get("Document No.") or "").strip():
                 row["Document No."] = last_no_by_header.get(row.get("Purchase_Header_ID"), "")
+            if (row.get("Type") == "Charge (Item)"
+                    and row.get("Purchase_Header_ID") in part_header_ids):
+                if "No." in row:
+                    row["No."] = "FRIEGHT IN"
+                if "GST Group Type" in row:
+                    row["GST Group Type"] = "Service"
+                if "GST Group Code" in row:
+                    try:
+                        rate = float(row.get("GST %") or 0)
+                    except (TypeError, ValueError):
+                        rate = 0
+                    row["GST Group Code"] = f"Service {rate:g}%" if rate else "Service"
 
         for row in re_r:
             if not (row.get("Source ID") or "").strip():
@@ -866,7 +898,7 @@ def invoices_by_batch(batch_name):
     """Every invoice in a batch (Dashboard batches table's per-status
     drill-down pop-up). Deliberately NOT filtered by IsActive: every
     non-terminal status (BUYER ORDER NO DOESN'T EXIST, PENDING IN SF,
-    INCOMPLETE DATA) is saved with IsActive=0 by evaluate_invoice() - it
+    DATA MISMATCH) is saved with IsActive=0 by evaluate_invoice() - it
     marks "not yet validated/ready", not "hide this row". Filtering on it
     here used to make the popup disagree with the status column's own
     count (e.g. count shows 3, popup opens to 0) for exactly the statuses
@@ -903,7 +935,7 @@ def get_invoice_field_check(header_id):
     """Field-by-field mandatory-data breakdown for one invoice: every
     required Purchase Header / Purchase Line / Reservation Entry column,
     its current stored value, and whether it's missing — for the Dashboard's
-    'INCOMPLETE DATA' drill-down (exactly which field(s) are missing and
+    'DATA MISMATCH' drill-down (exactly which field(s) are missing and
     what's currently in them).
     Sample: get_invoice_field_check(29)"""
     import excel_export
@@ -1078,8 +1110,15 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
             f"WHERE pt.Purchase_Header_ID IN ({id_ph}) AND s.StatusName IN ({from_ph})",
             *ids, *froms)
         qualifying = cur.fetchall()
-        files = [r[0] for r in qualifying if r[0]]
-        qualifying_ids = [r[1] for r in qualifying]
+        # Kept positionally paired (files[i] <-> qualifying_ids[i]) - a row
+        # with no FileName is dropped from both together, not just files,
+        # so callers that zip the two (e.g. the ALL_INVOICES archive copy)
+        # can't get misaligned.
+        files, qualifying_ids = [], []
+        for fname, hid in qualifying:
+            if fname:
+                files.append(fname)
+                qualifying_ids.append(hid)
 
         cur.execute(
             "UPDATE pt "
@@ -1127,9 +1166,21 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
                     *qualifying_ids)
 
         conn.commit()
-        return {"count": count, "files": files}
+        return {"count": count, "files": files, "header_ids": qualifying_ids}
     finally:
         conn.close()
+
+
+def invoices_by_header_ids(header_ids):
+    """Invoices for a specific set of header ids, in the same shape as
+    invoices_by_status/invoices_by_batch (used to build the invoice-no +
+    vendor-name filename for the ALL_INVOICES archive copy).
+    Sample: invoices_by_header_ids([12, 13])"""
+    ids = [int(h) for h in (header_ids or [])]
+    if not ids:
+        return []
+    ph = ", ".join("?" for _ in ids)
+    return _invoice_list(f"h.Id IN ({ph})", ids)
 
 
 def set_excluded(header_id, exclude, user_id=None):
@@ -1280,6 +1331,15 @@ _MENU_TABLE_DDL = [
         StatusName NVARCHAR(150) NOT NULL UNIQUE
     )
     """,
+    # Rename in place (UPDATE, not delete+reinsert) so every existing
+    # tracker row's StatusID keeps pointing at the same row - only its
+    # display name changes. Must run before the seed INSERT below, or the
+    # seed would insert "DATA MISMATCH" as a brand new row (since it
+    # doesn't exist yet under that name) while old rows stay orphaned on
+    # the never-updated "INCOMPLETE DATA" name.
+    "IF EXISTS (SELECT 1 FROM dbo.tbl_status WHERE StatusName = 'INCOMPLETE DATA') "
+    "AND NOT EXISTS (SELECT 1 FROM dbo.tbl_status WHERE StatusName = 'DATA MISMATCH') "
+    "UPDATE dbo.tbl_status SET StatusName = 'DATA MISMATCH' WHERE StatusName = 'INCOMPLETE DATA'",
     f"""
     INSERT INTO tbl_status (StatusName)
     SELECT v FROM (VALUES {_STATUS_SEED_VALUES}) t(v)
@@ -1866,19 +1926,20 @@ _MENU_PROC_DDL = [
         @UserName     NVARCHAR(100),
         @UserTypeID   INT,
         @PasswordHash NVARCHAR(256),
+        @Email        NVARCHAR(200) = NULL,
         @CreatedById  INT = NULL
     AS
     BEGIN
         SET NOCOUNT ON;
-        -- Sample: EXEC dbo.usp_CreateUser @UserName='jsmith', @UserTypeID=1, @PasswordHash='pbkdf2_sha256$100000$abcd$ef01', @CreatedById=7
+        -- Sample: EXEC dbo.usp_CreateUser @UserName='jsmith', @UserTypeID=1, @PasswordHash='pbkdf2_sha256$100000$abcd$ef01', @Email='jsmith@precisionit.co.in', @CreatedById=7
         IF EXISTS (SELECT 1 FROM dbo.tbl_user WHERE UserName = @UserName)
         BEGIN
             SELECT -1 AS Status;   -- already exists
             RETURN;
         END
         INSERT INTO dbo.tbl_user
-            (UserName, UserTypeID, Password, IsActive, CreatedById, CreatedDatetime)
-        VALUES (@UserName, @UserTypeID, @PasswordHash, 1, @CreatedById, GETDATE());
+            (UserName, UserTypeID, Password, Email, MustChangePassword, IsActive, CreatedById, CreatedDatetime)
+        VALUES (@UserName, @UserTypeID, @PasswordHash, @Email, 1, 1, @CreatedById, GETDATE());
         SELECT 0 AS Status;
     END
     """,
@@ -1886,13 +1947,15 @@ _MENU_PROC_DDL = [
     CREATE OR ALTER PROCEDURE dbo.usp_ResetPassword
         @UserName     NVARCHAR(100),
         @PasswordHash NVARCHAR(256),
+        @ForceChange  BIT = 0,
         @ModifiedById INT = NULL
     AS
     BEGIN
         SET NOCOUNT ON;
-        -- Sample: EXEC dbo.usp_ResetPassword @UserName='jsmith', @PasswordHash='pbkdf2_sha256$100000$abcd$ef01', @ModifiedById=7
+        -- Sample: EXEC dbo.usp_ResetPassword @UserName='jsmith', @PasswordHash='pbkdf2_sha256$100000$abcd$ef01', @ForceChange=1, @ModifiedById=7
         UPDATE dbo.tbl_user
            SET Password = @PasswordHash,
+               MustChangePassword = @ForceChange,
                LastModifiedById = @ModifiedById,
                LastModifiedDatetime = GETDATE()
          WHERE UserName = @UserName;
@@ -1913,6 +1976,53 @@ _MENU_PROC_DDL = [
                LastModifiedById = @ModifiedById,
                LastModifiedDatetime = GETDATE()
          WHERE UserId = @UserId;
+        SELECT @@ROWCOUNT AS Affected;
+    END
+    """,
+    # ---- Mail server settings ---------------------------------------------
+    # Single-row table (SettingID, UserName, EmailID, Password, SMTPHost,
+    # SMTPPort). Password is stored DPAPI-encrypted (secret_store) - these
+    # procedures only move the already-encrypted string, never touch it.
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_GetMailSettings
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_GetMailSettings
+        IF OBJECT_ID('dbo.tbl_MailSettings') IS NULL
+        BEGIN
+            SELECT TOP 0 CAST(NULL AS INT) AS SettingID,
+                         CAST(NULL AS NVARCHAR(100)) AS UserName,
+                         CAST(NULL AS NVARCHAR(200)) AS EmailID,
+                         CAST(NULL AS NVARCHAR(500)) AS Password,
+                         CAST(NULL AS NVARCHAR(200)) AS SMTPHost,
+                         CAST(NULL AS INT) AS SMTPPort;
+            RETURN;
+        END
+        SELECT TOP 1 SettingID, UserName, EmailID, Password, SMTPHost, SMTPPort
+        FROM dbo.tbl_MailSettings
+        ORDER BY SettingID;
+    END
+    """,
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_SaveMailSettings
+        @SettingID     INT,
+        @UserName      NVARCHAR(100),
+        @EmailID       NVARCHAR(200),
+        @PasswordEnc   NVARCHAR(500),
+        @SMTPHost      NVARCHAR(200),
+        @SMTPPort      INT
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_SaveMailSettings @SettingID=31, @UserName='SF APP', @EmailID='sfapp@precisionit.co.in', @PasswordEnc='enc:dpapi:...', @SMTPHost='mail.precisionit.co.in', @SMTPPort=587
+        UPDATE dbo.tbl_MailSettings
+           SET UserName = @UserName,
+               EmailID  = @EmailID,
+               Password = @PasswordEnc,
+               SMTPHost = @SMTPHost,
+               SMTPPort = @SMTPPort
+         WHERE SettingID = @SettingID;
         SELECT @@ROWCOUNT AS Affected;
     END
     """,
@@ -2081,6 +2191,7 @@ _MENU_PROC_DDL = [
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_ListUsers
         SELECT u.UserId, u.UserName, u.UserTypeID, t.UserTypeName, u.IsActive,
+               u.Email, u.MustChangePassword,
                u.CreatedById, u.CreatedDatetime,
                u.LastModifiedById, u.LastModifiedDatetime
         FROM dbo.tbl_user u
@@ -2096,10 +2207,24 @@ _MENU_PROC_DDL = [
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_GetUserByName @UserName='jsmith'
         SELECT u.UserId, u.UserName, u.UserTypeID, t.UserTypeName,
-               u.Password, u.IsActive
+               u.Password, u.IsActive, u.Email, u.MustChangePassword
         FROM dbo.tbl_user u
         LEFT JOIN dbo.tbl_UserType t ON u.UserTypeID = t.UserTypeId
         WHERE u.UserName = @UserName;
+    END
+    """,
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_GetUserByEmail
+        @Email NVARCHAR(200)
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_GetUserByEmail @Email='jsmith@precisionit.co.in'
+        SELECT u.UserId, u.UserName, u.UserTypeID, t.UserTypeName,
+               u.Password, u.IsActive, u.Email, u.MustChangePassword
+        FROM dbo.tbl_user u
+        LEFT JOIN dbo.tbl_UserType t ON u.UserTypeID = t.UserTypeId
+        WHERE u.Email = @Email;
     END
     """,
     """
@@ -2734,6 +2859,8 @@ def init_user_table():
             "CreatedDatetime": "DATETIME NULL DEFAULT GETDATE()",
             "LastModifiedById": "INT NULL",
             "LastModifiedDatetime": "DATETIME NULL",
+            "Email": "NVARCHAR(200) NULL",
+            "MustChangePassword": "BIT NOT NULL DEFAULT 0",
         }
         for col, ddl in adds.items():
             if col not in existing:
@@ -2742,6 +2869,200 @@ def init_user_table():
 
         cur.execute("SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('tbl_user')")
         return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def init_mail_settings_table():
+    """Create tbl_MailSettings if missing and seed the one SMTP settings
+    row (idempotent - never overwrites an existing row, only inserts when
+    the table is empty). Sample: init_mail_settings_table()"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.tables WHERE name = 'tbl_MailSettings'
+            )
+            CREATE TABLE tbl_MailSettings (
+                SettingID INT IDENTITY(31,1) PRIMARY KEY,
+                UserName  NVARCHAR(100) NULL,
+                EmailID   NVARCHAR(200) NULL,
+                Password  NVARCHAR(500) NULL,
+                SMTPHost  NVARCHAR(200) NULL,
+                SMTPPort  INT NULL
+            )
+            """
+        )
+        conn.commit()
+
+        cur.execute("SELECT COUNT(*) FROM tbl_MailSettings")
+        if cur.fetchone()[0] == 0:
+            cur.execute(
+                "INSERT INTO tbl_MailSettings (UserName, EmailID, Password, SMTPHost, SMTPPort) "
+                "VALUES (?, ?, ?, ?, ?)",
+                "SF APP", "sfapp@precisionit.co.in", secret_store.protect(""),
+                "mail.precisionit.co.in", 587,
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+# The one account guaranteed to always exist, with a fixed (not auto-
+# generated) password and no email/forced-change requirement, so it can
+# never be locked out by mail-server misconfiguration. Any number of other
+# Super Admins may also exist (created normally, with email + a generated
+# password like everyone else) - this is just the always-available default.
+DEFAULT_SUPER_ADMIN_USERNAME = "Sadmin"
+DEFAULT_SUPER_ADMIN_PASSWORD = "Sadmin@2026"
+
+
+def ensure_default_super_admin():
+    """Seed the default 'Sadmin' account if it doesn't exist yet. Idempotent.
+    Sample: ensure_default_super_admin()"""
+    init_user_table()
+    init_usertype_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM tbl_user WHERE UserName = ?", DEFAULT_SUPER_ADMIN_USERNAME)
+        if cur.fetchone():
+            return
+        cur.execute("SELECT UserTypeId FROM tbl_UserType WHERE UserTypeName = 'Super Admin'")
+        row = cur.fetchone()
+        if not row:
+            return
+        cur.execute(
+            "INSERT INTO tbl_user (UserName, UserTypeID, Password, Email, MustChangePassword, IsActive, CreatedDatetime) "
+            "VALUES (?, ?, ?, NULL, 0, 1, GETDATE())",
+            DEFAULT_SUPER_ADMIN_USERNAME, row[0], hash_password(DEFAULT_SUPER_ADMIN_PASSWORD),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Announcements (Super Admin only) - site-wide notices shown to every
+# logged-in user until EndDateTime passes or a Super Admin stops one early.
+# ---------------------------------------------------------------------------
+
+def init_announcement_table():
+    """Create tbl_Announcement if missing. Sample: init_announcement_table()"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.tables WHERE name = 'tbl_Announcement'
+            )
+            CREATE TABLE tbl_Announcement (
+                Id              INT IDENTITY(1,1) PRIMARY KEY,
+                Title           NVARCHAR(200) NOT NULL,
+                BodyText        NVARCHAR(MAX) NULL,
+                ImagePath       NVARCHAR(500) NULL,
+                VideoUrl        NVARCHAR(500) NULL,
+                EndDateTime     DATETIME NOT NULL,
+                IsActive        BIT NOT NULL DEFAULT 1,
+                CreatedById     INT NULL,
+                CreatedDatetime DATETIME NOT NULL DEFAULT GETDATE(),
+                StoppedById     INT NULL,
+                StoppedDatetime DATETIME NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_announcement(title, body_text, image_path, video_url, end_datetime, created_by=None):
+    """Create an announcement. Sample:
+    create_announcement('Maintenance', 'Down 10-11 PM', None, None, '2026-08-20 22:00:00', 11)"""
+    init_announcement_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO tbl_Announcement "
+            "(Title, BodyText, ImagePath, VideoUrl, EndDateTime, IsActive, CreatedById, CreatedDatetime) "
+            "OUTPUT INSERTED.Id "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, GETDATE())",
+            title, body_text, image_path, video_url, end_datetime, created_by,
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        return new_id
+    finally:
+        conn.close()
+
+
+def list_announcements():
+    """Every announcement, newest first (Super Admin management view).
+    Sample: list_announcements()"""
+    init_announcement_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT Id, Title, BodyText, ImagePath, VideoUrl, EndDateTime, IsActive, "
+            "CreatedById, CreatedDatetime, StoppedById, StoppedDatetime "
+            "FROM tbl_Announcement ORDER BY Id DESC"
+        )
+        cols = [d[0] for d in cur.description]
+        out = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            d["IsActive"] = bool(d["IsActive"])
+            for k in ("EndDateTime", "CreatedDatetime", "StoppedDatetime"):
+                if d.get(k) is not None:
+                    d[k] = str(d[k])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def get_active_announcements():
+    """Announcements every logged-in user should currently see: IsActive
+    and not yet past EndDateTime. Sample: get_active_announcements()"""
+    init_announcement_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT Id, Title, BodyText, ImagePath, VideoUrl, EndDateTime "
+            "FROM tbl_Announcement WHERE IsActive = 1 AND EndDateTime > GETDATE() "
+            "ORDER BY Id DESC"
+        )
+        cols = [d[0] for d in cur.description]
+        out = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            d["EndDateTime"] = str(d["EndDateTime"])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def stop_announcement(announcement_id, user_id=None):
+    """Deactivate an announcement immediately (Super Admin). Sample:
+    stop_announcement(3, 11)"""
+    init_announcement_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE tbl_Announcement SET IsActive = 0, StoppedById = ?, StoppedDatetime = GETDATE() "
+            "WHERE Id = ?",
+            user_id, announcement_id,
+        )
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 
@@ -2766,6 +3087,43 @@ def verify_password(password, stored):
         return binascii.hexlify(dk).decode() == hash_hex
     except (ValueError, AttributeError):
         return False
+
+
+_SPECIAL_CHARS = "!@#$%^&*()-_=+[]{};:,.<>?/"
+_PASSWORD_MIN_LEN = 5
+
+
+def validate_password_policy(password):
+    """Raise ValueError with a specific message unless `password` has at
+    least one uppercase, one lowercase, one digit, one special character,
+    and is at least 5 characters long. Sample: validate_password_policy('Ab1!x')"""
+    password = password or ""
+    if len(password) < _PASSWORD_MIN_LEN:
+        raise ValueError(f"Password must be at least {_PASSWORD_MIN_LEN} characters long.")
+    if not any(c.isupper() for c in password):
+        raise ValueError("Password must contain at least one uppercase letter.")
+    if not any(c.islower() for c in password):
+        raise ValueError("Password must contain at least one lowercase letter.")
+    if not any(c.isdigit() for c in password):
+        raise ValueError("Password must contain at least one number.")
+    if not any(c in _SPECIAL_CHARS for c in password):
+        raise ValueError("Password must contain at least one special character.")
+
+
+def generate_temp_password(length=10):
+    """A random password that satisfies validate_password_policy by
+    construction. Sample: generate_temp_password()"""
+    length = max(length, _PASSWORD_MIN_LEN)
+    required = [
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.ascii_lowercase),
+        secrets.choice(string.digits),
+        secrets.choice(_SPECIAL_CHARS),
+    ]
+    pool = string.ascii_letters + string.digits + _SPECIAL_CHARS
+    required += [secrets.choice(pool) for _ in range(length - len(required))]
+    secrets.SystemRandom().shuffle(required)
+    return "".join(required)
 
 
 # ---------------------------------------------------------------------------
@@ -2806,16 +3164,20 @@ def list_users():
         conn.close()
 
 
-def create_user(username, password, user_type_id, created_by=None):
-    """Create a user with a hashed password (raises if the name exists). Sample: create_user('jsmith', 'S3cret!', 1, 7)"""
+def create_user(username, user_type_id, email, created_by=None):
+    """Create a user with a system-generated temporary password (raises if
+    the name exists). The admin never chooses a password - one is always
+    auto-generated here and returned so the caller can email it; it is not
+    persisted anywhere in plaintext. Sample: create_user('jsmith', 1, 'jsmith@precisionit.co.in', 7)"""
     init_user_table()
     ensure_menu_schema()
+    temp_password = generate_temp_password()
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "EXEC dbo.usp_CreateUser ?, ?, ?, ?",
-            username, user_type_id, hash_password(password), created_by,
+            "EXEC dbo.usp_CreateUser ?, ?, ?, ?, ?",
+            username, user_type_id, hash_password(temp_password), email, created_by,
         )
         row = cur.fetchone()
         conn.commit()
@@ -2823,6 +3185,7 @@ def create_user(username, password, user_type_id, created_by=None):
             raise ValueError(f"User '{username}' already exists.")
     finally:
         conn.close()
+    return temp_password
 
 
 def get_user(username):
@@ -2838,6 +3201,56 @@ def get_user(username):
         return {
             "UserId": r[0], "UserName": r[1], "UserTypeID": r[2],
             "UserTypeName": r[3], "Password": r[4], "IsActive": bool(r[5]),
+            "Email": r[6], "MustChangePassword": bool(r[7]),
+        }
+    finally:
+        conn.close()
+
+
+def get_user_by_email(email):
+    """Fetch one user by email, or None. Sample: get_user_by_email('jsmith@precisionit.co.in')"""
+    if not email:
+        return None
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("EXEC dbo.usp_GetUserByEmail ?", email)
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "UserId": r[0], "UserName": r[1], "UserTypeID": r[2],
+            "UserTypeName": r[3], "Password": r[4], "IsActive": bool(r[5]),
+            "Email": r[6], "MustChangePassword": bool(r[7]),
+        }
+    finally:
+        conn.close()
+
+
+def get_user_by_id(user_id):
+    """Fetch one user by id, or None. Sample: get_user_by_id(12)"""
+    if not user_id:
+        return None
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT u.UserId, u.UserName, u.UserTypeID, t.UserTypeName, "
+            "u.Password, u.IsActive, u.Email, u.MustChangePassword "
+            "FROM dbo.tbl_user u "
+            "LEFT JOIN dbo.tbl_UserType t ON u.UserTypeID = t.UserTypeId "
+            "WHERE u.UserId = ?",
+            user_id,
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "UserId": r[0], "UserName": r[1], "UserTypeID": r[2],
+            "UserTypeName": r[3], "Password": r[4], "IsActive": bool(r[5]),
+            "Email": r[6], "MustChangePassword": bool(r[7]),
         }
     finally:
         conn.close()
@@ -2897,19 +3310,25 @@ def authenticate(username, password):
         "username": u["UserName"],
         "user_type": u["UserTypeName"],
         "user_type_id": u["UserTypeID"],
+        "must_change_password": u["MustChangePassword"],
     }
 
 
-def reset_password(username, new_password, modified_by=None):
-    """Set a new hashed password for a user. Sample: reset_password('jsmith', 'N3wPass!', 7)"""
+def reset_password(username, new_password, force_change=False, modified_by=None):
+    """Set a new hashed password for a user, validated against the password
+    policy. `force_change=True` also flags the account so the user must set
+    their own password on next login (used by user creation and the
+    forgot-password flow; a normal self-service change passes False to
+    clear the flag). Sample: reset_password('jsmith', 'N3wPass!1', True, 7)"""
+    validate_password_policy(new_password)
     init_user_table()
     ensure_menu_schema()
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "EXEC dbo.usp_ResetPassword ?, ?, ?",
-            username, hash_password(new_password), modified_by,
+            "EXEC dbo.usp_ResetPassword ?, ?, ?, ?",
+            username, hash_password(new_password), 1 if force_change else 0, modified_by,
         )
         row = cur.fetchone()
         conn.commit()
@@ -2932,6 +3351,55 @@ def set_user_active(user_id, is_active, modified_by=None):
         row = cur.fetchone()
         conn.commit()
         return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Mail server settings
+# ---------------------------------------------------------------------------
+
+def get_mail_settings():
+    """The single SMTP settings row, with Password decrypted, or None if
+    not yet initialized. Sample: get_mail_settings()"""
+    init_mail_settings_table()
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("EXEC dbo.usp_GetMailSettings")
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "SettingID": r[0], "UserName": r[1], "EmailID": r[2],
+            "Password": secret_store.unprotect(r[3] or ""),
+            "SMTPHost": r[4], "SMTPPort": r[5],
+        }
+    finally:
+        conn.close()
+
+
+def save_mail_settings(username, email, password, smtp_host, smtp_port):
+    """Update the single SMTP settings row. `password=None` keeps the
+    current (encrypted) password unchanged. Sample:
+    save_mail_settings('SF APP', 'sfapp@precisionit.co.in', 'S3cret!', 'mail.precisionit.co.in', 587)"""
+    init_mail_settings_table()
+    ensure_menu_schema()
+    current = get_mail_settings()
+    if password is None:
+        password_enc = secret_store.protect(current["Password"] if current else "")
+    else:
+        password_enc = secret_store.protect(password)
+    setting_id = current["SettingID"] if current else 31
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "EXEC dbo.usp_SaveMailSettings ?, ?, ?, ?, ?, ?",
+            setting_id, username, email, password_enc, smtp_host, smtp_port,
+        )
+        conn.commit()
     finally:
         conn.close()
 

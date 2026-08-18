@@ -83,7 +83,7 @@ def _normalize_date(value):
 
     # dd-Mon-yy  or  dd-Mon-yyyy
     match = re.match(
-        r"(\d{1,2})[-/ ]+([A-Za-z]{3,})[-/ ]+(\d{2,4})",
+        r"(\d{1,2})[-/. ]+([A-Za-z]{3,})[-/. ]+(\d{2,4})",
         value
     )
 
@@ -94,9 +94,9 @@ def _normalize_date(value):
             year = "20" + year
         return f"{int(day):02d}-{mon}-{year}"
 
-    # dd-mm-yyyy / dd/mm/yy
+    # dd-mm-yyyy / dd/mm/yy / dd.mm.yyyy
     match = re.match(
-        r"(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})",
+        r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})",
         value
     )
 
@@ -221,13 +221,176 @@ _CITY_STOPWORDS = {
 }
 
 
+# Reference gazetteer of Indian city/town/locality names, used to recognize
+# a city that's actually two (or three) words - e.g. "T Nagar", "Navi
+# Mumbai", "New Delhi", "Anna Nagar" - which the single-last-word fallback
+# below would otherwise cut down to just "Nagar"/"Mumbai"/"Delhi". Lowercase,
+# multi-word entries as space-joined phrases. Not exhaustive, but covers
+# every state/UT capital, the major metros/tier-2 cities, and the common
+# business-district localities of the largest metros (Chennai, Mumbai,
+# Bengaluru, Delhi NCR, Hyderabad, Pune) that GST invoices frequently cite
+# in place of the formal city name.
+_KNOWN_CITIES = {
+    # State / UT capitals & major metros
+    "delhi", "new delhi", "mumbai", "bengaluru", "bangalore", "chennai",
+    "kolkata", "hyderabad", "pune", "ahmedabad", "surat", "jaipur",
+    "lucknow", "kanpur", "nagpur", "indore", "thane", "bhopal",
+    "visakhapatnam", "vadodara", "ghaziabad", "ludhiana", "agra", "nashik",
+    "faridabad", "meerut", "rajkot", "kalyan", "vasai", "varanasi",
+    "srinagar", "aurangabad", "dhanbad", "amritsar", "navi mumbai",
+    "allahabad", "prayagraj", "ranchi", "howrah", "coimbatore", "jabalpur",
+    "gwalior", "vijayawada", "jodhpur", "madurai", "raipur", "kota",
+    "guwahati", "chandigarh", "solapur", "hubli", "dharwad",
+    "hubli-dharwad", "bareilly", "moradabad", "mysore", "mysuru",
+    "gurgaon", "gurugram", "aligarh", "jalandhar", "tiruchirappalli",
+    "trichy", "bhubaneswar", "salem", "warangal", "bhiwandi", "saharanpur",
+    "gorakhpur", "guntur", "bikaner", "amravati", "noida", "greater noida",
+    "jamshedpur", "bhilai", "cuttack", "firozabad", "kochi", "cochin",
+    "nellore", "bhavnagar", "dehradun", "durgapur", "asansol", "rourkela",
+    "nanded", "kolhapur", "ajmer", "akola", "gulbarga", "kalaburagi",
+    "jamnagar", "ujjain", "siliguri", "jhansi", "ulhasnagar", "jammu",
+    "sangli", "belgaum", "belagavi", "mangalore", "mangaluru",
+    "tirunelveli", "malegaon", "gaya", "jalgaon", "udaipur", "davanagere",
+    "kozhikode", "calicut", "kurnool", "rajahmundry", "bokaro", "bellary",
+    "ballari", "patiala", "agartala", "bhagalpur", "muzaffarnagar",
+    "latur", "dhule", "rohtak", "korba", "bhilwara", "berhampur",
+    "muzaffarpur", "ahmednagar", "mathura", "kollam", "avadi", "kadapa",
+    "sambalpur", "bilaspur", "shahjahanpur", "satara", "bijapur",
+    "vijayapura", "rampur", "shivamogga", "shimoga", "chandrapur",
+    "junagadh", "thrissur", "alwar", "bardhaman", "burdwan", "nizamabad",
+    "parbhani", "tumkur", "tumakuru", "khammam", "panipat", "darbhanga",
+    "aizawl", "dewas", "karnal", "bathinda", "jalna", "eluru", "barabanki",
+    "purnia", "satna", "mau", "sonipat", "farrukhabad", "sagar", "durg",
+    "imphal", "ratlam", "hapur", "arrah", "anantapur", "karimnagar",
+    "etawah", "ambernath", "bharatpur", "begusarai", "gandhidham",
+    "puducherry", "pondicherry", "sikar", "thoothukudi", "tuticorin",
+    "rewa", "mirzapur", "raichur", "pali", "ramagundam", "haridwar",
+    "vizianagaram", "tenali", "nagercoil", "sri ganganagar", "thanjavur",
+    "bulandshahr", "katni", "sambhal", "singrauli", "nadiad", "secunderabad",
+    "yamunanagar", "bidhannagar", "pallavaram", "bidar", "munger",
+    "panchkula", "burhanpur", "kharagpur", "dindigul", "gandhinagar",
+    "hospet", "hosapete", "ambattur", "vellore", "machilipatnam", "shimla",
+    "udupi", "katihar", "mahbubnagar", "saharsa", "dibrugarh", "jorhat",
+    "hazaribagh", "bhimavaram", "guntakal", "panvel", "deoghar", "ongole",
+    "nandyal", "morena", "bhiwani", "porbandar", "palakkad", "anand",
+    "purulia", "baharampur", "barmer", "morvi", "morbi", "orai", "bahraich",
+    "sirsa", "danapur", "serampore", "guna", "jaunpur", "shivpuri",
+    "surendranagar", "unnao", "chittoor", "lakhimpur", "hindupur",
+    "bharuch", "arakkonam", "chittorgarh", "ratnagiri", "nagaon",
+    "cuddalore", "erode", "kanchipuram", "tirupati", "karaikudi",
+    "neyveli", "rajapalayam", "sivakasi", "namakkal", "krishnagiri",
+    "hosur", "pollachi", "nagapattinam", "virudhunagar", "ariyalur",
+    "perambalur", "villupuram",
+    # Chennai localities/areas commonly cited in place of "Chennai" itself
+    "t nagar", "anna nagar", "adyar", "guindy", "velachery", "porur",
+    "tambaram", "west tambaram", "east tambaram", "chromepet", "egmore",
+    "mylapore", "nungambakkam", "perambur", "kilpauk", "vadapalani",
+    "saidapet", "triplicane", "royapettah", "alwarpet", "nandanam",
+    "teynampet", "ashok nagar", "kk nagar", "kodambakkam", "choolaimedu",
+    "aminjikarai", "purasawalkam", "villivakkam", "selaiyur", "medavakkam",
+    "sholinganallur", "thoraipakkam", "perungudi", "navalur", "siruseri",
+    "padi", "korattur", "mogappair", "west mambalam", "mambalam",
+    "poonamallee", "redhills", "madhavaram", "manali", "ennore",
+    "royapuram", "washermanpet", "tondiarpet", "chetpet", "vepery",
+    "santhome", "besant nagar", "thiruvanmiyur", "kolathur",
+    # Mumbai localities
+    "andheri", "bandra", "borivali", "dadar", "malad", "goregaon",
+    "kandivali", "vile parle", "juhu", "powai", "chembur", "ghatkopar",
+    "kurla", "worli", "colaba", "lower parel", "vikhroli", "mulund",
+    "bhandup", "vashi", "nerul", "kharghar", "airoli", "belapur",
+    "mira road", "virar", "nalasopara", "dombivli",
+    # Bengaluru localities
+    "whitefield", "koramangala", "indiranagar", "jayanagar",
+    "malleshwaram", "rajajinagar", "hsr layout", "btm layout",
+    "electronic city", "marathahalli", "yelahanka", "hebbal",
+    "banashankari", "jp nagar", "basavanagudi", "peenya",
+    # Delhi NCR localities
+    "dwarka", "rohini", "pitampura", "karol bagh", "lajpat nagar",
+    "saket", "vasant kunj", "janakpuri", "rajouri garden",
+    "connaught place", "chandni chowk", "mayur vihar", "preet vihar",
+    "laxmi nagar", "okhla", "nehru place", "greater kailash", "hauz khas",
+    "model town", "shalimar bagh",
+    # Hyderabad localities
+    "gachibowli", "madhapur", "kukatpally", "ameerpet", "begumpet",
+    "banjara hills", "jubilee hills", "uppal", "lb nagar", "miyapur",
+    "kondapur",
+    # Pune localities
+    "hinjewadi", "kothrud", "baner", "wakad", "aundh", "hadapsar",
+    "viman nagar", "kharadi", "pimpri", "chinchwad", "wagholi", "katraj",
+}
+# Longest phrase (in words) present in the gazetteer, so the matcher below
+# knows how wide a window to try first.
+_KNOWN_CITY_MAX_WORDS = max(len(c.split()) for c in _KNOWN_CITIES)
+
+
+def _match_known_city(tokens):
+    """Look for the longest gazetteer entry ending at the tail of `tokens`,
+    trying wider windows first so a two-word city/locality ('T Nagar',
+    'Navi Mumbai') is preferred over the single trailing word it contains."""
+    n = len(tokens)
+    for width in range(min(_KNOWN_CITY_MAX_WORDS, n), 0, -1):
+        chunk = [t.strip(".:-–() ") for t in tokens[n - width:]]
+        if not all(re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", c) for c in chunk):
+            continue
+        phrase = " ".join(c.rstrip(".") for c in chunk).lower()
+        if phrase in _KNOWN_CITIES:
+            return " ".join(w.capitalize() for w in phrase.split())
+    return ""
+
+
+def _any_known_city(tokens):
+    """Like _match_known_city, but tries every possible end position, not
+    just the very tail - a fallback for when trailing non-address junk
+    after the real city (no genuine PIN to cut at) defeats the tail
+    anchor, e.g. '... New Delhi Pin' with a literal word instead of a
+    real PIN. Walks end positions right to left, widest-first at each, so
+    a later, longer match ('New Delhi') is always preferred over an
+    earlier or shorter one ('Nehru Place', or bare 'Delhi') - the same
+    right-anchored preference _match_known_city has, just not limited to
+    only the true last token."""
+    n = len(tokens)
+    for end in range(n, 0, -1):
+        for width in range(min(_KNOWN_CITY_MAX_WORDS, end), 0, -1):
+            chunk = [t.strip(".:-–() ") for t in tokens[end - width:end]]
+            if not all(re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", c) for c in chunk):
+                continue
+            phrase = " ".join(c.rstrip(".") for c in chunk).lower()
+            if phrase in _KNOWN_CITIES:
+                return " ".join(w.capitalize() for w in phrase.split())
+    return ""
+
+
+def _first_city_pos(line):
+    """Character position where a known city/locality name (the same
+    gazetteer _city() matches against) begins in `line`, or -1 if none
+    found. Everything from that point on - the city itself, state, PIN,
+    any contact info trailing it - belongs in the dedicated City/Pincode
+    columns, not Address 2, so callers cut the line there."""
+    tokens = list(re.finditer(r"[A-Za-z][A-Za-z.'-]*", line))
+    n = len(tokens)
+    for i in range(n):
+        for width in range(min(_KNOWN_CITY_MAX_WORDS, n - i), 0, -1):
+            # A trailing "-" glued onto the token itself ("CHENNAI-600002"
+            # split on the digit run leaves "CHENNAI-") must not survive
+            # into the lookup, or it'll never match the plain gazetteer key.
+            phrase = " ".join(
+                t.group().rstrip(".-").lower() for t in tokens[i:i + width]
+            )
+            if phrase in _KNOWN_CITIES:
+                return tokens[i].start()
+    return -1
+
+
 def _city(address, state_name=""):
-    """Best-effort city from an address. The city is usually the last plain
-    alphabetic word sitting just before the PIN code ('... Chennai - 600 017',
-    '... CHENNAI 600 017'); everything after the PIN (India / phone / Ext) is
-    ignored. Falls back to the last alphabetic word when no PIN is present
-    ('22 HABIBULLAH ROAD T.NAGAR CHENNAI'), skipping punctuation, phone/ext
-    tokens and state-name words ('... CHENNAI, TAMIL MADU -')."""
+    """Best-effort city from an address. Tries the known-city gazetteer
+    first (so multi-word cities/localities like 'T Nagar' or 'Navi Mumbai'
+    come back whole), then falls back to a single-word heuristic: the last
+    plain alphabetic word sitting just before the PIN code ('... Chennai -
+    600 017', '... CHENNAI 600 017'); everything after the PIN (India /
+    phone / Ext) is ignored. Falls back to the last alphabetic word when no
+    PIN is present ('22 HABIBULLAH ROAD T.NAGAR CHENNAI'), skipping
+    punctuation, phone/ext tokens and state-name words ('... CHENNAI, TAMIL
+    MADU -')."""
     if not address:
         return ""
     stop = set(_CITY_STOPWORDS)
@@ -248,7 +411,24 @@ def _city(address, state_name=""):
         ):
             cut = i
             break
+        # City and PIN glued with no space at all ("CHENNAI-600008",
+        # "MUMBAI-400703") - .strip() above can't separate them since the
+        # digits aren't at a token edge. Keep the alpha prefix (the city)
+        # so it's still available to match below, but cut right after it.
+        glued = re.match(r"^([A-Za-z][A-Za-z.'-]*?)-?(\d{6})$", t0)
+        if glued:
+            tokens[i] = glued.group(1)
+            cut = i + 1
+            break
     search = tokens[:cut] or tokens
+    # Drop stray punctuation-only tokens (a lone "-" separator left behind
+    # once the PIN itself is cut off) so they don't block a match at the
+    # tail - e.g. "... T Nagar - 600017" must search from "Nagar", not "-".
+    search = [t for t in search if re.search(r"[A-Za-z0-9]", t)]
+
+    known = _match_known_city(search) or _any_known_city(search)
+    if known:
+        return known
 
     for tok in reversed(search):
         cleaned = tok.strip(".:-–() ")
@@ -263,18 +443,94 @@ def _city(address, state_name=""):
     return ""
 
 
+# A line that's actually contact info (phone/GST/email/website) or a
+# landmark/intercom note rather than part of the postal address itself -
+# GST invoice address blocks frequently run a "Mobile: ...", "GSTIN: ...",
+# "Near <landmark>", "Intercom-<no>" bit right after the real street
+# address, which _address_lines() used to glue straight into Address 2,
+# inflating it well past BC's field length and mixing non-address data in.
+_CONTACT_LINE_RE = re.compile(
+    r"@"                                                   # email
+    r"|\bwww\.|https?://"                                  # website
+    r"|\bgstin\b|\bgst\s*no\.?"                             # GST label
+    r"|\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]Z[A-Z\d]\b"        # GSTIN itself
+    r"|\b(?:ph|phone|mobile|mob|contact|tel|fax)\b\.?\s*:?" # phone label
+    r"|\budyam\b"                                           # Udyam label
+    r"|\budyam-[a-z]{2}-\d{2}-\d{7}\b"                      # Udyam reg. no.
+    r"|\bnear\b"                                            # landmark ("Near Casino Theatre")
+    r"|\bintercom\b"                                        # intercom number
+    r"|\bdays\b"                                            # payment-terms fragment ("... 30 Days Credit")
+    r"|\biso\s*certified\b|\biso\s*9001\b"                  # ISO certification boilerplate
+    r"|\b\d[\d\-]{7,13}\d\b",                               # bare phone number, labelled or not
+    re.IGNORECASE,
+)
+
+
+def _strip_contact(line):
+    """Cut a line at the first phone/GST/email/website/Udyam/landmark/
+    intercom marker OR the start of a recognized city/locality name,
+    whichever comes first - the City/Pincode columns already carry that
+    information, so Address 2 shouldn't repeat city/state/PIN or whatever
+    trails them ('...Nehru Place New Delhi-110019 ISO Certified -
+    9001:2015 Days' keeps only 'Nehru Place'). Returns "" if the cut point
+    is at (or before) the first real character, i.e. the line is nothing
+    but that noise start to finish."""
+    contact_cut = -1
+    m = _CONTACT_LINE_RE.search(line)
+    if m:
+        contact_cut = m.start()
+        # If the marker starts mid-word (the "@" inside "admin@x.com"),
+        # back up to the start of that word so a stray fragment ("admin")
+        # isn't left dangling in the kept prefix. Any of the usual
+        # separators counts as a word boundary, not just a space - real
+        # addresses are as often comma-separated ("...400001,UDYAM...")
+        # as space-separated.
+        if contact_cut > 0 and not line[contact_cut - 1] in " ,.-":
+            wb = max(line.rfind(c, 0, contact_cut) for c in " ,.-")
+            contact_cut = wb + 1 if wb != -1 else 0
+
+    # _first_city_pos already returns the start of a clean token (the regex
+    # it scans with requires a letter first), so it never needs the same
+    # backing-up treatment.
+    city_cut = _first_city_pos(line)
+
+    positions = [p for p in (contact_cut, city_cut) if p != -1]
+    if not positions:
+        return line
+    return line[:min(positions)].strip(" ,.-")
+
+
+def _cap(text, limit=50):
+    """Hard-cap a string to `limit` characters - Business Central's
+    Address/Address 2 fields are Text50, so a value any longer gets
+    rejected or silently truncated downstream regardless. This is a
+    safety net after the noise-stripping above (which already removes
+    most of what pushes a line past 50), not a substitute for it. Breaks
+    at the last space inside the limit when there is one, so a long line
+    isn't cut mid-word."""
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    return (text[:cut] if cut > 0 else text[:limit]).rstrip(" ,.-")
+
+
 def _address_lines(address):
-    """Split a possibly multi-line address into (line1, line2)."""
+    """Split a possibly multi-line address into (line1, line2), trimming
+    away any phone/GST/email/website/Udyam contact info found on a line
+    rather than an actual address line, and capping each to BC's 50-char
+    Address/Address 2 field limit."""
 
     if not address:
         return "", ""
 
-    lines = [ln.strip() for ln in address.split("\n") if ln.strip()]
+    raw_lines = [ln.strip() for ln in address.split("\n") if ln.strip()]
+    lines = [s for s in (_strip_contact(ln) for ln in raw_lines) if s]
 
     line1 = lines[0] if lines else ""
     line2 = " ".join(lines[1:]) if len(lines) > 1 else ""
 
-    return line1, line2
+    return _cap(line1), _cap(line2)
 
 
 def _num(value):
@@ -328,6 +584,35 @@ def _rate_near(text, keyword):
     return None
 
 
+# A page-footer note bleeding into the last item's description because the
+# table continues past a page break ("...LENOVO continued to page number 2
+# This is a Computer Generated Invoice") - generic boilerplate seen across
+# vendors, not any one template's quirk.
+_ITEM_FOOTER_RE = re.compile(
+    r"continued\s+to\s+page\s*(?:no\.?|number)?\s*\d+"
+    r"|this\s+is\s+an?\s+computer[\s-]*generated\s+invoice",
+    re.IGNORECASE,
+)
+
+
+def _clean_item_description(desc, serial):
+    """Strip OCR noise from an item's own description: a leading echo of
+    this row's serial number ('1. ', '2 ') - matched against the row's
+    actual SI so a genuine leading measurement ('18.5" TFT...') is never
+    mistaken for one - a trailing GST rate ('...ROLLER 18%', already
+    captured as its own field before this runs), and page-footer
+    boilerplate that bled in across a page break."""
+    desc = str(desc or "").strip()
+    if not desc:
+        return desc
+    desc = re.sub(rf"^{re.escape(str(serial))}\.?\s+", "", desc)
+    m = _ITEM_FOOTER_RE.search(desc)
+    if m:
+        desc = desc[:m.start()]
+    desc = re.sub(r"\s*\d{1,2}(?:\.\d+)?\s*%\s*$", "", desc)
+    return desc.strip(" ,.-")
+
+
 def _gst_rate_from_text(text):
     """
     Best-effort GST rate (%) read straight from the OCR text.
@@ -352,6 +637,14 @@ def _gst_rate_from_text(text):
         return cgst or sgst
 
     return _rate_near(text, "gst")
+
+
+# A right-scan for Invoice No. can occasionally run past its own value into
+# a date sitting further along the same OCR row with no label in between to
+# stop at (e.g. "Invioce No: 1413    03.08.2026", where the trailing date
+# belongs to a different column entirely) - strip a trailing date pattern
+# rather than keeping it glued onto the number.
+_TRAILING_DATE_RE = re.compile(r"\s+\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*$")
 
 
 # ---------------------------------------------------------------------------
@@ -471,14 +764,37 @@ def build_invoice_json(result, pdf_path=""):
 
         qty_n = _num(it.get("Quantity"))
         amt_n = _num(it.get("Amount"))
-        desc = it.get("Description", "")
+        raw_desc = it.get("Description", "")
         is_charge = bool(it.get("charge"))
+
+        # The invoice-level rate covers layouts with a proper tax-summary
+        # table or a general "IGST/CGST+SGST NN%" line in the OCR text. Some
+        # layouts instead print the rate trailing the item's own description
+        # ("... PICKUP ROLLER 18%") with nothing recognisable elsewhere on
+        # the page - fall back to that per item when the invoice-level rate
+        # came back blank, rather than leaving GST % empty. Reads the raw
+        # description (before _clean_item_description below strips that
+        # same "18%" out as noise).
+        item_rate = rate if rate else _rate_near(raw_desc, "")
+        # (keyword="" matches every line - the description is what we're
+        # scanning here, not a labelled tax-summary line.)
+
+        desc = _clean_item_description(raw_desc, serial)
 
         items.append({
             "sl_no": serial,
             "Description": desc,
             "hsn": it.get("HSN") or "",
-            "rate": _money(it.get("Rate")),
+            # Unit price: use whatever OCR read from the table's own Rate
+            # column, or - when that column wasn't recognised/positioned
+            # cleanly - derive it from Amount / Quantity. Amount = Rate x
+            # Quantity always holds for a line item, so this is an exact
+            # recovery, not a guess.
+            "rate": _money(it.get("Rate")) or (
+                _money(amt_n / qty_n)
+                if amt_n is not None and qty_n
+                else ""
+            ),
             "Unit": "",
             "discount": "",
             "amount": _money(it.get("Amount")),
@@ -490,9 +806,9 @@ def build_invoice_json(result, pdf_path=""):
             "Quantity": qty_n if qty_n is not None else "",
             "Amount": amt_n if amt_n is not None else "",
             "GST_Base_Amount": amt_n if amt_n is not None else "",
-            "TaxPercentage": rate if rate else "",
+            "TaxPercentage": item_rate if item_rate else "",
             "HSN_Percentage_Description": (
-                f"Goods {rate:g}%" if rate else ""
+                f"Goods {item_rate:g}%" if item_rate else ""
             ),
             "PartSpecification": desc,
             # Seed from the PDF's own table HSN/SAC column so it's used
@@ -523,7 +839,7 @@ def build_invoice_json(result, pdf_path=""):
     # ---- assembled schema ------------------------------------------------
 
     data = {
-        "invoice_no": fields.get("Invoice No.", ""),
+        "invoice_no": _TRAILING_DATE_RE.sub("", fields.get("Invoice No.", "") or "").strip(),
         "invoice_date": _normalize_date(fields.get("Dated", "")),
         "buyer_name": buyer_name_v,
         "buyer_gstin": buyer_gstin_v,

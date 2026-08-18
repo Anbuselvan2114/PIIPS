@@ -1,16 +1,16 @@
 {
-  "name": "Precision Intelligence Invoice Processing Suite",
+  "name": "PIIPS - Precision Intelligence Invoice Processing Suite",
   "short_name": "PIIPS",
-  "description": "Extract invoice data from PDFs and export to Excel / SQL.",
+  "description": "OCR-driven invoice processing, review and export for Business Central purchase documents.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#0f172a",
+  "background_color": "#f1f5f9",
   "theme_color": "#0e7490",
   "icons": [
-    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
-    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
     { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }

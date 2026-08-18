@@ -41,6 +41,39 @@ _LOOSE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Prefix + a clean date + trailing hyphen, serial not required here - used
+# to re-anchor when the serial doesn't immediately follow the hyphen (see
+# _serial_after below).
+_ANCHOR_RE = re.compile(
+    _PREFIX + r"\s*/\s*\d{4}\s*/\s*\d{2}\s*/\s*\d{2}\s*-",
+    re.IGNORECASE,
+)
+
+
+def _serial_after(text, pos):
+    """A 4-6 digit serial starting right at `pos` (only whitespace before
+    it), or - when a facing column's own text sits there instead - the
+    last 4-6 digit run on the very next physical line.
+
+    A two-column page (seller block | "Reference No. & Date." box) gets
+    flattened into one row of plain text per physical row, so the row
+    that starts "SPRPUR/2026/08/03-" often ends there, and the row below
+    it interleaves the OTHER column's own text ahead of the real serial:
+    "GSTIN:29LLZPS1935B1ZA                    85734" - naive whitespace-
+    only bridging stops at "GSTIN", this looks past it instead.
+    """
+    tail = text[pos:]
+    same_line = tail.split("\n", 1)[0]
+    m = re.match(r"\s*(\d{4,6})\b", same_line)
+    if m:
+        return m.group(1)
+    parts = tail.split("\n", 2)
+    if len(parts) >= 2:
+        digits = re.findall(r"\d{4,6}", parts[1])
+        if digits:
+            return digits[-1]
+    return None
+
 
 def _normalise(token):
     """Strip internal whitespace and upper-case a matched PO token.
@@ -86,6 +119,18 @@ def find_buyer_order_no(text):
     m = _STRICT_RE.search(text)
     if m:
         return _normalise(m.group(0)), "confident"
+
+    # The strict/loose forms above both assume the serial sits right after
+    # the hyphen with only whitespace between - a two-column page can
+    # interleave the facing column's own text there instead once OCR
+    # flattens rows into plain text. The prefix+date+hyphen is unambiguous
+    # on its own, so anchor on just that and look separately for the
+    # serial (same line, or the last digit run on the next physical line).
+    am = _ANCHOR_RE.search(text)
+    if am:
+        serial = _serial_after(text, am.end())
+        if serial:
+            return _normalise(am.group(0) + serial), "confident"
 
     # Skeleton match with garbled groups -> doubtful (needs human confirmation).
     m = _LOOSE_RE.search(text)

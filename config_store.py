@@ -236,7 +236,11 @@ def folders(create=True):
 
 # Reserved subfolders under the Folder Path that are NOT invoice-status folders
 # and must never be searched/overwritten when relocating a processed PDF.
-_RESERVED_SUBDIRS = {"Input", "New_Format", "Output", "Trained_format"}
+_RESERVED_SUBDIRS = {"Input", "New_Format", "Output", "Trained_format", "ALL_INVOICES"}
+
+# Renamed archive copies of every Posted/Completed invoice live here -
+# see copy_pdf_to_all_invoices().
+ALL_INVOICES_DIR = "ALL_INVOICES"
 
 
 def _safe_folder(name):
@@ -266,12 +270,13 @@ def ensure_status_folders(status_names):
 
 def find_pdf(filename):
     """Locate a PDF/image by name anywhere under the Folder Path (Input or any
-    status folder), skipping Output/New_Format/Trained_format. '' if missing."""
+    status folder), skipping Output/New_Format/Trained_format/ALL_INVOICES.
+    '' if missing."""
     base = (load_config().get("folder_path") or "").strip()
     if not base or not filename:
         return ""
     filename = os.path.basename(filename)
-    skip = {"New_Format", "Output", "Trained_format"}
+    skip = {"New_Format", "Output", "Trained_format", ALL_INVOICES_DIR}
     for root, dirs, files in os.walk(base):
         if root == base:
             dirs[:] = [d for d in dirs if d not in skip]
@@ -298,7 +303,7 @@ def move_pdf_to_status(filename, status_name, src_path=None):
 
     src = src_path if (src_path and os.path.isfile(src_path)) else None
     if not src:
-        skip = {"New_Format", "Output", "Trained_format"}
+        skip = {"New_Format", "Output", "Trained_format", ALL_INVOICES_DIR}
         for root, dirs, files in os.walk(base):
             if root == base:  # don't descend into extraction/training folders
                 dirs[:] = [d for d in dirs if d not in skip]
@@ -317,6 +322,28 @@ def move_pdf_to_status(filename, status_name, src_path=None):
         if os.path.exists(dest):
             os.remove(dest)
         shutil.move(src, dest)
+    except OSError:
+        return ""
+    return dest
+
+
+def copy_pdf_to_all_invoices(src_path, dest_filename):
+    """Copy a Posted/Completed invoice's PDF into <Folder Path>/ALL_INVOICES
+    under a new name (invoice no + vendor name), leaving the original where
+    it is. Returns the destination path, or "" if the copy didn't happen.
+    Sample: copy_pdf_to_all_invoices(r"D:\\PIIPS\\Posted\\inv1.pdf", "INV-102_Acme Corp.pdf")
+    """
+    base = (load_config().get("folder_path") or "").strip()
+    if not base or not src_path or not dest_filename or not os.path.isfile(src_path):
+        return ""
+    target = os.path.join(base, ALL_INVOICES_DIR)
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError:
+        return ""
+    dest = os.path.join(target, dest_filename)
+    try:
+        shutil.copy2(src_path, dest)
     except OSError:
         return ""
     return dest

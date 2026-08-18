@@ -172,6 +172,32 @@ def _cell_value(inv, item, sheet, smap, col):
     return static.get(col, "")
 
 
+# A freight/courier/forwarding line has no Navision item master entry of
+# its own (see ocr_engine.py's "charge": True lines) - BC books it as a
+# fixed service line instead. Only applies to PART invoices; SERVICE
+# invoices have no per-line GST Group at all.
+_FREIGHT_NO = "FRIEGHT IN"
+
+
+def _freight_line_override(sheet, col, inv, item):
+    """Forced Purchase Line values for a freight/charge item on a PART
+    invoice, or None if this row/column isn't one."""
+    if sheet != "Purchase Line" or not (item or {}).get("_charge"):
+        return None
+    if (inv.get("_invoice_type") or "").strip().upper() != "PART":
+        return None
+
+    if col == "No.":
+        return _FREIGHT_NO
+    if col == "GST Group Type":
+        return "Service"
+    if col == "GST Group Code":
+        rate = item.get("TaxPercentage")
+        rate_str = f"{rate:g}%" if isinstance(rate, (int, float)) and rate else ""
+        return f"Service {rate_str}".strip() if rate_str else "Service"
+    return None
+
+
 def _link_override(sheet, col, inv, item):
     """
     Enforce the cross-sheet relationship keys (BC join chain):
@@ -209,6 +235,9 @@ def _link_override(sheet, col, inv, item):
             return doc_no
         if col == "Line No.":
             return line_no
+        freight = _freight_line_override(sheet, col, inv, item)
+        if freight is not None:
+            return freight
     elif sheet == "Reservation Entry":
         if col == "Source Type":
             return PURCHASE_LINE_SOURCE_TYPE
@@ -328,7 +357,7 @@ def build_rows_grouped(invoices, mapping=None):
 # deliberately NOT in these lists: they're saved blank on purpose (see
 # database.save_grouped) and only become real once the invoice is marked
 # Loaded — an invoice otherwise ready must not be downgraded to
-# INCOMPLETE DATA just because that future value isn't set yet.
+# DATA MISMATCH just because that future value isn't set yet.
 REQUIRED_HEADER_FIELDS = [
     "Pay-to Name", "Pay-to Address", "Ship-to Name", "Ship-to Address",
     "Posting Date", "Payment Terms Code", "Due Date", "Location Code",

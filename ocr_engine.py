@@ -100,6 +100,10 @@ def _looks_like_photo_page(image):
 # Indian GSTIN: 2-digit state code + 10-char PAN + entity/check chars (15 total).
 _GSTIN_RE = re.compile(r"\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]{2}")
 
+# A physical-dimension spec with no unit word of its own (e.g. `18.5"` for a
+# monitor's screen size) - digits then a bare inch/feet mark, nothing else.
+_SIZE_SPEC_RE = re.compile(r'^\d+(\.\d+)?["\']$')
+
 
 def _norm_gstin(value):
     """Uppercase, alphanumerics only — for comparing GSTIN values."""
@@ -1001,9 +1005,13 @@ class OCREngine:
 
         page_inputs = self._page_inputs(pdf_path)
 
-        # Reject handheld-photo pages before spending OCR time on them. Only
-        # rasterised pages are relevant (image is not None) — a page with a
-        # born-digital text layer (image=None) never came from a camera.
+        # This version only processes born-digital PDFs (a real embedded
+        # text layer). A page with no text layer (image is not None) had to
+        # be rasterised for OCR, which means the source is a scan or a
+        # photocopy (or a handheld photo) rather than an original digital
+        # document — reject the whole file rather than OCR-extracting from
+        # it, so it gets moved to UNSUPPORTED upstream instead of silently
+        # producing lower-confidence data.
         rasterised = [image for _boxes, image in page_inputs if image is not None]
         if rasterised:
             photo_count = sum(1 for image in rasterised if _looks_like_photo_page(image))
@@ -1013,6 +1021,10 @@ class OCREngine:
                     "(uneven lighting/background or non-paper aspect ratio) — "
                     "unsupported."
                 )
+            raise ValueError(
+                "Document is a scanned or photocopied PDF, not an original "
+                "born-digital PDF (no embedded text layer) — unsupported."
+            )
 
         result = {
 
@@ -2245,9 +2257,10 @@ class OCREngine:
 
 
         def is_hsn(value):
-
+            # GST HSN codes are validly 4, 6 or 8 digits depending on the
+            # supplier's turnover slab — not always the full 6-8 digit form.
             return re.match(
-                r"^\d{6,10}$",
+                r"^\d{4,10}$",
                 value.strip()
             ) is not None
 
@@ -2280,6 +2293,27 @@ class OCREngine:
                 "each",
                 "ea"
             ]
+
+        def descriptive_text(wds):
+            """Real description words from a row: unit words (No./Nos/
+            Pcs/...) are always noise, and a number is noise ONLY when it
+            sits under the Quantity/Rate/Amount column - a genuine spec
+            number that happens to be part of the description (e.g. "90"
+            in "90 Days Warranty") is printed in the Description column's
+            own territory and must survive, while a Quantity/Rate/Amount
+            figure that leaked onto this row (already harvested above)
+            should not be echoed into the text too."""
+            out = []
+            for w in wds:
+                t = w["text"].strip()
+                if is_unit(t):
+                    continue
+                if is_number(t) and value_cols:
+                    col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
+                    if col in ("Quantity", "Rate", "Amount"):
+                        continue
+                out.append(t)
+            return " ".join(out).strip()
 
 
 
@@ -2562,6 +2596,22 @@ class OCREngine:
                         )
 
 
+                        # A 4+ digit token whose nearest column is Quantity
+                        # is almost never a genuine quantity (real order
+                        # quantities run 1-3 digits) - it's an HSN/SAC code
+                        # that landed a few pixels closer to the Quantity
+                        # header than its own, likely because the data row's
+                        # column boundary drifted slightly from the header
+                        # row's. Reroute it before the distance tie-break
+                        # locks it into the wrong column.
+                        if (
+                            col == "Quantity"
+                            and "HSN" in value_cols
+                            and re.match(r"^\d{4,10}[A-Za-z]?$", txt)
+                        ):
+                            col = "HSN"
+
+
                         # HSN / SAC code (4, 6 or 8 digits, optional letter)
                         if col == "HSN" and re.match(
                             r"^\d{4,10}[A-Za-z]?$",
@@ -2681,7 +2731,17 @@ class OCREngine:
                 # Charge line / description continuation
                 # ----------------------------------
 
-                has_text = any(c.isalpha() for c in row_text)
+                # A bare physical-dimension spec ("18.5\"") has no letters
+                # either, so it fails the isalpha() check below same as a
+                # leaked tax/summary number does - but its trailing inch
+                # mark makes it unambiguous (a plain number or a percent
+                # figure like "18%" never has one), so it can safely count
+                # as real content without reopening the regression a
+                # broader "any non-numeric token" rule caused earlier.
+                has_text = (
+                    any(c.isalpha() for c in row_text)
+                    or any(_SIZE_SPEC_RE.match(w["text"].strip()) for w in words)
+                )
 
                 EXCLUDE_KW = ("output", "igst", "cgst", "sgst", "tax amount",
                               "total", "round off", "round-off", "roundoff",
@@ -2740,13 +2800,40 @@ class OCREngine:
                 if (current_item and has_text
                         and not any(k in lower for k in EXCLUDE_KW)
                         and not any(k in lower for k in CHARGE_KW)):
-                    current_item["Description"] += " " + row_text
+                    # A scanned/garbled image can split one logical item
+                    # row across several OCR rows, with the Quantity/Rate/
+                    # Amount figures landing on a row that has no
+                    # recognisable serial of its own and so falls through
+                    # to here as plain description continuation. Recover
+                    # any of those columns this item is still missing
+                    # before appending the row as description text -
+                    # only a token tight against a value column's own
+                    # x-position qualifies, so a part number or size that
+                    # happens to be numeric but sits elsewhere on the row
+                    # isn't mistaken for it.
+                    if value_cols:
+                        for w in words:
+                            t = w["text"].strip()
+                            if not is_number(t):
+                                continue
+                            col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
+                            if (
+                                col in ("Quantity", "Rate", "Amount")
+                                and current_item.get(col) is None
+                                and abs(w["x"] - value_cols[col]) < 150
+                            ):
+                                current_item[col] = clean_number(t)
+                    content = descriptive_text(words)
+                    if content:
+                        current_item["Description"] += " " + content
                 elif (current_item is None and has_text
                         and not any(k in lower for k in EXCLUDE_KW)
                         and not any(k in lower for k in CHARGE_KW)):
-                    pending_lead_in = (
-                        pending_lead_in + " " + row_text
-                    ).strip() if pending_lead_in else row_text
+                    content = descriptive_text(words)
+                    if content:
+                        pending_lead_in = (
+                            pending_lead_in + " " + content
+                        ).strip() if pending_lead_in else content
 
 
 
@@ -2903,7 +2990,7 @@ class OCREngine:
             elif "qty" in txt or "quantity" in txt:
                 columns["Quantity"] = x
 
-            elif txt == "rate" or "price" in txt:
+            elif "rate" in txt or "price" in txt:
                 columns["Rate"] = x
 
             elif txt == "per":

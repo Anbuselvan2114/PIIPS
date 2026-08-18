@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
 import { getDbConfig, saveDbConfig } from "./api";
+import { PasswordInput } from "./components";
+
+// Fields stacked vertically instead of the shared ".row"'s default
+// side-by-side layout.
+const stackStyle = { flexDirection: "column", alignItems: "stretch", maxWidth: 420, gap: 14 };
 
 export default function DatabaseConfig({ user }) {
   const [server, setServer] = useState("");
@@ -67,13 +72,13 @@ export default function DatabaseConfig({ user }) {
           whole application — an unreachable database will lock everyone out.
         </p>
 
-        <div className="row">
-          <div className="field" style={{ flex: 1, minWidth: 220 }}>
+        <div className="row" style={stackStyle}>
+          <div className="field">
             <label className="label">Server</label>
             <input value={server} onChange={(e) => setServer(e.target.value)}
                    placeholder="10.0.1.213  or  SERVER\\SQLEXPRESS" />
           </div>
-          <div className="field" style={{ flex: 1, minWidth: 200 }}>
+          <div className="field">
             <label className="label">Database</label>
             <input value={database} onChange={(e) => setDatabase(e.target.value)}
                    placeholder="PIIPS" />
@@ -97,17 +102,17 @@ export default function DatabaseConfig({ user }) {
         </div>
 
         {sqlAuth && (
-          <div className="row">
-            <div className="field" style={{ flex: 1, minWidth: 200 }}>
+          <div className="row" style={stackStyle}>
+            <div className="field">
               <label className="label">Username</label>
               <input value={username} onChange={(e) => setUsername(e.target.value)}
                      placeholder="sa" autoComplete="off" />
             </div>
-            <div className="field" style={{ flex: 1, minWidth: 200 }}>
+            <div className="field">
               <label className="label">Password</label>
-              <input type="password" value={password} autoComplete="new-password"
-                     onChange={(e) => setPassword(e.target.value)}
-                     placeholder={passwordSet ? "•••••• (unchanged)" : "password"} />
+              <PasswordInput value={password} autoComplete="new-password"
+                             onChange={(e) => setPassword(e.target.value)}
+                             placeholder={passwordSet ? "•••••• (unchanged)" : "password"} />
               {passwordSet && (
                 <div className="hint" style={{ marginTop: 4 }}>
                   Leave blank to keep the current password.

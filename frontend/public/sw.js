@@ -1,52 +1,48 @@
-/* PIIPS service worker */
-const CACHE = "piips-cache-v2";
-const APP_SHELL = [
-  "/", "/index.html", "/manifest.webmanifest",
-  "/icon-192.png", "/icon-512.png",
-];
+// PIIPS service worker: caches the static app shell so it installs and
+// loads offline. Never caches API calls (/api/*) - invoice/job data must
+// always come from the network, since a stale cached response here could
+// show a wrong dashboard state or silently drop a change.
 
-self.addEventListener("install", (e) => {
-  e.waitUntil(
-    caches.open(CACHE).then((c) => c.addAll(APP_SHELL)).then(() => self.skipWaiting())
+const CACHE = "piips-shell-v1";
+const SHELL = ["/", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png", "/icon-maskable-512.png"];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting())
   );
 });
 
-self.addEventListener("activate", (e) => {
-  e.waitUntil(
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
     caches.keys()
       .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
 
-self.addEventListener("fetch", (e) => {
-  const req = e.request;
-  const url = new URL(req.url);
+self.addEventListener("fetch", (event) => {
+  const { request } = event;
+  if (request.method !== "GET") return;
 
-  // only handle same-origin GETs; never cache the API
-  if (req.method !== "GET" || url.origin !== location.origin) return;
-  if (url.pathname.startsWith("/api/")) return;
+  const url = new URL(request.url);
+  if (url.pathname.startsWith("/api/")) return; // always network, never cached
 
-  // pages: always a genuine network hit, never the browser's HTTP cache -
-  // a stale index.html means every new deploy points nowhere useful, since
-  // it references the previous build's content-hashed JS/CSS filenames.
-  // Falls back to the cached shell only when the network is truly down.
-  if (req.mode === "navigate") {
-    e.respondWith(
-      fetch(req, { cache: "no-store" }).catch(() => caches.match("/index.html"))
-    );
-    return;
-  }
-
-  // static assets: cache-first, then network (and cache the result)
-  e.respondWith(
-    caches.match(req).then((hit) =>
-      hit ||
-      fetch(req).then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
-        return res;
-      }).catch(() => hit)
-    )
+  // Cache-first for the built app shell (hashed JS/CSS filenames make this
+  // safe - a new build gets new filenames, so stale content is never served
+  // once the new index.html/manifest land), falling back to network and
+  // caching what comes back.
+  event.respondWith(
+    caches.match(request).then((cached) => {
+      if (cached) return cached;
+      return fetch(request)
+        .then((response) => {
+          if (response && response.ok) {
+            const copy = response.clone();
+            caches.open(CACHE).then((cache) => cache.put(request, copy));
+          }
+          return response;
+        })
+        .catch(() => cached);
+    })
   );
 });

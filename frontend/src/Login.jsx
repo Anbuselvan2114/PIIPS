@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { login } from "./api";
-import { Logo } from "./components";
+import { Logo, PasswordInput } from "./components";
 
 export default function Login({ onSuccess, onForgot }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState(null);
+  const [pasteBlocked, setPasteBlocked] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const submit = async (e) => {
@@ -19,6 +20,11 @@ export default function Login({ onSuccess, onForgot }) {
     } finally {
       setBusy(false);
     }
+  };
+
+  const blockPaste = (e) => {
+    e.preventDefault();
+    setPasteBlocked(true);
   };
 
   return (
@@ -39,10 +45,14 @@ export default function Login({ onSuccess, onForgot }) {
         </div>
         <div className="field">
           <label className="label">Password</label>
-          <div className="input-group">
-            <span className="ico">🔒</span>
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
-          </div>
+          <PasswordInput icon="🔒" value={password}
+                         onChange={(e) => { setPassword(e.target.value); setPasteBlocked(false); }}
+                         onPaste={blockPaste} placeholder="Password" />
+          {pasteBlocked && (
+            <div className="hint" style={{ color: "var(--danger)", marginTop: 4 }}>
+              🚫 Pasting into the password field isn't allowed here — please type it.
+            </div>
+          )}
         </div>
 
         {error && <div className="alert alert-danger">{error}</div>}
