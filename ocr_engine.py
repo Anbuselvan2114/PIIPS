@@ -2286,6 +2286,27 @@ class OCREngine:
                 "ea"
             ]
 
+        def descriptive_text(wds):
+            """Real description words from a row: unit words (No./Nos/
+            Pcs/...) are always noise, and a number is noise ONLY when it
+            sits under the Quantity/Rate/Amount column - a genuine spec
+            number that happens to be part of the description (e.g. "90"
+            in "90 Days Warranty") is printed in the Description column's
+            own territory and must survive, while a Quantity/Rate/Amount
+            figure that leaked onto this row (already harvested above)
+            should not be echoed into the text too."""
+            out = []
+            for w in wds:
+                t = w["text"].strip()
+                if is_unit(t):
+                    continue
+                if is_number(t) and value_cols:
+                    col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
+                    if col in ("Quantity", "Rate", "Amount"):
+                        continue
+                out.append(t)
+            return " ".join(out).strip()
+
 
 
         if not table_rows:
@@ -2794,13 +2815,17 @@ class OCREngine:
                                 and abs(w["x"] - value_cols[col]) < 150
                             ):
                                 current_item[col] = clean_number(t)
-                    current_item["Description"] += " " + row_text
+                    content = descriptive_text(words)
+                    if content:
+                        current_item["Description"] += " " + content
                 elif (current_item is None and has_text
                         and not any(k in lower for k in EXCLUDE_KW)
                         and not any(k in lower for k in CHARGE_KW)):
-                    pending_lead_in = (
-                        pending_lead_in + " " + row_text
-                    ).strip() if pending_lead_in else row_text
+                    content = descriptive_text(words)
+                    if content:
+                        pending_lead_in = (
+                            pending_lead_in + " " + content
+                        ).strip() if pending_lead_in else content
 
 
 
