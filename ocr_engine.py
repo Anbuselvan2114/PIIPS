@@ -2757,6 +2757,29 @@ class OCREngine:
                 if (current_item and has_text
                         and not any(k in lower for k in EXCLUDE_KW)
                         and not any(k in lower for k in CHARGE_KW)):
+                    # A scanned/garbled image can split one logical item
+                    # row across several OCR rows, with the Quantity/Rate/
+                    # Amount figures landing on a row that has no
+                    # recognisable serial of its own and so falls through
+                    # to here as plain description continuation. Recover
+                    # any of those columns this item is still missing
+                    # before appending the row as description text -
+                    # only a token tight against a value column's own
+                    # x-position qualifies, so a part number or size that
+                    # happens to be numeric but sits elsewhere on the row
+                    # isn't mistaken for it.
+                    if value_cols:
+                        for w in words:
+                            t = w["text"].strip()
+                            if not is_number(t):
+                                continue
+                            col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
+                            if (
+                                col in ("Quantity", "Rate", "Amount")
+                                and current_item.get(col) is None
+                                and abs(w["x"] - value_cols[col]) < 150
+                            ):
+                                current_item[col] = clean_number(t)
                     current_item["Description"] += " " + row_text
                 elif (current_item is None and has_text
                         and not any(k in lower for k in EXCLUDE_KW)
