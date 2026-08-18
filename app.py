@@ -711,7 +711,9 @@ class LifecycleModel(BaseModel):
 def lifecycle_advance(payload: LifecycleModel):
     """Advance the selected invoices to a lifecycle stage's target status
     (Load→LOADED, Post→POSTED, Complete→COMPLETED) and move each PDF into its
-    new status folder."""
+    new status folder. Posted/Completed invoices are also archived into
+    <Folder Path>/ALL_INVOICES as "<Invoice No.>_<Vendor Name>.pdf" (a copy,
+    the original stays in its status folder)."""
     stage = (payload.stage or "").lower()
     if stage not in _LIFECYCLE:
         raise HTTPException(status_code=400, detail="Unknown stage")
@@ -722,12 +724,32 @@ def lifecycle_advance(payload: LifecycleModel):
             payload.header_ids, spec["from"], spec["to"], payload.user_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    for fname in res.get("files", []):
+
+    files = res.get("files", [])
+    for fname in files:
         try:
             config_store.move_pdf_to_status(fname, spec["to"])
         except Exception:  # noqa: BLE001 - file move is best-effort
             import traceback
             traceback.print_exc()
+
+    if spec["to"] in ("POSTED", "COMPLETED") and files:
+        try:
+            meta = {m["file_name"]: m for m in database.invoices_by_header_ids(res.get("header_ids", []))}
+            for fname in files:
+                m = meta.get(fname)
+                if not m:
+                    continue
+                inv_no = config_store._safe_folder(m.get("invoice_no") or "NoInvoiceNo")
+                vendor = config_store._safe_folder(m.get("vendor") or "UnknownVendor")
+                ext = os.path.splitext(fname)[1] or ".pdf"
+                dest_name = f"{inv_no}_{vendor}{ext}"
+                new_src = os.path.join(config_store.status_folder(spec["to"]), fname)
+                config_store.copy_pdf_to_all_invoices(new_src, dest_name)
+        except Exception:  # noqa: BLE001 - archive copy is best-effort
+            import traceback
+            traceback.print_exc()
+
     return {"ok": True, "count": res.get("count", 0), "to": spec["to"]}
 
 

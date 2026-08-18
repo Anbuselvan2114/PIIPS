@@ -1110,8 +1110,15 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
             f"WHERE pt.Purchase_Header_ID IN ({id_ph}) AND s.StatusName IN ({from_ph})",
             *ids, *froms)
         qualifying = cur.fetchall()
-        files = [r[0] for r in qualifying if r[0]]
-        qualifying_ids = [r[1] for r in qualifying]
+        # Kept positionally paired (files[i] <-> qualifying_ids[i]) - a row
+        # with no FileName is dropped from both together, not just files,
+        # so callers that zip the two (e.g. the ALL_INVOICES archive copy)
+        # can't get misaligned.
+        files, qualifying_ids = [], []
+        for fname, hid in qualifying:
+            if fname:
+                files.append(fname)
+                qualifying_ids.append(hid)
 
         cur.execute(
             "UPDATE pt "
@@ -1159,9 +1166,21 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
                     *qualifying_ids)
 
         conn.commit()
-        return {"count": count, "files": files}
+        return {"count": count, "files": files, "header_ids": qualifying_ids}
     finally:
         conn.close()
+
+
+def invoices_by_header_ids(header_ids):
+    """Invoices for a specific set of header ids, in the same shape as
+    invoices_by_status/invoices_by_batch (used to build the invoice-no +
+    vendor-name filename for the ALL_INVOICES archive copy).
+    Sample: invoices_by_header_ids([12, 13])"""
+    ids = [int(h) for h in (header_ids or [])]
+    if not ids:
+        return []
+    ph = ", ".join("?" for _ in ids)
+    return _invoice_list(f"h.Id IN ({ph})", ids)
 
 
 def set_excluded(header_id, exclude, user_id=None):
