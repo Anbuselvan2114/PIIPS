@@ -1005,9 +1005,13 @@ class OCREngine:
 
         page_inputs = self._page_inputs(pdf_path)
 
-        # Reject handheld-photo pages before spending OCR time on them. Only
-        # rasterised pages are relevant (image is not None) — a page with a
-        # born-digital text layer (image=None) never came from a camera.
+        # This version only processes born-digital PDFs (a real embedded
+        # text layer). A page with no text layer (image is not None) had to
+        # be rasterised for OCR, which means the source is a scan or a
+        # photocopy (or a handheld photo) rather than an original digital
+        # document — reject the whole file rather than OCR-extracting from
+        # it, so it gets moved to UNSUPPORTED upstream instead of silently
+        # producing lower-confidence data.
         rasterised = [image for _boxes, image in page_inputs if image is not None]
         if rasterised:
             photo_count = sum(1 for image in rasterised if _looks_like_photo_page(image))
@@ -1017,6 +1021,10 @@ class OCREngine:
                     "(uneven lighting/background or non-paper aspect ratio) — "
                     "unsupported."
                 )
+            raise ValueError(
+                "Document is a scanned or photocopied PDF, not an original "
+                "born-digital PDF (no embedded text layer) — unsupported."
+            )
 
         result = {
 
