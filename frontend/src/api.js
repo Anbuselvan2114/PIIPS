@@ -192,10 +192,10 @@ export const setUserActive = (user_id, is_active, modified_by) =>
     body: JSON.stringify({ user_id, is_active, modified_by }),
   });
 
-export const adminResetPassword = (user_id, target_user_id) =>
+export const adminResetPassword = (user_id, target_user_id, new_password) =>
   request("/api/users/reset-password", {
     method: "POST",
-    body: JSON.stringify({ user_id, target_user_id }),
+    body: JSON.stringify({ user_id, target_user_id, new_password: new_password || null }),
   });
 
 export const getMailSettings = (user_id) =>

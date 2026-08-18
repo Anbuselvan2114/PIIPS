@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { getUsers, createUser, setUserActive, adminResetPassword, changePassword } from "./api";
+import { useEffect, useMemo, useState } from "react";
+import { getUsers, createUser, setUserActive, adminResetPassword } from "./api";
 import { DataTable } from "./components";
 
 // Fields stacked vertically instead of the shared ".row"'s default
@@ -13,9 +13,9 @@ export default function UserManagement({ user }) {
   const [form, setForm] = useState({ username: "", email: "", user_type_id: "" });
   const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [ownPw, setOwnPw] = useState({ current: "", next: "", confirm: "" });
-  const [ownPwMsg, setOwnPwMsg] = useState(null);
-  const [ownPwBusy, setOwnPwBusy] = useState(false);
+  const [assignPw, setAssignPw] = useState({ target_user_id: "", next: "", confirm: "" });
+  const [assignPwMsg, setAssignPwMsg] = useState(null);
+  const [assignPwBusy, setAssignPwBusy] = useState(false);
 
   const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
 
@@ -63,20 +63,33 @@ export default function UserManagement({ user }) {
     } catch (e) { setMessage({ ok: false, text: e.message }); }
   };
 
-  // An Admin may reset anyone except a Super Admin; a Super Admin may reset anyone.
-  const canResetFor = (u) => isSuperAdmin || (u.UserTypeName || "").toLowerCase() !== "super admin";
+  // Super Admin may target anyone, including themselves. An Admin may
+  // target only a plain User/Accounts account - never themselves, another
+  // Admin, or a Super Admin. Mirrors the backend's own check in
+  // /api/users/reset-password (which is the real enforcement).
+  const canAssignFor = (u) => {
+    if (isSuperAdmin) return true;
+    const role = (u.UserTypeName || "").toLowerCase();
+    return u.UserId !== user?.user_id && role !== "admin" && role !== "super admin";
+  };
 
-  const onChangeOwnPw = async (e) => {
+  const assignableUsers = useMemo(
+    () => users.filter((u) => u.IsActive && canAssignFor(u)),
+    [users, isSuperAdmin, user]
+  );
+
+  const onAssignPw = async (e) => {
     e.preventDefault();
-    setOwnPwMsg(null);
-    if (ownPw.next !== ownPw.confirm) { setOwnPwMsg({ ok: false, text: "New passwords do not match." }); return; }
-    setOwnPwBusy(true);
+    setAssignPwMsg(null);
+    if (assignPw.next !== assignPw.confirm) { setAssignPwMsg({ ok: false, text: "New passwords do not match." }); return; }
+    const target = users.find((u) => String(u.UserId) === String(assignPw.target_user_id));
+    setAssignPwBusy(true);
     try {
-      await changePassword(user?.user_id, ownPw.current, ownPw.next);
-      setOwnPwMsg({ ok: true, text: "Password updated." });
-      setOwnPw({ current: "", next: "", confirm: "" });
-    } catch (e) { setOwnPwMsg({ ok: false, text: e.message }); }
-    finally { setOwnPwBusy(false); }
+      const r = await adminResetPassword(user?.user_id, Number(assignPw.target_user_id), assignPw.next);
+      setAssignPwMsg({ ok: true, text: `Password updated for "${target?.UserName}" and emailed to them.${emailNote(r)}` });
+      setAssignPw({ target_user_id: "", next: "", confirm: "" });
+    } catch (e) { setAssignPwMsg({ ok: false, text: e.message }); }
+    finally { setAssignPwBusy(false); }
   };
 
   if (loading) return <div className="page"><div className="card">Loading…</div></div>;
@@ -84,26 +97,37 @@ export default function UserManagement({ user }) {
   return (
     <div className="page">
       <div className="card">
-        <h3>My password</h3>
-        <p className="hint">Change the password for your own account ({user?.username}).</p>
-        <form className="row" style={stackStyle} onSubmit={onChangeOwnPw}>
+        <h3>Change Password</h3>
+        <p className="hint">
+          Assign a new password for another user — {isSuperAdmin
+            ? "as Super Admin you can select any user."
+            : "you can select any User/Accounts account (not yourself, another Admin, or a Super Admin)."}
+          {" "}The new password is emailed to them and they must set their own on next login.
+        </p>
+        <form className="row" style={stackStyle} onSubmit={onAssignPw}>
           <div className="field">
-            <label className="label">Current password</label>
-            <input type="password" value={ownPw.current} onChange={(e) => setOwnPw({ ...ownPw, current: e.target.value })} placeholder="Current password" />
+            <label className="label">User</label>
+            <select value={assignPw.target_user_id}
+                    onChange={(e) => setAssignPw({ ...assignPw, target_user_id: e.target.value })}>
+              <option value="">Select a user…</option>
+              {assignableUsers.map((u) => (
+                <option key={u.UserId} value={u.UserId}>{u.UserName} ({u.UserTypeName})</option>
+              ))}
+            </select>
           </div>
           <div className="field">
             <label className="label">New password</label>
-            <input type="password" value={ownPw.next} onChange={(e) => setOwnPw({ ...ownPw, next: e.target.value })} placeholder="New password" />
+            <input type="password" value={assignPw.next} onChange={(e) => setAssignPw({ ...assignPw, next: e.target.value })} placeholder="New password" />
           </div>
           <div className="field">
             <label className="label">Confirm new password</label>
-            <input type="password" value={ownPw.confirm} onChange={(e) => setOwnPw({ ...ownPw, confirm: e.target.value })} placeholder="Confirm new password" />
+            <input type="password" value={assignPw.confirm} onChange={(e) => setAssignPw({ ...assignPw, confirm: e.target.value })} placeholder="Confirm new password" />
           </div>
-          <button type="submit" className="btn btn-primary" disabled={ownPwBusy || !ownPw.current || !ownPw.next} style={{ alignSelf: "flex-start" }}>
-            {ownPwBusy ? "Saving…" : "Change password"}
+          <button type="submit" className="btn btn-primary" disabled={assignPwBusy || !assignPw.target_user_id || !assignPw.next} style={{ alignSelf: "flex-start" }}>
+            {assignPwBusy ? "Saving…" : "Change password"}
           </button>
         </form>
-        {ownPwMsg && <div className={`alert ${ownPwMsg.ok ? "alert-success" : "alert-danger"}`}>{ownPwMsg.text}</div>}
+        {assignPwMsg && <div className={`alert ${assignPwMsg.ok ? "alert-success" : "alert-danger"}`}>{assignPwMsg.text}</div>}
       </div>
 
       <div className="card">
@@ -162,7 +186,7 @@ export default function UserManagement({ user }) {
                   <button className={`btn btn-sm ${r._u.IsActive ? "btn-danger" : "btn-success"}`} onClick={() => toggle(r._u)}>
                     {r._u.IsActive ? "Inactivate" : "Give access"}
                   </button>
-                  {canResetFor(r._u) && (
+                  {canAssignFor(r._u) && (
                     <button className="btn btn-sm btn-subtle" onClick={() => resetPw(r._u)}>
                       Reset password
                     </button>

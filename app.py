@@ -1416,6 +1416,7 @@ class UserActiveModel(BaseModel):
 class UserResetPasswordModel(BaseModel):
     user_id: int          # the acting admin/super admin
     target_user_id: int   # whose password is being reset
+    new_password: Optional[str] = None   # None = auto-generate
 
 
 def _email_result(email_sent, email_error):
@@ -1499,28 +1500,48 @@ def api_set_user_active(payload: UserActiveModel, request: Request):
 
 @app.post("/api/users/reset-password")
 def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
-    """Admin-triggered password reset for another user (distinct from the
-    self-service /api/forgot-password). An Admin may reset anyone except a
-    Super Admin; only a Super Admin may reset a Super Admin's password."""
+    """Admin-triggered password reset/assignment for another user (distinct
+    from the self-service /api/forgot-password). A Super Admin may target
+    anyone, including themselves. An Admin may target only plain User/
+    Accounts accounts - never themselves, another Admin, or a Super Admin.
+    `new_password` lets the caller assign a specific password directly
+    (e.g. the User Management "Change Password" form); omitted, one is
+    auto-generated (the per-row "Reset password" action). Either way the
+    target must change it on next login, and it's emailed to them."""
     import database
     import mailer
 
     caller_role = database.get_user_role(payload.user_id)
     if not caller_role or not caller_role["active"] or caller_role["role"].lower() not in ("admin", "super admin"):
         raise HTTPException(status_code=403, detail="Admin access required.")
+    is_super_admin = caller_role["role"].lower() == "super admin"
 
     target = database.get_user_by_id(payload.target_user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    target_role = database.get_user_role(payload.target_user_id)
-    if (target_role and (target_role["role"] or "").lower() == "super admin"
-            and caller_role["role"].lower() != "super admin"):
-        raise HTTPException(status_code=403, detail="Only a Super Admin can reset a Super Admin's password.")
+    if not is_super_admin:
+        target_role = database.get_user_role(payload.target_user_id)
+        target_role_name = (target_role["role"] or "").lower() if target_role else ""
+        if (payload.target_user_id == payload.user_id
+                or target_role_name in ("admin", "super admin")):
+            raise HTTPException(
+                status_code=403,
+                detail="Admins can only change the password of a regular User/Accounts account "
+                       "- not their own, another Admin's, or a Super Admin's.",
+            )
 
-    temp_password = database.generate_temp_password()
+    if payload.new_password:
+        try:
+            database.validate_password_policy(payload.new_password)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        new_password = payload.new_password
+    else:
+        new_password = database.generate_temp_password()
+
     try:
-        database.reset_password(target["UserName"], temp_password, force_change=True, modified_by=payload.user_id)
+        database.reset_password(target["UserName"], new_password, force_change=True, modified_by=payload.user_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
@@ -1529,7 +1550,7 @@ def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
         try:
             mailer.send_mail(
                 target["Email"], "Your PIIPS password was reset",
-                mailer.password_reset_email_html(target["UserName"], temp_password, _base_url(request)),
+                mailer.password_reset_email_html(target["UserName"], new_password, _base_url(request)),
             )
             email_sent = True
         except mailer.MailError as exc:
