@@ -785,7 +785,16 @@ def build_invoice_json(result, pdf_path=""):
             "sl_no": serial,
             "Description": desc,
             "hsn": it.get("HSN") or "",
-            "rate": _money(it.get("Rate")),
+            # Unit price: use whatever OCR read from the table's own Rate
+            # column, or - when that column wasn't recognised/positioned
+            # cleanly - derive it from Amount / Quantity. Amount = Rate x
+            # Quantity always holds for a line item, so this is an exact
+            # recovery, not a guess.
+            "rate": _money(it.get("Rate")) or (
+                _money(amt_n / qty_n)
+                if amt_n is not None and qty_n
+                else ""
+            ),
             "Unit": "",
             "discount": "",
             "amount": _money(it.get("Amount")),
