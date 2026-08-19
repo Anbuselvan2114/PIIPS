@@ -91,20 +91,16 @@ def save_template(entity, invoice_type, name, po_format, static, user_id=None):
     return key, folder
 
 
-def _split_path(input_folder, pdf_path):
+def entity_type_name_from_relpath(rel):
     """
-    Parse (entity, invoice_type, name) from a PDF located under
-    <input_folder>/<entity>/<invoice_type>/<name>/<file>. Returns
-    (None, None, None) if not resolvable (e.g. fewer than 4 path segments)
-    — independent of whether a template is actually defined for that path.
+    Parse (entity, invoice_type, name) from a path already relative to the
+    Input root, e.g. "PT/PART/Services_Chennai/inv1.pdf" (same shape as
+    tbl_InputFile_Log.RelPath). Returns (None, None, None) if not resolvable
+    (e.g. fewer than 4 path segments) — independent of whether a template is
+    actually defined for that path.
     """
-    if not input_folder:
+    if not rel:
         return None, None, None
-    try:
-        rel = os.path.relpath(pdf_path, input_folder)
-    except ValueError:
-        return None, None, None
-
     parts = [p for p in rel.replace("\\", "/").split("/") if p]
     if len(parts) < 4:            # need entity / invoice_type / name / file
         return None, None, None
@@ -112,6 +108,22 @@ def _split_path(input_folder, pdf_path):
     entity, invoice_type = parts[0], parts[1]
     name = "/".join(parts[2:-1])   # everything between invoice_type and filename
     return entity, invoice_type, name
+
+
+def _split_path(input_folder, pdf_path):
+    """
+    Parse (entity, invoice_type, name) from a PDF located under
+    <input_folder>/<entity>/<invoice_type>/<name>/<file>. Returns
+    (None, None, None) if not resolvable — independent of whether a
+    template is actually defined for that path.
+    """
+    if not input_folder:
+        return None, None, None
+    try:
+        rel = os.path.relpath(pdf_path, input_folder)
+    except ValueError:
+        return None, None, None
+    return entity_type_name_from_relpath(rel)
 
 
 def invoice_type_for_path(input_folder, pdf_path):

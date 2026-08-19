@@ -644,6 +644,13 @@ def list_statuses():
         conn.close()
 
 
+# Same pattern as excel_export._DOC_NO_SUFFIX_RE - splits a doc number into
+# its prefix and trailing numeric sequence (e.g. "PO-2627-000010" ->
+# ("PO-2627-", "000010")) so a changed PO_Number_Format can be re-applied
+# to an existing sequence without disturbing the sequence itself.
+_DOC_NO_SUFFIX_RE = re.compile(r"^(.*?)(\d+)$")
+
+
 def fetch_batch(batch_name, sheet_cols):
     """
     Read a batch's rows from the 3 tables into {sheet: {columns, rows}}
@@ -707,6 +714,64 @@ def fetch_batch(batch_name, sheet_cols):
         pl_r = read_rows()
         cur.nextset()
         re_r = read_rows()
+
+        # Refresh each header's PO_Number_Format from the CURRENT template
+        # instead of the value frozen onto the row back when it was
+        # extracted (see save_grouped) - so editing a template's PO Number
+        # Format on the Template screen is reflected on THIS batch's very
+        # next download, for any header that hasn't been Loaded yet
+        # (fetch_batch is already scoped to headers not past READY TO LOAD,
+        # via usp_FetchBatch's @idset, and to this one batch_name). A
+        # changed format also re-prefixes Last_Updated_No (keeping its
+        # existing numeric sequence) so the download reflects it even when
+        # the caller didn't pass a custom doc_no to trigger a full
+        # renumber_batch. Both columns are written back to
+        # tbl_Purchase_Header immediately, not just used in-memory for this
+        # one export. Falls back to the row's own stored value when the
+        # source file's relative path no longer resolves to an active
+        # template (e.g. the template was deleted since).
+        header_ids = [row["Id"] for row in ph_r if row.get("Id") is not None]
+        if header_ids:
+            import template_store
+            placeholders = ",".join("?" * len(header_ids))
+            cur.execute(
+                f"SELECT Purchase_Header_ID, RelPath FROM tbl_InputFile_Log "
+                f"WHERE Purchase_Header_ID IN ({placeholders})",
+                *header_ids,
+            )
+            relpath_by_header = {r[0]: r[1] for r in cur.fetchall() if r[1]}
+            if relpath_by_header:
+                current_templates = get_templates_data()
+                updates = []  # (new_po_fmt, new_last_no_or_None, header_id)
+                for row in ph_r:
+                    rel = relpath_by_header.get(row.get("Id"))
+                    if not rel:
+                        continue
+                    entity, invoice_type, name = template_store.entity_type_name_from_relpath(rel)
+                    if entity is None:
+                        continue
+                    current = current_templates.get(f"{entity}\\{invoice_type}\\{name}")
+                    if current is None:
+                        continue
+                    new_po_fmt = current.get("PO_Number_Format", "")
+                    if new_po_fmt == (row.get("PO_Number_Format") or ""):
+                        continue  # unchanged - nothing to refresh for this header
+
+                    old_last_no = (row.get("Last_Updated_No") or row.get("No.") or "").strip()
+                    m = _DOC_NO_SUFFIX_RE.match(old_last_no) if old_last_no else None
+                    new_last_no = f"{new_po_fmt}{m.group(2)}" if (m and new_po_fmt) else old_last_no
+
+                    row["PO_Number_Format"] = new_po_fmt
+                    row["Last_Updated_No"] = new_last_no
+                    updates.append((new_po_fmt, new_last_no, row["Id"]))
+
+                for new_po_fmt, new_last_no, header_id in updates:
+                    cur.execute(
+                        "UPDATE tbl_Purchase_Header SET PO_Number_Format = ?, Last_Updated_No = ? WHERE Id = ?",
+                        new_po_fmt, new_last_no, header_id,
+                    )
+                if updates:
+                    conn.commit()
 
         last_no_by_header = {}
         for row in ph_r:
