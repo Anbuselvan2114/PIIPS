@@ -119,7 +119,7 @@ def _shell(accent, heading, body_html, footer_note=""):
               <td style="padding:0 32px 28px;">
                 <div style="height:1px;background:#e2e8f0;margin-bottom:18px;"></div>
                 <div style="color:#94a3b8;font-size:12px;line-height:1.6;{_FONT}">
-                  Precision Intelligence Invoice Processing Suite
+                  Precision Intelligent Invoice Processing Suite
                   {f"<br>{footer_note}" if footer_note else ""}
                   <br>This is an automated message - please do not reply to this email.
                 </div>

@@ -1,5 +1,5 @@
 {
-  "name": "PIIPS - Precision Intelligence Invoice Processing Suite",
+  "name": "PIIPS - Precision Intelligent Invoice Processing Suite",
   "short_name": "PIIPS",
   "description": "OCR-driven invoice processing, review and export for Business Central purchase documents.",
   "start_url": "/",

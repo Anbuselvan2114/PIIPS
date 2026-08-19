@@ -17,7 +17,7 @@ from format_model import FormatModel
 ACCEPTED_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 
 app = FastAPI(
-    title="Precision Intelligence Invoice Processing Suite",
+    title="Precision Intelligent Invoice Processing Suite",
     version="2.1"
 )
 
