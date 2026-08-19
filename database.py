@@ -575,10 +575,18 @@ def reset_input_files(relpaths):
 
 def get_processed_invoices():
     """
-    {invoice_no: earliest_batch} for every invoice already saved in
-    tbl_Purchase_Header (any batch). Used to skip re-processing an invoice
-    that is already in the database. Backfills InvoiceNo from the mapped
-    'Vendor Invoice No.' column for rows saved before InvoiceNo existed.
+    {(invoice_no, buyer_order_no_lower): {"batch": earliest_batch,
+        "header_id": int, "excluded": bool}}
+    for every invoice already saved in tbl_Purchase_Header (any batch) -
+    keyed on the combination of Invoice No. and Buyer's Order No. together
+    (not Invoice No. alone - different vendors, or the same vendor's
+    invoices against different POs, can coincidentally reuse an invoice
+    number). Used to skip re-processing an invoice that is already in the
+    database - unless its only existing record has been Excluded, in which
+    case the caller re-processes it into that same header instead of
+    flagging a duplicate (see processor.py and reprocess_excluded_header).
+    Backfills InvoiceNo from the mapped 'Vendor Invoice No.' column for rows
+    saved before InvoiceNo existed.
 
     Sample: get_processed_invoices()
     """
@@ -587,7 +595,100 @@ def get_processed_invoices():
     try:
         cur = conn.cursor()
         cur.execute("EXEC dbo.usp_GetProcessedInvoices")
-        return {r[0]: r[1] for r in cur.fetchall()}
+        out = {}
+        for inv_no, batch, header_id, is_excluded, buyer_order_no in cur.fetchall():
+            po = str(buyer_order_no or "").strip().lower()
+            out[(inv_no, po)] = {
+                "batch": batch, "header_id": header_id, "excluded": bool(is_excluded),
+            }
+        return out
+    finally:
+        conn.close()
+
+
+def reprocess_excluded_header(existing_header_id, new_header_id):
+    """After a fresh save_grouped() insert created `new_header_id` for an
+    invoice whose only prior record (`existing_header_id`) was Excluded,
+    merge the newly-inserted row's data back onto the EXISTING Header and
+    Tracker rows in place (same Id - the invoice a user has been looking at
+    stays the same record, genuinely updated, not replaced by a new one),
+    replace its Line/Reservation children with the freshly-inserted ones
+    (re-parented onto the existing header - counts can legitimately differ
+    from before, so there's no stable old-row-to-new-row identity to update
+    against), then discard the now-empty temporary new_header_id shell.
+    Re-checks the existing tracker is actually Excluded itself (not just
+    trusting a caller's earlier read) so this can never silently overwrite
+    a live invoice under any other status.
+    Sample: reprocess_excluded_header(42, 57)"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT s.StatusName FROM dbo.tbl_Purchase_Tracker pt "
+            "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+            "WHERE pt.Purchase_Header_ID = ?",
+            existing_header_id,
+        )
+        row = cur.fetchone()
+        if not row or (row[0] or "").strip().upper() != "EXCLUDED":
+            return False
+
+        # ---- Header: copy every real data column from new -> existing ----
+        cur.execute(
+            "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.tbl_Purchase_Header')")
+        h_cols = [r[0] for r in cur.fetchall() if r[0] not in ("Id", "CreatedAt")]
+        if h_cols:
+            cur.execute(
+                f"SELECT {', '.join(_q(c) for c in h_cols)} FROM dbo.tbl_Purchase_Header WHERE Id = ?",
+                new_header_id,
+            )
+            new_row = cur.fetchone()
+            if new_row:
+                set_clause = ", ".join(f"{_q(c)} = ?" for c in h_cols)
+                cur.execute(
+                    f"UPDATE dbo.tbl_Purchase_Header SET {set_clause} WHERE Id = ?",
+                    *new_row, existing_header_id,
+                )
+
+        # ---- Line / Reservation: existing children replaced wholesale by
+        # the freshly-inserted ones, re-parented onto the existing header ----
+        for child_table in ("tbl_Purchase_Line", "tbl_Reservation_Entry"):
+            cur.execute(f"DELETE FROM dbo.{child_table} WHERE Purchase_Header_ID = ?", existing_header_id)
+            cur.execute(
+                f"UPDATE dbo.{child_table} SET Purchase_Header_ID = ? WHERE Purchase_Header_ID = ?",
+                existing_header_id, new_header_id,
+            )
+
+        # ---- Tracker: copy the new tracker's fields onto the EXISTING
+        # tracker row in place (clears IsExcluded/PriorStatusID, adopts the
+        # fresh verdict/status/batch), then drop the temporary new tracker ----
+        cur.execute(
+            "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.tbl_Purchase_Tracker')")
+        t_cols = [r[0] for r in cur.fetchall()
+                  if r[0] not in ("Id", "Purchase_Header_ID", "CreatedById", "CreatedDatetime")]
+        if t_cols:
+            cur.execute(
+                f"SELECT {', '.join(_q(c) for c in t_cols)} FROM dbo.tbl_Purchase_Tracker "
+                "WHERE Purchase_Header_ID = ?",
+                new_header_id,
+            )
+            new_row = cur.fetchone()
+            if new_row:
+                set_clause = ", ".join(f"{_q(c)} = ?" for c in t_cols)
+                cur.execute(
+                    f"UPDATE dbo.tbl_Purchase_Tracker SET {set_clause} WHERE Purchase_Header_ID = ?",
+                    *new_row, existing_header_id,
+                )
+
+        cur.execute(
+            "UPDATE dbo.tbl_InputFile_Log SET Purchase_Header_ID = ? WHERE Purchase_Header_ID = ?",
+            existing_header_id, new_header_id,
+        )
+        cur.execute("DELETE FROM dbo.tbl_Purchase_Tracker WHERE Purchase_Header_ID = ?", new_header_id)
+        cur.execute("DELETE FROM dbo.tbl_Purchase_Header WHERE Id = ?", new_header_id)
+        conn.commit()
+        return True
     finally:
         conn.close()
 
@@ -2383,7 +2484,19 @@ _MENU_PROC_DDL = [
             EXEC('UPDATE dbo.tbl_Purchase_Header SET InvoiceNo = [Vendor Invoice No.] '
                + 'WHERE InvoiceNo IS NULL AND [Vendor Invoice No.] IS NOT NULL');
         -- BatchName now lives on the tracker (informational for dedup).
-        SELECT h.InvoiceNo, MIN(pt.BatchName) AS BatchName
+        -- HeaderId/IsExcluded let the caller re-process an invoice whose
+        -- only existing record was excluded, instead of flagging it as a
+        -- duplicate (see database.get_processed_invoices) - picks one
+        -- representative header per invoice no. (MIN Id) since an invoice
+        -- no. is expected to map to a single real header in practice.
+        -- BuyerOrderNo comes from the tracker (a fixed schema column,
+        -- always present) rather than the header's own optional, Excel-
+        -- mapped "Buyer's Order No." column (may not exist depending on
+        -- field mapping) - part of the (InvoiceNo, vendor, PO) match key.
+        SELECT h.InvoiceNo, MIN(pt.BatchName) AS BatchName,
+               MIN(h.Id) AS HeaderId,
+               MAX(CASE WHEN ISNULL(pt.IsExcluded, 0) = 1 THEN 1 ELSE 0 END) AS IsExcluded,
+               MIN(pt.BuyerOrderNo) AS BuyerOrderNo
         FROM dbo.tbl_Purchase_Header h
         LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = h.Id
         WHERE h.InvoiceNo IS NOT NULL AND h.InvoiceNo <> ''

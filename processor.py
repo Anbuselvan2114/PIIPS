@@ -330,6 +330,8 @@ class JobManager:
                 }
                 if verdict.get("reason"):
                     rec["reason"] = verdict["reason"]
+                if ctx.get("_reprocess_into_header_id"):
+                    rec["_reprocess_into_header_id"] = ctx["_reprocess_into_header_id"]
                 return rec
 
             # Invoices whose verdict needs Service First, queued up across
@@ -445,24 +447,48 @@ class JobManager:
                                 "static": static, "tkey": tkey,
                             }
 
-                            # Already saved (any batch) - matched by the
-                            # extracted Vendor Invoice No., not the PDF's
-                            # filename, so a re-upload under a different
-                            # filename is still caught. Given a real tracker
-                            # row like every other outcome (not silently
-                            # skipped with none at all) so it's visible/
-                            # counted on the Dashboard; _move_by_status below
-                            # relocates the PDF into the DUPLICATE folder the
-                            # same way it does for every other status.
-                            if inv_no in invoice_map:
-                                verdict = {
-                                    "status": "DUPLICATE", "is_active": False,
-                                    "is_synced": False,
-                                    "reason": f"Invoice {inv_no} already processed "
-                                              f"in batch {invoice_map[inv_no]}",
-                                }
-                                records.append(_finish_group(ctx, verdict))
-                                continue
+                            # Already saved (any batch) - matched by
+                            # (Invoice No., Buyer's Order No.) together, not
+                            # the PDF's filename and not the invoice number
+                            # alone (the same invoice number can
+                            # coincidentally recur against a different PO).
+                            # Given a real tracker row like every other
+                            # outcome (not silently skipped with none at
+                            # all) so it's visible/counted on the
+                            # Dashboard; _move_by_status below relocates the
+                            # PDF into the DUPLICATE folder the same way it
+                            # does for every other status.
+                            #
+                            # Exception: if that existing record is
+                            # currently Excluded, a re-upload is treated as
+                            # a deliberate correction, not a duplicate - its
+                            # Header/Tracker rows are updated in place (same
+                            # Id, not a new-looking record) and its Line/
+                            # Reservation rows are replaced with this run's
+                            # fresh data, once this group's own save
+                            # completes below (see _save_to_db's post-save
+                            # reconciliation pass, database.
+                            # reprocess_excluded_header) - so this run falls
+                            # through to normal processing here instead of
+                            # being parked as DUPLICATE.
+                            match_key = (
+                                inv_no,
+                                str(data.get("buyer_order_no") or "").strip().lower(),
+                            )
+                            if match_key in invoice_map:
+                                existing = invoice_map[match_key]
+                                if existing.get("excluded") and existing.get("header_id"):
+                                    ctx["_reprocess_into_header_id"] = existing["header_id"]
+                                    del invoice_map[match_key]
+                                else:
+                                    verdict = {
+                                        "status": "DUPLICATE", "is_active": False,
+                                        "is_synced": False,
+                                        "reason": f"Invoice {inv_no} already processed "
+                                                  f"in batch {existing.get('batch')}",
+                                    }
+                                    records.append(_finish_group(ctx, verdict))
+                                    continue
 
                             # Registered as soon as this invoice_no is
                             # accepted (not deferred to _finish_group) so a
@@ -471,7 +497,9 @@ class JobManager:
                             # PART invoices don't get their final verdict
                             # until the batched Service First call below.
                             if inv_no:
-                                invoice_map[inv_no] = job.batch_name
+                                invoice_map[match_key] = {
+                                    "batch": job.batch_name, "header_id": None, "excluded": False,
+                                }
 
                             if fmt_name is None or not inv_no:
                                 # Either the format itself is unrecognized,
@@ -737,6 +765,33 @@ class JobManager:
                 matched[i]["_status"] = tracker["statuses"][i]
 
             job.db_saved = database.save_grouped(grouped, job.batch_name, tracker)
+
+            # Invoices that matched an Excluded record (see the main loop's
+            # duplicate check) were just inserted above as ordinary fresh
+            # rows, same as every other invoice in this batch - now merge
+            # each one back onto its existing Excluded header/tracker in
+            # place (same Id) and drop the temporary insert.
+            for r in matched:
+                existing_id = r.get("_reprocess_into_header_id")
+                if not existing_id:
+                    continue
+                inv_no = (r.get("data") or {}).get("invoice_no", "")
+                if not inv_no:
+                    continue
+                try:
+                    cur = database.get_connection().cursor()
+                    cur.execute(
+                        "SELECT TOP 1 h.Id FROM dbo.tbl_Purchase_Header h "
+                        "JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = h.Id "
+                        "WHERE pt.BatchName = ? AND h.InvoiceNo = ? ORDER BY h.Id DESC",
+                        job.batch_name, inv_no,
+                    )
+                    row = cur.fetchone()
+                    cur.connection.close()
+                    if row:
+                        database.reprocess_excluded_header(existing_id, row[0])
+                except Exception:  # noqa: BLE001 - best-effort
+                    traceback.print_exc()
 
         except Exception:  # noqa: BLE001 - DB save is best-effort
             traceback.print_exc()
