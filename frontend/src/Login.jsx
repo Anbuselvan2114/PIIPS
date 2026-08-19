@@ -34,7 +34,7 @@ export default function Login({ onSuccess, onForgot }) {
           <Logo size={40} />
           <div className="auth-brand">PIIPS</div>
         </div>
-        <div className="auth-sub">Precision Intelligence Invoice Processing Suite</div>
+        <div className="auth-sub">Precision Intelligent Invoice Processing Suite</div>
 
         <div className="field">
           <label className="label">User Name</label>
