@@ -2274,18 +2274,25 @@ _MENU_PROC_DDL = [
         ;WITH wanted AS (SELECT value AS RelPath FROM OPENJSON(@Paths)),
         ranked AS (
             SELECT l.RelPath, l.FileName, l.InitiatedByID, l.InitiatedDatetime, l.StatusID,
+                   pt.IsExcluded,
                    ROW_NUMBER() OVER (PARTITION BY l.RelPath
                                       ORDER BY l.InitiatedDatetime DESC, l.Id DESC) AS rn
             FROM dbo.tbl_InputFile_Log l
             JOIN wanted w ON w.RelPath = l.RelPath
+            LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID
         )
         -- StatusID = 0 means the file was reset (moved to New_Format) and may
         -- be uploaded again by anyone, so it is NOT treated as a duplicate.
+        -- Same for a file whose linked invoice record has since been
+        -- Excluded on the Dashboard - re-uploading it is a deliberate
+        -- correction (see processor.py's Excluded re-process path), not a
+        -- duplicate, so it must reach processing rather than being silently
+        -- skipped here before it ever gets that far.
         SELECT r.RelPath, r.FileName, r.InitiatedByID, u.UserName AS InitiatedByName,
                r.InitiatedDatetime
         FROM ranked r
         LEFT JOIN dbo.tbl_user u ON u.UserId = r.InitiatedByID
-        WHERE r.rn = 1 AND ISNULL(r.StatusID, -1) <> 0;
+        WHERE r.rn = 1 AND ISNULL(r.StatusID, -1) <> 0 AND ISNULL(r.IsExcluded, 0) = 0;
     END
     """,
     # ---- Reset input-file log entries (moved to New_Format) --------------
