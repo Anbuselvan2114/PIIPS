@@ -1026,10 +1026,21 @@ def get_invoice_field_check(header_id):
                 # template value exists when it doesn't.
                 if source == "Template" and not v.strip():
                     source = "None"
-                rows.append({
-                    "field": n, "value": v, "missing": not v.strip(),
+                missing = not v.strip()
+                row_out = {
+                    "field": n, "value": v, "missing": missing,
                     "source": source,
-                })
+                }
+                # Purchase Line "No." (Nav Item No.) only ever comes from
+                # Service First's GetHSNDetails, keyed on an exact
+                # (PO, item description) match (see service_api._apply_hsn_map)
+                # - so a missing "No." from that source always means SF
+                # didn't recognize this line's description, not some other
+                # data problem. Surfacing the reason directly saves a trip
+                # into the API logs to find out why.
+                if sheet == "Purchase Line" and n == "No." and missing and source == "Service First":
+                    row_out["reason"] = "missing- item description in PDF and SF are different"
+                rows.append(row_out)
             return rows
 
         header_wanted = excel_export.REQUIRED_HEADER_FIELDS + ["InvoiceNo"]

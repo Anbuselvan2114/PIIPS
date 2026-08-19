@@ -226,9 +226,14 @@ export default function Dashboard({ user }) {
     { key: "source", label: "Source" },
     { key: "missing", label: "Status",
       render: (r) => (
-        <span className={`badge ${r.missing ? "badge-warning" : "badge-success"}`}>
-          {r.missing ? "Missing" : "OK"}
-        </span>
+        <div>
+          <span className={`badge ${r.missing ? "badge-warning" : "badge-success"}`}>
+            {r.missing ? "Missing" : "OK"}
+          </span>
+          {r.reason && (
+            <div className="hint" style={{ marginTop: 3 }}>{r.reason}</div>
+          )}
+        </div>
       ) },
   ];
 
