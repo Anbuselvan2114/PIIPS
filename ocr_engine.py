@@ -2069,7 +2069,20 @@ class OCREngine:
 
             "authorised",
 
-            "authorized"
+            "authorized",
+
+            # Generic amount-summary section headings used by layouts whose
+            # own footer markers above never appear until much further down
+            # (e.g. "Bank Details") - without these, everything between the
+            # item table and that later marker (the amount-in-words line,
+            # the Sub Total/Tax/Received/Balance block, a separate tax-rate
+            # table) gets scanned as more table rows, and label fragments
+            # from it end up glued onto the last real item's description.
+            "invoice amount in words",
+
+            "amount in words",
+
+            "sub total",
 
         ]
 
