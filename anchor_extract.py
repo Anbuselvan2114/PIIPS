@@ -65,6 +65,10 @@ LABEL_WORDS = [
     "reference no", "other references", "mode/terms", "terms of payment",
     "gstin", "uin", "state name", "state code", "hsn", "sac", "description",
     "qty", "quantity", "rate", "amount", "unit", "price", "code", "tax invoice",
+    # Other generic GST document-type titles besides "Tax Invoice" (e.g. a
+    # combined invoice/dispatch document) - a document-type label, not a
+    # company name, wherever it prints as the page's own top line.
+    "delivery challan",
     "original copy", "duplicate", "triplicate", "contect person",
     "contact person", "shipping addres", "shipping address", "address",
     "party details", "consignee", "bill to", "ship to", "s.n.", "sl.no",
@@ -374,6 +378,26 @@ def extract(header_rows, footer_rows, page_width):
         for ri, row in enumerate(rows):
                 if ri in claimed_rows:
                     continue
+
+                # A page-wide document-title row (e.g. "Invoice Cum Delivery
+                # Challan (ORIGINAL FOR RECIPIENT)") can straddle the left/
+                # right divider - "Invoice Cum" left of it, "Delivery
+                # Challan (ORIGINAL FOR RECIPIENT)" right of it - so neither
+                # half alone contains a recognizable label phrase even
+                # though the row AS A WHOLE plainly is one. Checked against
+                # the full, unsliced row text (not just the left column
+                # used below), but ONLY for the page's very first row - a
+                # title banner can only ever be the first line of the page,
+                # while every later Seller-block row legitimately pairs
+                # left-column address text with right-column invoice-
+                # metadata labels ("Invoice No." / "Dated") on the SAME
+                # row in the common Tally layout, which would otherwise
+                # false-positive as a title too.
+                if ri == 0 and section == "Seller" and not named["Seller"]:
+                    whole = _row_text(row)
+                    if whole and _is_label(whole):
+                        continue
+
                 left = sorted([w for w in row if w["x"] < divider], key=lambda w: w["x"])
                 if not left:
                     continue
