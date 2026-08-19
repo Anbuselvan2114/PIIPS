@@ -2451,6 +2451,13 @@ _MENU_PROC_DDL = [
 
         -- 1) Per-batch summary. `exportable` = invoices that would appear in
         -- the Excel (active AND not excluded); the UI hides Download when 0.
+        -- Ordered by BatchName itself (newest first), not MIN(h.CreatedAt) -
+        -- a header re-processed into an existing Excluded record (see
+        -- database.reprocess_excluded_header) deliberately keeps its
+        -- original CreatedAt, so that column no longer reflects when the
+        -- batch containing it was actually run. BatchName is always
+        -- "PIIPS_Batch_YYYYMMDD_HHMMSS" (job.batch_name in processor.py),
+        -- which sorts correctly as a plain string without that problem.
         SELECT pt.BatchName, MIN(h.CreatedAt) AS created, COUNT(*) AS headers,
                SUM(CASE WHEN pt.IsActive = 1 AND ISNULL(pt.IsExcluded, 0) = 0
                         THEN 1 ELSE 0 END) AS exportable
@@ -2458,7 +2465,7 @@ _MENU_PROC_DDL = [
         JOIN dbo.tbl_Purchase_Header h ON h.Id = pt.Purchase_Header_ID
         WHERE pt.BatchName IS NOT NULL
         GROUP BY pt.BatchName
-        ORDER BY MIN(h.CreatedAt) DESC;
+        ORDER BY pt.BatchName DESC;
 
         -- 2) Count of tracker rows per StatusID, per batch. Deliberately
         -- NOT filtered by IsActive - see invoices_by_batch()'s docstring
