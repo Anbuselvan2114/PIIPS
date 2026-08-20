@@ -25,8 +25,11 @@ WEBCONFIG_FILE = os.path.join(BASE_DIR, "web.config")
 
 DEFAULT_CONFIG = {
     # Single working folder. Input (and its per-template subfolders),
-    # New_Format and the extracted output all live under here.
-    "folder_path": "",
+    # New_Format and the extracted output all live under here. Only a
+    # starting point for a brand-new config.json (an environment that
+    # already has one keeps whatever it's set to) - always changeable
+    # afterward from the Folder Configuration screen.
+    "folder_path": r"E:\PIIPS_UPloads",
     # SQL Server connection string. Kept in config.json (git-ignored),
     # never hard-coded here, so the credential is not committed to source.
     "db_connection": "",
