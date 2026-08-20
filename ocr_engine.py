@@ -2797,6 +2797,23 @@ class OCREngine:
                         if _val(w["text"]) is None and not is_hsn_or_sac(w["text"].strip())
                     ).strip() or "Freight"
 
+                    # Some layouts print the charge's OWN GST rate as a
+                    # separate cell on this same row (e.g. "Freight Outward
+                    # 9968 | 18 | % | 120.00" - a bare number immediately
+                    # followed by "%", not the HSN and not the Amount). The
+                    # number itself is a valid _val() match, so the label-
+                    # building comprehension above already excludes it from
+                    # the description - it just isn't captured anywhere
+                    # else otherwise, silently discarding a real, explicitly
+                    # stated freight tax rate. Read straight from row_text
+                    # (before that exclusion) rather than the words list, so
+                    # it doesn't matter whether "18" and "%" arrived as one
+                    # token or two.
+                    charge_rate_match = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", row_text)
+                    charge_rate = (
+                        float(charge_rate_match.group(1)) if charge_rate_match else None
+                    )
+
                     if current_item:
                         items.append(current_item)
                     item_seq += 1
@@ -2806,6 +2823,7 @@ class OCREngine:
                         "HSN": hsn,
                         "Quantity": 1, "Rate": amt, "Amount": amt,
                         "charge": True,
+                        "ChargeRatePercent": charge_rate,
                     }
                     pending_lead_in = ""
                     continue
