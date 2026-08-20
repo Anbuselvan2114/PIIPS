@@ -74,9 +74,28 @@ def _description_mismatch(nav_desc, pdf_desc):
 # Backend calls
 # ---------------------------------------------------------------------------
 
+# A single combined call covering a whole processing run's worth of POs/
+# items (as designed - see fetch_sf_batch) can run into the hundreds of
+# entries for a large run, and this backend times out or 500s on a
+# request that big well within the 60s timeout - confirmed directly
+# against the real API. Worse, get_spare_purchase_items/get_hsn_details
+# used to fail the ENTIRE request as one unit, so one slow/oversized call
+# wiped out matches for every invoice in the run, not just the
+# ones that were actually the problem. Chunking keeps each HTTP call
+# small enough to reliably succeed, and a chunk that still fails only
+# costs that chunk's own items - not everyone else's.
+_CHUNK_SIZE = 25
+
+
+def _chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def get_spare_purchase_items(order_numbers):
     """{order_no_lower: [reservation_row, ...]} for the given PO numbers.
-    Returns {} on any error or when no API URL is configured.
+    A chunk that errors is skipped (logged, not raised) so the rest of a
+    large run's chunks still get their real answer.
     Sample: get_spare_purchase_items(['SPRPUR/2026/04/27-83650'])"""
     base = _base_url()
     if not base:
@@ -89,62 +108,60 @@ def get_spare_purchase_items(order_numbers):
     if not payload:
         return {}
 
-    try:
-        resp = _session.post(base + _SPARE_PATH, json=payload, timeout=_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001 - backend optional
-        print(f"Spare purchase API error: {exc}")
-        return {}
-
-    if isinstance(data, dict):
-        rows = data.get("result", data)
-    else:
-        rows = data
-    if not isinstance(rows, list):
-        return {}
-
     grouped = {}
-    for row in rows:
-        if isinstance(row, dict):
-            key = _clean(row.get("SpareRequestOrderNumber"))
-            if key:
-                grouped.setdefault(key, []).append(row)
+    for chunk in _chunked(payload, _CHUNK_SIZE):
+        try:
+            resp = _session.post(base + _SPARE_PATH, json=chunk, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001 - backend optional
+            print(f"Spare purchase API error (chunk of {len(chunk)}): {exc}")
+            continue
+
+        rows = data.get("result", data) if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict):
+                key = _clean(row.get("SpareRequestOrderNumber"))
+                if key:
+                    grouped.setdefault(key, []).append(row)
     return grouped
 
 
 def get_hsn_details(hsn_items):
-    """{(po_lower, part_lower): row} of HSN/item-master details. Returns {}
-    on error or when no API URL is configured.
+    """{(po_lower, part_lower): row} of HSN/item-master details. A chunk
+    that errors is skipped (logged, not raised) so the rest of a large
+    run's chunks still get their real answer.
     Sample: get_hsn_details([{'PartSpecification': 'Oil Filter', 'PurchaseOrderNo': 'SPRPUR/2026/04/27-83650'}])"""
     base = _base_url()
     if not base or not hsn_items:
         return {}
 
-    try:
-        resp = _session.post(base + _HSN_PATH, json=hsn_items, timeout=_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001 - backend optional
-        print(f"HSN details API error: {exc}")
-        return {}
-
-    if isinstance(data, dict):
-        rows = (data.get("PartViewModelList") or data.get("Data")
-                or data.get("Items") or [])
-    elif isinstance(data, list):
-        rows = data
-    else:
-        rows = []
-
     hsn_map = {}
-    for row in rows:
-        if not isinstance(row, dict):
+    for chunk in _chunked(hsn_items, _CHUNK_SIZE):
+        try:
+            resp = _session.post(base + _HSN_PATH, json=chunk, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001 - backend optional
+            print(f"HSN details API error (chunk of {len(chunk)}): {exc}")
             continue
-        po = _clean(row.get("PurchaseOrderNo"))
-        part = _clean(row.get("PartSpecification"))
-        if po and part:
-            hsn_map[(po, part)] = row
+
+        if isinstance(data, dict):
+            rows = (data.get("PartViewModelList") or data.get("Data")
+                    or data.get("Items") or [])
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            po = _clean(row.get("PurchaseOrderNo"))
+            part = _clean(row.get("PartSpecification"))
+            if po and part:
+                hsn_map[(po, part)] = row
     return hsn_map
 
 
