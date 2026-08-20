@@ -729,7 +729,11 @@ class JobManager:
             #     (PENDING IN SF / DATA MISMATCH verdicts are provisional,
             #     not final, until the data itself is checked).
             #   - anything missing -> DATA MISMATCH, with exactly which
-            #     field(s).
+            #     field(s) - excluding one whose only possible source is
+            #     an unset Template value (see excel_export._is_none_source):
+            #     nothing was ever configured to fill it, so its absence
+            #     isn't a real data problem.
+            field_mapping = excel_export.load_mapping()
             for i, group in enumerate(grouped["groups"]):
                 if tracker["statuses"][i] in (
                     "BUYER ORDER NO DOESN'T EXIST", "NEW TEMPLATE", "DUPLICATE",
@@ -741,7 +745,7 @@ class JobManager:
                 header_for_check = dict(group["header"])
                 header_for_check["InvoiceNo"] = group.get("invoice_no", "")
                 missing = excel_export.missing_required_fields(
-                    header_for_check, group["lines"], group["reservations"]
+                    header_for_check, group["lines"], group["reservations"], field_mapping
                 )
                 if missing:
                     tracker["statuses"][i] = "DATA MISMATCH"

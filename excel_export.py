@@ -494,25 +494,49 @@ def required_fields_for_line_type(line_type):
     return REQUIRED_LINE_FIELDS + [extra] if extra else REQUIRED_LINE_FIELDS
 
 
-def _line_missing_fields(line):
+def _is_none_source(sheet, col, mapping):
+    """True when a blank field's source is the "None" case (see
+    field_source's docstring): nothing is actually configured to populate
+    it - no PDF mapping, no Service First mapping, no static Template
+    value entered either. Mirrors database.get_invoice_field_check's own
+    Template-blank-means-None refinement, reused here so a field nobody
+    ever intended to fill can't itself cause DATA MISMATCH - only a field
+    that's genuinely supposed to come from the PDF/Service First/a real
+    Template value/System and doesn't should."""
+    return field_source(sheet, col, mapping) == "Template"
+
+
+def _line_missing_fields(line, mapping=None):
     return {
         f for f in required_fields_for_line_type(line.get("Type"))
-        if _is_blank(line.get(f))
+        if _is_blank(line.get(f)) and not _is_none_source("Purchase Line", f, mapping)
     }
 
 
-def missing_required_fields(header, lines, reservations=None):
+def missing_required_fields(header, lines, reservations=None, mapping=None):
     """Names of mandatory Purchase Header/Line/Reservation Entry columns
     that are empty/null for this invoice (the header row, every line item
-    row, and every reservation row). An empty list means the invoice is
-    complete. `reservations` defaults to none checked — invoices with no
-    reservation rows at all (e.g. NON-GRN, which never syncs with Service
-    First) aren't penalized for having none."""
-    missing = {f for f in REQUIRED_HEADER_FIELDS if _is_blank(header.get(f))}
+    row, and every reservation row) AND actually meant to be filled from
+    somewhere (PDF/Service First/a real configured Template value/System)
+    - a field whose only possible source is an unset Template value (see
+    _is_none_source) is expected to be blank and never counts here. An
+    empty list means the invoice is complete. `reservations` defaults to
+    none checked — invoices with no reservation rows at all (e.g. NON-GRN,
+    which never syncs with Service First) aren't penalized for having
+    none. `mapping` is the field mapping (load_mapping()'s result);
+    loaded fresh if not passed in."""
+    mapping = mapping if mapping is not None else load_mapping()
+    missing = {
+        f for f in REQUIRED_HEADER_FIELDS
+        if _is_blank(header.get(f)) and not _is_none_source("Purchase Header", f, mapping)
+    }
     for line in lines:
-        missing.update(_line_missing_fields(line))
+        missing.update(_line_missing_fields(line, mapping))
     for res in (reservations or []):
-        missing.update(f for f in REQUIRED_RESERVATION_FIELDS if _is_blank(res.get(f)))
+        missing.update(
+            f for f in REQUIRED_RESERVATION_FIELDS
+            if _is_blank(res.get(f)) and not _is_none_source("Reservation Entry", f, mapping)
+        )
     return sorted(missing)
 
 
