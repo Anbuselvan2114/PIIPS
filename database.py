@@ -1127,6 +1127,12 @@ def get_invoice_field_check(header_id):
                 # template value exists when it doesn't.
                 if source == "Template" and not v.strip():
                     source = "None"
+                # A "None" field has nothing configured to populate it at
+                # all - not shown here at all (nothing to review or act
+                # on), and never counts toward DATA MISMATCH either (see
+                # excel_export.missing_required_fields).
+                if source == "None":
+                    continue
                 missing = not v.strip()
                 row_out = {
                     "field": n, "value": v, "missing": missing,
