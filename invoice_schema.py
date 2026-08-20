@@ -571,6 +571,42 @@ def _tax_rate(tax_total):
     return None
 
 
+def _tax_amount(tax_total):
+    """Total GST amount actually printed on the invoice (IGST, or
+    CGST+SGST summed) - used to reconcile whether freight was taxed (see
+    the items loop below). None if the summary table has no usable
+    amount at all.
+
+    A table with more than one HSN/rate group usually also prints its
+    own "Total" row restating the combined figure - use ONLY that row
+    when present, rather than summing every row, or a table that
+    already includes its own total would get double-counted (a
+    single-group table's "Total" row just repeats the one HSN row's own
+    figures, so this still gives the right answer either way)."""
+
+    total_row = next(
+        (row for row in tax_total if (row.get("HSN") or "").strip().lower() == "total"),
+        None,
+    )
+    if total_row is not None:
+        tax_total = [total_row]
+
+    total = 0.0
+    found = False
+    for row in tax_total:
+        igst = _num(row.get("IGST_Amount"))
+        if igst:
+            total += igst
+            found = True
+            continue
+        cgst = _num(row.get("CGST_Amount"))
+        sgst = _num(row.get("SGST_Amount"))
+        if cgst or sgst:
+            total += (cgst or 0) + (sgst or 0)
+            found = True
+    return total if found else None
+
+
 def _rate_near(text, keyword):
     """First plausible percentage on a line that mentions `keyword`."""
 
@@ -637,6 +673,43 @@ def _gst_rate_from_text(text):
         return cgst or sgst
 
     return _rate_near(text, "gst")
+
+
+_AMOUNT_RE = re.compile(r"[\d,]+\.\d{2}")
+
+
+def _gst_amount_from_text(text):
+    """Best-effort total GST amount read straight from the OCR text (the
+    last currency-shaped number - i.e. with 2 decimal places, so it's
+    never confused with a bare rate like "18" - on a line mentioning
+    IGST/CGST+SGST/GST). Used when the structured tax-summary table has
+    no usable amount either (some layouts print the rate/amount as a
+    plain text line - e.g. "Output IGST@18%  18 %  219.60" - not a table
+    this code recognises)."""
+
+    if not text:
+        return None
+
+    def _amount_near(keyword):
+        for line in text.splitlines():
+            if keyword in line.lower():
+                nums = _AMOUNT_RE.findall(line)
+                if nums:
+                    return _num(nums[-1])
+        return None
+
+    igst = _amount_near("igst")
+    if igst:
+        return igst
+
+    cgst = _amount_near("cgst")
+    sgst = _amount_near("sgst")
+    if cgst and sgst:
+        return cgst + sgst
+    if cgst or sgst:
+        return cgst or sgst
+
+    return _amount_near("gst")
 
 
 # A right-scan for Invoice No. can occasionally run past its own value into
@@ -842,6 +915,55 @@ def build_invoice_json(result, pdf_path=""):
             "HSN_Type": "Goods",
             "Nav_Item_No": "",
         })
+
+    # ---- Freight/courier GST %: reconcile against the invoice's own
+    # stated tax amount, not just what's printed on the charge line's own
+    # row -------------------------------------------------------------
+    # A rate printed right on the freight row (or its absence) can be
+    # right, wrong, or lost to OCR/layout noise - but the invoice's own
+    # arithmetic never lies. Test both possibilities against the actual
+    # tax amount the PDF states: goods taxed alone, or goods+freight
+    # taxed together. Whichever reproduces the real number decides every
+    # charge line's rate for this invoice, overriding the per-line
+    # guess above (only when the check is actually possible - an
+    # invoice with no parseable tax-summary amount, or no freight line
+    # at all, keeps the per-line result as-is).
+    actual_tax = _tax_amount(tax_total)
+    if actual_tax is None:
+        actual_tax = _gst_amount_from_text(result.get("Text", ""))
+    if rate and actual_tax is not None:
+        goods_total = sum(
+            _num(it2["Amount"]) or 0 for it2 in items if not it2["_charge"]
+        )
+        freight_total = sum(
+            _num(it2["Amount"]) or 0 for it2 in items if it2["_charge"]
+        )
+        if freight_total:
+            candidate_0 = round(goods_total * rate / 100, 2)
+            candidate_full = round((goods_total + freight_total) * rate / 100, 2)
+            diff_0 = abs(actual_tax - candidate_0)
+            diff_full = abs(actual_tax - candidate_full)
+            # A real match reproduces the stated tax almost exactly - only
+            # off by paisa-level rounding, never rupees. Require that
+            # before trusting either candidate; a table with its own
+            # parsing quirks (e.g. a CGST+SGST layout that only captured
+            # one half, so actual_tax reads roughly half of the true
+            # figure) can otherwise still be numerically "closer" to one
+            # candidate than the other by sheer chance, which isn't a
+            # genuine reconciliation - falling through to keep the
+            # per-line result (the safer 0-unless-stated default) is
+            # better than trusting a coincidence.
+            TOLERANCE = 2.0
+            resolved_rate = None
+            if diff_0 <= TOLERANCE or diff_full <= TOLERANCE:
+                resolved_rate = rate if diff_full < diff_0 else 0
+            if resolved_rate is not None:
+                for it2 in items:
+                    if it2["_charge"]:
+                        it2["TaxPercentage"] = resolved_rate if resolved_rate else "0"
+                        it2["HSN_Percentage_Description"] = (
+                            f"Goods {resolved_rate:g}%" if resolved_rate else ""
+                        )
 
     # Consignee / Ship-to falls back to Buyer / Bill-to when the PDF has no
     # separate consignee block (item 12).
