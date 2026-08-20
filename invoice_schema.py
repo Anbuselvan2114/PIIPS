@@ -775,7 +775,24 @@ def build_invoice_json(result, pdf_path=""):
         # came back blank, rather than leaving GST % empty. Reads the raw
         # description (before _clean_item_description below strips that
         # same "18%" out as noise).
-        item_rate = rate if rate else _rate_near(raw_desc, "")
+        #
+        # A freight/courier charge line never gets this invoice-level rate
+        # at all - that rate is the GOODS tax table's rate, which routinely
+        # differs from (or simply doesn't apply to) freight. Only a
+        # percentage actually printed on the charge line's own text counts;
+        # when the PDF doesn't state one there, the correct reading is 0%,
+        # not silently inheriting whatever the items were taxed at.
+        if is_charge:
+            # ocr_engine's charge-row parser captures a rate printed as its
+            # own cell on that row (e.g. "Freight Outward | 9968 | 18 | % |
+            # 120.00") separately, since that number gets excluded from the
+            # description text there (it's a valid number, not label text)
+            # - prefer it over re-scanning the description for the same
+            # thing, which would only find it if it happened to survive
+            # into the text.
+            item_rate = it.get("ChargeRatePercent") or _rate_near(raw_desc, "") or 0
+        else:
+            item_rate = rate if rate else _rate_near(raw_desc, "")
         # (keyword="" matches every line - the description is what we're
         # scanning here, not a labelled tax-summary line.)
 
@@ -806,7 +823,14 @@ def build_invoice_json(result, pdf_path=""):
             "Quantity": qty_n if qty_n is not None else "",
             "Amount": amt_n if amt_n is not None else "",
             "GST_Base_Amount": amt_n if amt_n is not None else "",
-            "TaxPercentage": item_rate if item_rate else "",
+            # item_rate can be a legitimate 0 for a charge line (see above) -
+            # `item_rate else ...` would wrongly collapse that back to blank
+            # (0 is falsy), so charge lines get an explicit "0" rather than
+            # falling through to the same "" an Item line's true unknown
+            # rate uses.
+            "TaxPercentage": (
+                item_rate if item_rate else ("0" if is_charge else "")
+            ),
             "HSN_Percentage_Description": (
                 f"Goods {item_rate:g}%" if item_rate else ""
             ),
