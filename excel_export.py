@@ -192,9 +192,17 @@ def _freight_line_override(sheet, col, inv, item):
     if col == "GST Group Type":
         return "Service"
     if col == "GST Group Code":
+        # `and rate` would treat a genuine 0% (falsy) as "no rate at all"
+        # and collapse this back down to the bare "Service", losing the
+        # rate a freight line with no GST is legitimately supposed to
+        # show ("Service 0%", not just "Service") - only a rate that
+        # isn't a number at all (never actually resolved) falls back.
         rate = item.get("TaxPercentage")
-        rate_str = f"{rate:g}%" if isinstance(rate, (int, float)) and rate else ""
-        return f"Service {rate_str}".strip() if rate_str else "Service"
+        try:
+            rate_n = float(rate) if rate not in (None, "") else None
+        except (TypeError, ValueError):
+            rate_n = None
+        return f"Service {rate_n:g}%" if rate_n is not None else "Service"
     return None
 
 
