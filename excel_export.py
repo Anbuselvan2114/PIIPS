@@ -379,6 +379,7 @@ REQUIRED_HEADER_FIELDS = [
 REQUIRED_LINE_FIELDS = [
     "Line No.", "Type", "Location Code", "Description",
     "Quantity", "Direct Unit Cost", "Line Amount", "TDS Nature of Deduction",
+    "GST Group Code", "GST Group Type", "GST Base Amount",
 ]
 
 # Purchase Line "No." (Nav Item No.) is mandatory only for an "Item" line —

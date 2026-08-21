@@ -1154,7 +1154,9 @@ def get_invoice_field_check(header_id):
                 rows.append(row_out)
             return rows
 
-        header_wanted = excel_export.REQUIRED_HEADER_FIELDS + ["InvoiceNo"]
+        # REQUIRED_HEADER_FIELDS already ends with "InvoiceNo" - appending
+        # it again here used to show it twice in the Fields popup.
+        header_wanted = excel_export.REQUIRED_HEADER_FIELDS
         header_cols = _existing_cols(cur, "tbl_Purchase_Header", header_wanted)
         header_values = {}
         if header_cols:
