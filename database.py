@@ -918,7 +918,11 @@ def fetch_batch(batch_name, sheet_cols):
                         rate = float(row.get("GST %") or 0)
                     except (TypeError, ValueError):
                         rate = 0
-                    row["GST Group Code"] = f"Service {rate:g}%" if rate else "Service"
+                    # `if rate else "Service"` would collapse a genuine
+                    # 0% (falsy) back down to the bare fallback, losing
+                    # the rate a freight line with no GST is legitimately
+                    # supposed to show ("Service 0%", not just "Service").
+                    row["GST Group Code"] = f"Service {rate:g}%"
 
         for row in re_r:
             if not (row.get("Source ID") or "").strip():
