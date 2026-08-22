@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   startProcessing, getStatus, getResult, getActiveJob,
-  getBatches, batchDownloadUrl, getStatusCounts,
+  getBatches, downloadBatchFile, getStatusCounts,
   getInvoicesByStatus, getInvoicesByBatch, setInvoiceExcluded,
   getInvoiceFieldCheck,
 } from "./api";
@@ -106,6 +106,8 @@ export default function Dashboard({ user }) {
   const [results, setResults] = useState([]);
   const [batches, setBatches] = useState([]);
   const [batchInputs, setBatchInputs] = useState({});   // batch -> {docNo, entryNo}
+  const [batchError, setBatchError] = useState(null);
+  const [downloadingBatch, setDownloadingBatch] = useState(null);
   const [statusCounts, setStatusCounts] = useState([]);
   const [modal, setModal] = useState(null);
   const [fieldModal, setFieldModal] = useState(null);
@@ -202,6 +204,30 @@ export default function Dashboard({ user }) {
       }));
       loadStatusCounts(); loadBatches();
     } catch (e) { setError(e.message); }
+  };
+
+  const [includingAll, setIncludingAll] = useState(false);
+  const includeAll = async () => {
+    const targets = (modal?.rows || []).filter((r) => r.is_excluded && r.header_id);
+    if (!targets.length) return;
+    setIncludingAll(true);
+    try {
+      const results = await Promise.allSettled(
+        targets.map((r) => setInvoiceExcluded(r.header_id, false, user?.user_id)));
+      const byId = new Map(targets.map((r, i) => [r.header_id, results[i]]));
+      setModal((m) => m && ({
+        ...m,
+        rows: m.rows.map((x) => {
+          const res = byId.get(x.header_id);
+          return res && res.status === "fulfilled"
+            ? { ...x, is_excluded: false, status: res.value.new_status || x.status }
+            : x;
+        }),
+      }));
+      const failed = results.filter((r) => r.status === "rejected");
+      if (failed.length) setError(`${failed.length} invoice(s) could not be included.`);
+      loadStatusCounts(); loadBatches();
+    } finally { setIncludingAll(false); }
   };
 
   const percent = job?.percent ?? 0;
@@ -316,10 +342,39 @@ export default function Dashboard({ user }) {
   // Document No / Entry No / Download only make sense while a batch still
   // has invoices sitting at READY TO LOAD — once everything has moved on
   // to Loaded/Posted/Completed there's nothing left to stage for NAV.
-  const canDownload = (row) => (row.exportable ?? 1) > 0 && (row["st:READY TO LOAD"] ?? 0) > 0;
+  // A batch locks the moment any invoice in it reaches Loaded/Excluded (or
+  // later) - see database._batch_status_and_lock. From then on the whole
+  // batch can no longer be downloaded or renumbered, even for invoices
+  // still sitting at Ready to Load. Batches must also clear in creation
+  // order - blocked_by names any earlier, not-yet-cleared batch(es) this
+  // one must wait on (see database.list_batches). Only one batch may be
+  // Downloaded/In Progress at a time - see app.py's download_batch.
+  const canDownload = (row) => (row.exportable ?? 1) > 0 && (row["st:READY TO LOAD"] ?? 0) > 0
+    && !row.locked && !(row.blocked_by || []).length
+    && !batches.some((b) => b.batch !== row.batch
+      && (b.batch_status === "DOWNLOADED" || b.batch_status === "IN PROGRESS"));
+
+  // A plain link navigation can't show a clean error (a failed download,
+  // e.g. a Document No. collision, would just dump raw JSON in the
+  // browser) - fetch it instead so a rejection surfaces here as a normal
+  // Dashboard alert, and only save the file on success.
+  const doDownload = async (batch) => {
+    setBatchError(null); setDownloadingBatch(batch);
+    try {
+      const { blob, filename } = await downloadBatchFile(
+        batch, batchInputs[batch]?.docNo, batchInputs[batch]?.entryNo);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) { setBatchError(e.message); }
+    finally { setDownloadingBatch(null); }
+  };
 
   const batchColumns = [
     { key: "batch", label: "Batch Name" },
+    { key: "batch_status", label: "Batch Status", render: (row) => row.batch_status || "CREATED" },
     { key: "extracted", label: "Extracted", render: (row) => row.extracted ?? 0 },
     ...BATCH_STATUS_COLS.map(({ status, label }) => ({
       key: `st:${status}`,
@@ -352,12 +407,17 @@ export default function Dashboard({ user }) {
       ) : <span className="muted">—</span>) },
     { key: "_dl", label: "", sortable: false,
       render: (row) => (canDownload(row) ? (
-        <a className="btn btn-primary btn-sm"
-           href={batchDownloadUrl(row.batch, batchInputs[row.batch]?.docNo, batchInputs[row.batch]?.entryNo)}>
-          Download
-        </a>
+        <button className="btn btn-primary btn-sm" disabled={downloadingBatch === row.batch}
+                onClick={() => doDownload(row.batch)}>
+          {downloadingBatch === row.batch ? "Downloading…" : "Download"}
+        </button>
       ) : (
-        <span className="muted" title="No active / included invoices to export, or every invoice in this batch has already moved past Ready to Load">—</span>
+        <span className="muted"
+              title={row.locked
+                ? "This batch has an invoice already Loaded, Excluded, Posted, Completed, or Rejected — it can no longer be downloaded or renumbered."
+                : (row.blocked_by || []).length
+                ? `Waiting on earlier batch(es) to be Loaded, Posted, or Completed first: ${row.blocked_by.join(", ")}`
+                : "No active / included invoices to export, or every invoice in this batch has already moved past Ready to Load"}>—</span>
       )) },
   ];
 
@@ -394,6 +454,24 @@ export default function Dashboard({ user }) {
               <h3>Batches</h3><div style={{ flex: 1 }} />
               <button className="btn btn-subtle btn-sm" onClick={loadBatches}>Refresh</button>
             </div>
+            {(() => {
+              // Only one batch may be mid-flight (Downloaded/In Progress)
+              // at a time - see app.py's download_batch - so name whichever
+              // batch(es) are currently sitting in that state, not just the
+              // ones an ordering check (blocked_by) would report.
+              const active = batches
+                .filter((b) => b.batch_status === "DOWNLOADED" || b.batch_status === "IN PROGRESS")
+                .map((b) => b.batch);
+              if (!active.length) return null;
+              return (
+                <div className="alert alert-info" style={{ marginBottom: 12 }}>
+                  Batch {active.join(", ")} {active.length > 1 ? "are" : "is"} still Downloaded/In Progress — no other batch can be downloaded until {active.length > 1 ? "they are" : "it's"} fully Loaded, Posted, or Completed.
+                </div>
+              );
+            })()}
+            {batchError && (
+              <div className="alert alert-danger" style={{ marginBottom: 12 }}>{batchError}</div>
+            )}
             <DataTable columns={batchColumns} rows={batchRows} searchKeys={["batch", "created"]}
                        empty="No batches yet. Run Start to create one." />
           </div>
@@ -437,6 +515,14 @@ export default function Dashboard({ user }) {
       {modal && (
         <Modal title={modal.title} onClose={() => setModal(null)}>
           {modal.error && <div className="alert alert-danger">{modal.error}</div>}
+          {modal.kind === "batch" && modal.status === "EXCLUDED"
+            && !modal.loading && modal.rows.some((r) => r.is_excluded) && (
+            <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+              <button className="btn btn-subtle btn-sm" disabled={includingAll} onClick={includeAll}>
+                {includingAll ? "Including…" : "Include All"}
+              </button>
+            </div>
+          )}
           {modal.loading ? <div className="empty">Loading…</div> : (
             <DataTable
               columns={modal.kind === "batch" ? batchModalColumns : invoiceColumns}

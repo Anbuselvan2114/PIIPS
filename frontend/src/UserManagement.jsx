@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { getUsers, createUser, setUserActive, adminResetPassword } from "./api";
+import { getUsers, createUser, setUserActive, adminResetPassword, adminChangeUserType } from "./api";
 import { DataTable, confirmDialog, PasswordInput } from "./components";
 
 // Fields stacked vertically instead of the shared ".row"'s default
@@ -16,6 +16,8 @@ export default function UserManagement({ user }) {
   const [assignPw, setAssignPw] = useState({ target_user_id: "", next: "", confirm: "" });
   const [assignPwMsg, setAssignPwMsg] = useState(null);
   const [assignPwBusy, setAssignPwBusy] = useState(false);
+  const [typeEdits, setTypeEdits] = useState({});   // user_id -> pending selected type id
+  const [typeBusyId, setTypeBusyId] = useState(null);
 
   const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
 
@@ -83,6 +85,27 @@ export default function UserManagement({ user }) {
     () => users.filter((u) => u.IsActive && canAssignFor(u)),
     [users, isSuperAdmin, user]
   );
+
+  // Same rule as canAssignFor, applied to the role being ASSIGNED rather
+  // than who it's assigned to: an Admin may only hand out the plain
+  // User/Accounts role - never promote someone to Admin/Super Admin.
+  // Mirrors /api/users/change-type's own check (the real enforcement).
+  const assignableTypes = isSuperAdmin
+    ? types
+    : types.filter((t) => ["user", "accounts"].includes((t.name || "").toLowerCase()));
+
+  const saveType = async (u) => {
+    const newTypeId = Number(typeEdits[u.UserId]);
+    if (!newTypeId || newTypeId === u.UserTypeID) return;
+    setTypeBusyId(u.UserId);
+    try {
+      const r = await adminChangeUserType(user?.user_id, u.UserId, newTypeId);
+      setMessage({ ok: true, text: `"${u.UserName}" is now ${r.user_type_name}.` });
+      setTypeEdits((s) => { const n = { ...s }; delete n[u.UserId]; return n; });
+      refresh();
+    } catch (e) { setMessage({ ok: false, text: e.message }); }
+    finally { setTypeBusyId(null); }
+  };
 
   const onAssignPw = async (e) => {
     e.preventDefault();
@@ -182,7 +205,26 @@ export default function UserManagement({ user }) {
           columns={[
             { key: "user", label: "User" },
             { key: "email", label: "Email" },
-            { key: "type", label: "Type" },
+            { key: "type", label: "Type", sortable: false,
+              render: (r) => {
+                if (!canAssignFor(r._u)) return r.type;
+                const pending = typeEdits[r._u.UserId];
+                const changed = pending !== undefined && Number(pending) !== r._u.UserTypeID;
+                return (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <select value={pending ?? r._u.UserTypeID}
+                            onChange={(e) => setTypeEdits((s) => ({ ...s, [r._u.UserId]: e.target.value }))}>
+                      {assignableTypes.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+                    </select>
+                    {changed && (
+                      <button className="btn btn-sm btn-primary" disabled={typeBusyId === r._u.UserId}
+                              onClick={() => saveType(r._u)}>
+                        {typeBusyId === r._u.UserId ? "Saving…" : "Save"}
+                      </button>
+                    )}
+                  </div>
+                );
+              } },
             { key: "active", label: "Status",
               render: (r) => <span className={`badge ${r._u.IsActive ? "badge-success" : "badge-danger"}`}>{r.active}</span> },
             { key: "created", label: "Created" },

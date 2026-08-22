@@ -43,8 +43,10 @@ STATUS_VALUES = [
 ]
 
 # User type values for tbl_UserType. "Accounts" runs the Load/Post/Complete
-# lifecycle (see ROLE_MENUS in the frontend App.jsx).
-USER_TYPE_VALUES = ["User", "Admin", "Super Admin", "Accounts"]
+# lifecycle; "Viewer" can see every menu/page but never change anything -
+# every mutating endpoint rejects it via app.py's _require_not_viewer
+# (see ROLE_MENUS in the frontend App.jsx).
+USER_TYPE_VALUES = ["User", "Admin", "Super Admin", "Accounts", "Viewer"]
 
 # Invoice type values for tbl_InvoiceType (formerly the free-text "GRN" /
 # "NON-GRN" strings baked into template/folder paths — PART = GRN, SERVICE =
@@ -201,23 +203,18 @@ def save_grouped(data, batch_name=None, tracker=None):
     Sample: save_grouped(grouped, 'PIIPS_Batch_20260722_101500', tracker)
 
     [No.] (header) / [Document No.] (line) / [Source ID] (reservation) are
-    deliberately saved blank, not the auto-generated Document No. — a
-    download's renumbering (excel_export.renumber_batch) must never end up
-    disagreeing with what's actually stored. The proposed number goes into
-    Last_Updated_No instead (self-healing column, see usp_SaveInvoiceBatch);
-    it becomes real/permanent only once the invoice is marked Loaded (see
-    advance_status). This mutates `data`'s groups in place — safe here since
-    the caller (processor.py's _save_to_db) builds `data` fresh for this
-    call and doesn't read it again afterward; in particular the mandatory-
-    field completeness check (ready vs incomplete) already ran on the real
-    numbers *before* this function is called, so blanking them now doesn't
-    affect that classification — only the DB write.
+    deliberately saved blank — a real, unique Document No. is only minted
+    at Excel-download time (see fetch_batch/_assign_document_numbers),
+    resolving PO_Number_Format live from the template rather than storing
+    it on the header at all. This mutates `data`'s groups in place — safe
+    here since the caller (processor.py's _save_to_db) builds `data` fresh
+    for this call and doesn't read it again afterward; in particular the
+    mandatory-field completeness check (ready vs incomplete) already ran
+    before this function is called, so blanking them now doesn't affect
+    that classification — only the DB write.
     """
     for g in data.get("groups", []):
         header = g.get("header") or {}
-        original_no = (header.get("No.") or "").strip()
-        if original_no:
-            header["Last_Updated_No"] = original_no
         header["No."] = ""
         for line in g.get("lines") or []:
             line["Document No."] = ""
@@ -228,7 +225,7 @@ def save_grouped(data, batch_name=None, tracker=None):
     ph_cols = list(cols["Purchase Header"])
     pl_cols = list(cols["Purchase Line"])
     re_cols = list(cols["Reservation Entry"])
-    header_cols = ph_cols + ["InvoiceNo", "Last_Updated_No", "PO_Number_Format"]   # BatchName now lives on the tracker
+    header_cols = ph_cols + ["InvoiceNo"]   # BatchName now lives on the tracker
 
     tracker = tracker or {}
     initiators = tracker.get("initiators") or []
@@ -250,8 +247,6 @@ def save_grouped(data, batch_name=None, tracker=None):
     for gid, g in enumerate(data.get("groups", [])):
         header = {c: _norm(g["header"].get(c)) for c in ph_cols}
         header["InvoiceNo"] = g.get("invoice_no")
-        header["Last_Updated_No"] = g["header"].get("Last_Updated_No")
-        header["PO_Number_Format"] = g.get("po_number_format")
         header["_BatchName"] = batch_name       # -> tracker.BatchName
         header["_gid"] = gid
         init = initiators[gid] if gid < len(initiators) else None
@@ -619,14 +614,18 @@ def reprocess_excluded_header(existing_header_id, new_header_id):
     against), then discard the now-empty temporary new_header_id shell.
     Re-checks the existing tracker is actually Excluded itself (not just
     trusting a caller's earlier read) so this can never silently overwrite
-    a live invoice under any other status.
+    a live invoice under any other status. The existing header's BatchName
+    and [No.] are preserved as-is (not overwritten by the new insert's) -
+    re-processing re-includes the invoice into the batch it already
+    belonged to, with whatever Document No. it already had (even blank),
+    rather than moving it into a new batch or resetting its numbering.
     Sample: reprocess_excluded_header(42, 57)"""
     ensure_menu_schema()
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT s.StatusName FROM dbo.tbl_Purchase_Tracker pt "
+            "SELECT s.StatusName, pt.BatchName FROM dbo.tbl_Purchase_Tracker pt "
             "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
             "WHERE pt.Purchase_Header_ID = ?",
             existing_header_id,
@@ -634,11 +633,16 @@ def reprocess_excluded_header(existing_header_id, new_header_id):
         row = cur.fetchone()
         if not row or (row[0] or "").strip().upper() != "EXCLUDED":
             return False
+        batch_name = row[1]
 
-        # ---- Header: copy every real data column from new -> existing ----
+        # ---- Header: copy every real data column from new -> existing,
+        # EXCEPT [No.] - re-processing brings in fresh extracted data, not
+        # a fresh Document No.; whatever No. this invoice already had (even
+        # blank) is left exactly as it is, to be minted at the next
+        # download of whichever batch it ends up in (see fetch_batch) ----
         cur.execute(
             "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.tbl_Purchase_Header')")
-        h_cols = [r[0] for r in cur.fetchall() if r[0] not in ("Id", "CreatedAt")]
+        h_cols = [r[0] for r in cur.fetchall() if r[0] not in ("Id", "CreatedAt", "No.")]
         if h_cols:
             cur.execute(
                 f"SELECT {', '.join(_q(c) for c in h_cols)} FROM dbo.tbl_Purchase_Header WHERE Id = ?",
@@ -663,11 +667,16 @@ def reprocess_excluded_header(existing_header_id, new_header_id):
 
         # ---- Tracker: copy the new tracker's fields onto the EXISTING
         # tracker row in place (clears IsExcluded/PriorStatusID, adopts the
-        # fresh verdict/status/batch), then drop the temporary new tracker ----
+        # fresh verdict/status), then drop the temporary new tracker.
+        # BatchName is deliberately NOT overwritten - re-processing an
+        # excluded invoice re-includes it into the batch it already
+        # belonged to, not whatever batch this particular reprocessing run
+        # happened to be, so it downloads/numbers alongside its original
+        # batch instead of silently jumping to a new one ----
         cur.execute(
             "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.tbl_Purchase_Tracker')")
         t_cols = [r[0] for r in cur.fetchall()
-                  if r[0] not in ("Id", "Purchase_Header_ID", "CreatedById", "CreatedDatetime")]
+                  if r[0] not in ("Id", "Purchase_Header_ID", "CreatedById", "CreatedDatetime", "BatchName")]
         if t_cols:
             cur.execute(
                 f"SELECT {', '.join(_q(c) for c in t_cols)} FROM dbo.tbl_Purchase_Tracker "
@@ -688,17 +697,121 @@ def reprocess_excluded_header(existing_header_id, new_header_id):
         )
         cur.execute("DELETE FROM dbo.tbl_Purchase_Tracker WHERE Purchase_Header_ID = ?", new_header_id)
         cur.execute("DELETE FROM dbo.tbl_Purchase_Header WHERE Id = ?", new_header_id)
+        # Reprocessing an Excluded invoice back to a real status (e.g. Ready
+        # To Load) is a re-inclusion just like the manual Include button -
+        # see _mark_batch_reincluded - so the batch is shown as at least
+        # Downloaded rather than quietly looking freshly Created again.
+        _mark_batch_reincluded(cur, batch_name)
         conn.commit()
         return True
     finally:
         conn.close()
 
 
+# Any invoice reaching one of these means the batch's Document No.
+# sequence may already be partly committed (Loaded into Navision, or
+# deliberately dropped) - see _batch_status_and_lock/batch_is_locked.
+# Excluded is deliberately NOT here: it's ignored entirely (see
+# _BATCH_IGNORED_STATUSES) and never locks the batch on its own - the
+# batch's lock state is always driven by its currently-included invoices.
+_BATCH_LOCK_STATUSES = ("LOADED", "POSTED", "COMPLETED", "REJECTED BY ACCOUNTS")
+
+
+# Statuses ignored entirely when deciding whether a batch is "cleared" (see
+# _batch_is_cleared) or computing its status label (see
+# _batch_status_and_lock). Each is either inert (Excluded/Duplicate never
+# need further action - a duplicate is already handled under a different
+# header) or off on its own separate resolution path (New Template needs
+# retraining, Data Mismatch needs a data fix) that shouldn't hold up this
+# batch's own status label, or any batch behind it, indefinitely.
+_BATCH_IGNORED_STATUSES = ("EXCLUDED", "NEW TEMPLATE", "DUPLICATE", "DATA MISMATCH")
+
+
+def _batch_is_cleared(counts):
+    """True if every invoice in a batch NOT in _BATCH_IGNORED_STATUSES has
+    reached LOADED/POSTED/COMPLETED, OR none of them have reached that far
+    YET (still sitting at Ready To Load, say) - a batch that hasn't started
+    doesn't hold up a later batch either. Only PARTIAL progress - some
+    invoices Loaded/Posted/Completed, others not - counts as not cleared,
+    since that's real, unfinished work for this batch specifically."""
+    counted_total = sum(c for s, c in counts.items() if s not in _BATCH_IGNORED_STATUSES)
+    cleared = counts.get("LOADED", 0) + counts.get("POSTED", 0) + counts.get("COMPLETED", 0)
+    return cleared == 0 or cleared == counted_total
+
+
+def _batch_status_and_lock(counts, downloaded, ever_reincluded=False):
+    """(batch_status, locked) derived from a batch's {status: count} map and
+    whether it's ever been downloaded. Precedence: Excluded > Completed >
+    Loaded/Posted (uniform) > In Progress > Downloaded > Created. The label
+    is always computed from the batch's currently-INCLUDED invoices -
+    Excluded ones are ignored entirely (see _BATCH_IGNORED_STATUSES) and
+    never lock the batch or move its label off of what the remaining
+    invoices would show on their own.
+    - Created: nothing downloaded yet, nothing moved on.
+    - Downloaded: the Excel has been pulled at least once, nothing moved on
+      (an Excluded invoice sitting alongside all-Ready-To-Load invoices
+      does NOT change this - it's ignored).
+    - Loaded / Posted: every invoice outside _BATCH_IGNORED_STATUSES has
+      reached that SAME single stage (see _batch_is_cleared) - e.g. one
+      Loaded invoice plus any number of Excluded/Data Mismatch/Duplicate/
+      New Template invoices still counts as "Loaded".
+    - In Progress: at least one invoice (outside _BATCH_IGNORED_STATUSES)
+      has reached Loaded/Posted/Completed/Rejected but NOT every one has
+      reached the SAME stage (see batch_is_locked/_batch_is_cleared) - real,
+      partial progress. No more downloading or Document No./Entry No.
+      renumbering for the WHOLE batch, since part of its sequence may
+      already be committed. A batch where NOTHING has moved past Ready To
+      Load yet is NOT "in progress" even if it has Excluded/Data Mismatch/
+      Duplicate rows sitting in it - those don't represent real work
+      started on this batch.
+    - Excluded: every invoice in the batch is Excluded (none Completed) -
+      the whole batch was dropped, not finished.
+    - Completed: every invoice is Completed or Excluded (at least one
+      actually Completed).
+    A batch that has ever had a re-inclusion (ever_reincluded - see
+    _batch_ever_reincluded, set by both the manual Include button and
+    reprocessing an Excluded invoice back to a real status) is ALWAYS shown
+    as at least Downloaded, taking priority even over "In Progress" - e.g.
+    a batch already Loaded except for one invoice that got re-included and
+    is sitting at Ready To Load again still shows Downloaded, not In
+    Progress, since the point of including a file back in is exactly to
+    download the batch again and mint IT a fresh number - the already-
+    Loaded invoices elsewhere still keep the batch 'locked' (returned
+    separately), so nothing about them gets renumbered by that download."""
+    total = sum(counts.values())
+    locked = any(counts.get(s, 0) > 0 for s in _BATCH_LOCK_STATUSES)
+    if total > 0 and counts.get("EXCLUDED", 0) == total:
+        return "EXCLUDED", locked
+
+    completed_or_excluded = counts.get("COMPLETED", 0) + counts.get("EXCLUDED", 0)
+    if total > 0 and completed_or_excluded == total:
+        return "COMPLETED", locked
+
+    counted_total = sum(c for s, c in counts.items() if s not in _BATCH_IGNORED_STATUSES)
+    reached = {s for s in ("LOADED", "POSTED", "COMPLETED") if counts.get(s, 0) > 0}
+    if counted_total > 0 and len(reached) == 1 and _batch_is_cleared(counts):
+        return next(iter(reached)), locked
+    if ever_reincluded:
+        return "DOWNLOADED", locked
+    if locked:
+        return "IN PROGRESS", locked
+    if downloaded:
+        return "DOWNLOADED", locked
+    return "CREATED", locked
+
+
 def list_batches():
     """Batches (newest first), each with a per-status count map keyed by status
-    name (one entry per StatusID that occurs in the batch's tracker rows).
+    name (one entry per StatusID that occurs in the batch's tracker rows),
+    plus a derived batch_status ('CREATED' / 'DOWNLOADED' / 'LOADED' / 'POSTED' /
+    'COMPLETED' / 'EXCLUDED' - see _batch_status_and_lock), 'locked' (Document No./Entry No.
+    renumbering must be disabled - see batch_is_locked), and
+    'blocked_by' (names of EARLIER, not-yet-cleared batches that must reach
+    Loaded/Posted/Completed - see _batch_is_cleared - before THIS batch may
+    be downloaded at all; batches must download in order so a later
+    batch's Document Nos. never get ahead of an earlier one still pending).
     Sample: list_batches()
-    Returns [{batch, created, headers, exportable, counts: {status: n, ...}}]."""
+    Returns [{batch, created, headers, exportable, counts, batch_status, locked, blocked_by}]."""
     ensure_menu_schema()
     conn = get_connection()
     try:
@@ -725,7 +838,77 @@ def list_batches():
             if batch in by_batch and sname:
                 by_batch[batch]["counts"][sname] = cnt or 0
 
-        return [by_batch[b] for b in order]
+        downloaded = set()
+        if _table_exists(cur, "tbl_BatchDownload") and order:
+            placeholders = ", ".join("?" for _ in order)
+            cur.execute(
+                f"SELECT BatchName FROM dbo.tbl_BatchDownload WHERE BatchName IN ({placeholders})",
+                *order)
+            downloaded = {r[0] for r in cur.fetchall()}
+
+        reincluded = set()
+        if _table_exists(cur, "tbl_BatchReIncluded") and order:
+            placeholders = ", ".join("?" for _ in order)
+            cur.execute(
+                f"SELECT BatchName FROM dbo.tbl_BatchReIncluded WHERE BatchName IN ({placeholders})",
+                *order)
+            reincluded = {r[0] for r in cur.fetchall()}
+
+        for batch in order:
+            row = by_batch[batch]
+            row["batch_status"], row["locked"] = _batch_status_and_lock(
+                row["counts"], batch in downloaded, batch in reincluded)
+
+        # `order` is BatchName DESC (newest first), so everything AFTER a
+        # batch in this list was created BEFORE it - exactly the "earlier
+        # batches" a download must wait on. Batches must clear in creation
+        # order, so this is computed once here rather than left to the
+        # caller to get right.
+        cleared = {b: _batch_is_cleared(by_batch[b]["counts"]) for b in order}
+        for i, batch in enumerate(order):
+            earlier = order[i + 1:]
+            by_batch[batch]["blocked_by"] = [b for b in earlier if not cleared[b]]
+
+        # Returned oldest-first: the batch that needs attention first (to
+        # unblock everything newer) leads the list.
+        return [by_batch[b] for b in reversed(order)]
+    finally:
+        conn.close()
+
+
+def is_batch_locked(batch_name):
+    """Public wrapper for batch_is_locked() - opens its own connection.
+    Sample: is_batch_locked('PIIPS_Batch_20260722_101500')"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        return batch_is_locked(conn.cursor(), batch_name)
+    finally:
+        conn.close()
+
+
+def mark_batch_downloaded(batch_name):
+    """Record that a batch's Excel was just downloaded (for the Dashboard's
+    Batch Status column - see list_batches). Upserts one row per batch.
+    Sample: mark_batch_downloaded('PIIPS_Batch_20260722_101500')"""
+    if not batch_name:
+        return
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        if not _table_exists(cur, "tbl_BatchDownload"):
+            return
+        cur.execute(
+            "UPDATE dbo.tbl_BatchDownload SET LastDownloadedAt = GETDATE(), "
+            "DownloadCount = DownloadCount + 1 WHERE BatchName = ?",
+            batch_name)
+        if cur.rowcount == 0:
+            cur.execute(
+                "INSERT INTO dbo.tbl_BatchDownload "
+                "(BatchName, FirstDownloadedAt, LastDownloadedAt, DownloadCount) "
+                "VALUES (?, GETDATE(), GETDATE(), 1)",
+                batch_name)
+        conn.commit()
     finally:
         conn.close()
 
@@ -753,6 +936,375 @@ def list_statuses():
 _DOC_NO_SUFFIX_RE = re.compile(r"^(.*?)(\d+)$")
 
 
+def _next_doc_no_seq(cur, po_fmt):
+    """Next sequence number for a PO_Number_Format prefix, continuing from
+    the highest number already used ANYWHERE in tbl_Purchase_Header.[No.]
+    under that exact prefix - never restarting at 1 for a fresh
+    batch/run - so two separate downloads that happen to share a prefix
+    can never mint the same Document No."""
+    like_escaped = po_fmt.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    cur.execute(
+        "SELECT [No.] FROM dbo.tbl_Purchase_Header WHERE [No.] LIKE ? ESCAPE '\\'",
+        like_escaped + "%",
+    )
+    best = 0
+    for (no,) in cur.fetchall():
+        if not no or not no.startswith(po_fmt):
+            continue
+        suffix = no[len(po_fmt):]
+        if suffix.isdigit():
+            best = max(best, int(suffix))
+    return best + 1
+
+
+def _batch_ever_reincluded(cur, batch_name):
+    """True if this batch has ever had a previously-Excluded invoice
+    Included back in (see set_excluded/_mark_batch_reincluded). Once that
+    happens the batch is shown as at least Downloaded (not locked) even if
+    every remaining invoice reverts to a pre-Loaded status (e.g. Ready To
+    Load) - a re-inclusion is a real action taken on the batch, so it
+    shouldn't quietly look freshly Created again.
+    Sample: _batch_ever_reincluded(cur, 'PIIPS_Batch_20260722_101500')"""
+    if not _table_exists(cur, "tbl_BatchReIncluded"):
+        return False
+    cur.execute("SELECT 1 FROM dbo.tbl_BatchReIncluded WHERE BatchName = ?", batch_name)
+    return cur.fetchone() is not None
+
+
+def _mark_batch_reincluded(cur, batch_name):
+    """Record that batch_name has had a re-inclusion - see
+    _batch_ever_reincluded. Idempotent; call within an already-open
+    transaction (the caller commits)."""
+    if not batch_name or not _table_exists(cur, "tbl_BatchReIncluded"):
+        return
+    cur.execute("SELECT 1 FROM dbo.tbl_BatchReIncluded WHERE BatchName = ?", batch_name)
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO dbo.tbl_BatchReIncluded (BatchName, MarkedAt) VALUES (?, GETDATE())",
+            batch_name)
+
+
+def batch_is_locked(cur, batch_name):
+    """True once at least one invoice in this batch has reached a status in
+    _BATCH_LOCK_STATUSES (Loaded/Posted/Completed/Rejected). Excluded never
+    locks the batch on its own - it's ignored entirely (see
+    _BATCH_IGNORED_STATUSES) so the batch's lock state is always driven by
+    its currently-INCLUDED invoices. From the locked point some of the
+    batch's Document Nos. may already be committed in Navision (or
+    deliberately dropped), so its [No.] sequence is frozen: fetch_batch
+    must never renumber it on a re-download, and the whole batch can no
+    longer be downloaded or have its Document No./Entry No. renumbered
+    (see download_batch) - see also _batch_status_and_lock, which derives
+    the same condition from counts already in hand. A re-inclusion
+    (_batch_ever_reincluded) does NOT lock the batch - the point of
+    including a file back in is to be able to download the batch again and
+    mint it a fresh number.
+    Sample: batch_is_locked(cur, 'PIIPS_Batch_20260722_101500')"""
+    placeholders = ", ".join("?" for _ in _BATCH_LOCK_STATUSES)
+    cur.execute(
+        "SELECT COUNT(*) FROM dbo.tbl_Purchase_Tracker pt "
+        "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+        f"WHERE pt.BatchName = ? AND s.StatusName IN ({placeholders})",
+        batch_name, *_BATCH_LOCK_STATUSES)
+    return cur.fetchone()[0] > 0
+
+
+def _po_number_formats_for_headers(cur, header_ids):
+    """{header_id: PO_Number_Format} resolved LIVE from each header's
+    template, via its source file's path (tbl_InputFile_Log.RelPath ->
+    template_store) - PO_Number_Format is never stored on
+    tbl_Purchase_Header, so this always reflects the template's current
+    setting, not a stale value frozen at processing time. A header whose
+    template can't be resolved (deleted since, or no matching file log
+    row) is simply absent from the result."""
+    header_ids = [h for h in header_ids if h is not None]
+    if not header_ids:
+        return {}
+    placeholders = ",".join("?" * len(header_ids))
+    cur.execute(
+        f"SELECT Purchase_Header_ID, RelPath FROM tbl_InputFile_Log "
+        f"WHERE Purchase_Header_ID IN ({placeholders})",
+        *header_ids,
+    )
+    relpath_by_header = {r[0]: r[1] for r in cur.fetchall() if r[1]}
+    if not relpath_by_header:
+        return {}
+    import template_store
+    current_templates = get_templates_data()
+    result = {}
+    for header_id, rel in relpath_by_header.items():
+        entity, invoice_type, name = template_store.entity_type_name_from_relpath(rel)
+        if entity is None:
+            continue
+        current = current_templates.get(f"{entity}\\{invoice_type}\\{name}")
+        if current is None:
+            continue
+        result[header_id] = current.get("PO_Number_Format", "") or ""
+    return result
+
+
+def _find_no_collision(cur, id_to_no):
+    """Check a proposed {header_id: no} mapping against every header
+    ALREADY in the table before it's written. Returns (no, other_batch)
+    for the first Document No. that's already in use by a DIFFERENT
+    header, or None if the whole mapping is safe to write. Used by both
+    the default per-download minting (_assign_document_numbers) and a
+    user's custom renumber (write_document_numbers) so a duplicate Document
+    No. across two batches is refused outright rather than silently
+    written - see the callers for what happens on a collision."""
+    for header_id, no in id_to_no.items():
+        if not no:
+            continue
+        cur.execute(
+            "SELECT TOP 1 pt.BatchName FROM dbo.tbl_Purchase_Header h "
+            "LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = h.Id "
+            "WHERE h.[No.] = ? AND h.Id <> ?",
+            no, header_id)
+        row = cur.fetchone()
+        if row:
+            return no, row[0]
+    return None
+
+
+def _no_collision_error(no, other_batch):
+    return ValueError(
+        f"The No. '{no}' is already processed with another batch"
+        + (f" ('{other_batch}')" if other_batch else "")
+        + " - download aborted, nothing was changed. Refresh and try again."
+    )
+
+
+def _assign_document_numbers(cur, header_rows):
+    """Mint a FRESH, real, globally-unique Document No. for every header
+    row passed in - every call re-mints, even a header that already has
+    one (see fetch_batch, which skips calling this entirely once the batch
+    is locked) - continuing each header's live template PO_Number_Format's
+    sequence from whatever's already used across the whole table, and
+    writes it directly to tbl_Purchase_Header.[No.] (propagated onto that
+    header's tbl_Purchase_Line.[Document No.] / tbl_Reservation_Entry.
+    [Source ID] rows). Mutates each row's "No."/"PO_Number_Format" in
+    place; PO_Number_Format is resolved live here, never stored.
+
+    Computes every header's new number FIRST and checks the whole set for
+    a collision against another batch's already-persisted [No.] (see
+    _find_no_collision) before writing anything - raises ValueError and
+    writes nothing at all if one is found (a concurrent download's race,
+    or two headers whose no-template fallback happens to collide), rather
+    than silently letting two batches share a Document No."""
+    header_ids = [row.get("Id") for row in header_rows]
+    po_fmt_by_header = _po_number_formats_for_headers(cur, header_ids)
+    seq_by_prefix = {}
+    proposed = {}
+    for row in header_rows:
+        header_id = row.get("Id")
+        if header_id is None:
+            continue
+        po_fmt = po_fmt_by_header.get(header_id, "")
+        row["PO_Number_Format"] = po_fmt
+        if po_fmt:
+            if po_fmt not in seq_by_prefix:
+                seq_by_prefix[po_fmt] = _next_doc_no_seq(cur, po_fmt)
+            new_no = f"{po_fmt}{seq_by_prefix[po_fmt]:06d}"
+            seq_by_prefix[po_fmt] += 1
+        else:
+            # No template prefix on record - fall back to the invoice's own
+            # number so it's at least deterministic, never blank.
+            new_no = (row.get("InvoiceNo") or f"DOC{header_id}").strip()
+        proposed[header_id] = new_no
+
+    collision = _find_no_collision(cur, proposed)
+    if collision:
+        raise _no_collision_error(*collision)
+
+    for row in header_rows:
+        header_id = row.get("Id")
+        if header_id not in proposed:
+            continue
+        new_no = proposed[header_id]
+        row["No."] = new_no
+        cur.execute("UPDATE dbo.tbl_Purchase_Header SET [No.] = ? WHERE Id = ?", new_no, header_id)
+        if _existing_cols(cur, "tbl_Purchase_Line", ["Document No."]):
+            cur.execute(
+                "UPDATE dbo.tbl_Purchase_Line SET [Document No.] = ? WHERE Purchase_Header_ID = ?",
+                new_no, header_id)
+        if _table_exists(cur, "tbl_Reservation_Entry") and _existing_cols(cur, "tbl_Reservation_Entry", ["Source ID"]):
+            cur.execute(
+                "UPDATE dbo.tbl_Reservation_Entry SET [Source ID] = ? WHERE Purchase_Header_ID = ?",
+                new_no, header_id)
+
+
+def write_document_numbers(id_to_no):
+    """Bulk-write an explicit {header_id: no} mapping straight to
+    tbl_Purchase_Header.[No.] (used for a user-chosen custom renumber, see
+    excel_export.renumber_batch), propagating each value onto that header's
+    Purchase_Line.[Document No.] and Reservation_Entry.[Source ID] rows the
+    same way. Checks the whole mapping against every other header's
+    already-persisted [No.] first (see _find_no_collision) and writes
+    nothing at all - raising ValueError instead - if a custom-chosen number
+    collides with one another batch already has.
+    Sample: write_document_numbers({42: 'PO-2627-000010'})"""
+    pairs = [(int(i), n) for i, n in (id_to_no or {}).items() if i is not None and n]
+    if not pairs:
+        return
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        collision = _find_no_collision(cur, dict(pairs))
+        if collision:
+            raise _no_collision_error(*collision)
+        cur.executemany(
+            "UPDATE dbo.tbl_Purchase_Header SET [No.] = ? WHERE Id = ?",
+            [(n, i) for i, n in pairs])
+        cur.executemany(
+            "UPDATE dbo.tbl_Purchase_Line SET [Document No.] = ? WHERE Purchase_Header_ID = ?",
+            [(n, i) for i, n in pairs])
+        if _table_exists(cur, "tbl_Reservation_Entry"):
+            cur.executemany(
+                "UPDATE dbo.tbl_Reservation_Entry SET [Source ID] = ? WHERE Purchase_Header_ID = ?",
+                [(n, i) for i, n in pairs])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _find_entry_no_collision(cur, id_to_entry_no):
+    """Reservation Entry counterpart to _find_no_collision: checks a
+    proposed {reservation_row_id: entry_no} mapping against every
+    reservation row ALREADY in the table. Returns (entry_no, other_batch)
+    for the first Entry No. already in use by a DIFFERENT row, or None if
+    the whole mapping is safe to write."""
+    for row_id, entry_no in id_to_entry_no.items():
+        if not entry_no:
+            continue
+        cur.execute(
+            "SELECT TOP 1 pt.BatchName FROM dbo.tbl_Reservation_Entry r "
+            "LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = r.Purchase_Header_ID "
+            "WHERE r.[Entry No.] = ? AND r.Id <> ?",
+            str(entry_no), row_id)
+        row = cur.fetchone()
+        if row:
+            return entry_no, row[0]
+    return None
+
+
+def _entry_no_collision_error(entry_no, other_batch):
+    return ValueError(
+        f"The Entry No. '{entry_no}' is already processed with another batch"
+        + (f" ('{other_batch}')" if other_batch else "")
+        + " - download aborted, nothing was changed. Refresh and try again."
+    )
+
+
+def _next_entry_no_seq(cur):
+    """Next sequential integer for Entry No., continuing from the highest
+    already used ANYWHERE in tbl_Reservation_Entry.[Entry No.] - never
+    restarting at 1 for a fresh batch/run, so two separate downloads can
+    never mint the same Entry No. Unlike Document No. this has no prefix,
+    just a plain running integer."""
+    cur.execute(
+        "SELECT [Entry No.] FROM dbo.tbl_Reservation_Entry "
+        "WHERE [Entry No.] IS NOT NULL AND [Entry No.] <> ''")
+    best = 0
+    for (v,) in cur.fetchall():
+        try:
+            best = max(best, int(str(v).strip()))
+        except (TypeError, ValueError):
+            continue
+    return best + 1
+
+
+def _assign_entry_numbers(cur, res_rows):
+    """Mint a FRESH, real, globally-unique Entry No. for every reservation
+    row passed in - every call re-mints, even a row that already has one
+    (see fetch_batch, which skips calling this entirely once the batch is
+    locked) - continuing the running sequence from whatever's already used
+    across the whole table, and writes it directly to
+    tbl_Reservation_Entry.[Entry No.]. Mutates each row's "Entry No." in
+    place. Computes every row's new number first and checks the whole set
+    for a collision against another batch's already-persisted Entry No.
+    (see _find_entry_no_collision) before writing anything - raises
+    ValueError and writes nothing at all if one is found, rather than
+    silently letting two batches share an Entry No."""
+    seq = None
+    proposed = {}
+    for row in res_rows:
+        row_id = row.get("Id")
+        if row_id is None:
+            continue
+        if seq is None:
+            seq = _next_entry_no_seq(cur)
+        proposed[row_id] = str(seq)
+        seq += 1
+
+    collision = _find_entry_no_collision(cur, proposed)
+    if collision:
+        raise _entry_no_collision_error(*collision)
+
+    for row_id, entry_no in proposed.items():
+        cur.execute("UPDATE dbo.tbl_Reservation_Entry SET [Entry No.] = ? WHERE Id = ?", entry_no, row_id)
+    for row in res_rows:
+        row_id = row.get("Id")
+        if row_id in proposed:
+            row["Entry No."] = proposed[row_id]
+
+
+def write_entry_numbers(id_to_entry_no):
+    """Bulk-write an explicit {reservation_row_id: entry_no} mapping
+    straight to tbl_Reservation_Entry.[Entry No.] (used for a user-chosen
+    custom renumber, see excel_export.renumber_batch). Checks the whole
+    mapping against every other row's already-persisted Entry No. first
+    (see _find_entry_no_collision) and writes nothing at all - raising
+    ValueError instead - if a custom-chosen number collides with one
+    another batch already has.
+    Sample: write_entry_numbers({7: '1001'})"""
+    pairs = [(int(i), str(n)) for i, n in (id_to_entry_no or {}).items() if i is not None and n]
+    if not pairs:
+        return
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        collision = _find_entry_no_collision(cur, dict(pairs))
+        if collision:
+            raise _entry_no_collision_error(*collision)
+        cur.executemany(
+            "UPDATE dbo.tbl_Reservation_Entry SET [Entry No.] = ? WHERE Id = ?",
+            [(n, i) for i, n in pairs])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def precheck_number_collisions(id_to_no, id_to_entry_no):
+    """Check a proposed Document No. mapping AND a proposed Entry No.
+    mapping for collisions in one shared connection, before either
+    write_document_numbers or write_entry_numbers runs. A custom renumber
+    sets both at once via two separate calls that each commit
+    independently - without this upfront check, a Document No. write could
+    succeed and commit, only for the paired Entry No. write to then hit a
+    collision and abort, leaving the Document No. change persisted despite
+    the overall request failing with "nothing was changed". Raises
+    ValueError on the first collision found (of either kind); returns None
+    if both mappings are safe to write.
+    Sample: precheck_number_collisions({42: 'PO-2627-000010'}, {7: '1001'})"""
+    no_pairs = [(int(i), n) for i, n in (id_to_no or {}).items() if i is not None and n]
+    entry_pairs = [(int(i), str(n)) for i, n in (id_to_entry_no or {}).items() if i is not None and n]
+    if not no_pairs and not entry_pairs:
+        return
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        if no_pairs:
+            collision = _find_no_collision(cur, dict(no_pairs))
+            if collision:
+                raise _no_collision_error(*collision)
+        if entry_pairs:
+            collision = _find_entry_no_collision(cur, dict(entry_pairs))
+            if collision:
+                raise _entry_no_collision_error(*collision)
+    finally:
+        conn.close()
+
+
 def fetch_batch(batch_name, sheet_cols):
     """
     Read a batch's rows from the 3 tables into {sheet: {columns, rows}}
@@ -762,20 +1314,26 @@ def fetch_batch(batch_name, sheet_cols):
     actually exist on the table — restricted to headers not yet advanced
     past READY TO LOAD (see usp_FetchBatch's @idset).
 
-    [No.] / [Document No.] / [Source ID] are deliberately blank until the
-    invoice is marked Loaded (see advance_status) — a download must show
-    the working number instead, so this falls back to the header's
-    Last_Updated_No (propagated onto its lines/reservations) whenever
-    those columns are blank. Each header row also carries an internal "Id"
-    key (not part of the declared column list, so it's invisible to the
-    exported Excel) so the caller can write back Last_Updated_No after a
-    renumbered download — see update_last_updated_no().
+    Every download re-mints and re-writes a fresh [No.] directly to
+    tbl_Purchase_Header.[No.] for every header in the batch (propagated
+    onto tbl_Purchase_Line.[Document No.] / tbl_Reservation_Entry.
+    [Source ID]) - see _assign_document_numbers, which resolves each
+    header's PO_Number_Format LIVE from its template (never stored) and
+    continues that prefix's sequence from whatever's already used across
+    the whole table, so it can never collide with a number minted by an
+    earlier, separate download. EXCEPTION: once any invoice in this batch
+    has reached LOADED/POSTED/COMPLETED/REJECTED BY ACCOUNTS, the whole
+    batch's numbering is frozen (see batch_is_locked) - some of its numbers
+    may already be committed in Navision, so a re-download must leave every
+    [No.] exactly as it is. The rows are then re-read straight from the
+    table so the export reflects exactly what's now persisted.
+    advance_status's Load step never generates [No.] - it only
+    duplicate-checks it.
 
-    [Entry No.] on Reservation Entry follows the same pattern, but per-row
-    (it isn't shared across a header's rows the way No. is): each
-    reservation row falls back to its own Last_Updated_Entry_No when
-    [Entry No.] is blank, and carries an internal "Id" for the write-back —
-    see update_last_updated_entry_no().
+    [Entry No.] on Reservation Entry works exactly the same way now: every
+    download re-mints and re-writes a fresh one directly to
+    tbl_Reservation_Entry.[Entry No.] (see _assign_entry_numbers), under
+    the same batch_is_locked exception as [No.].
 
     Sample: fetch_batch('PIIPS_Batch_20260722_101500', {'Purchase Header': ['InvoiceNo'], 'Purchase Line': ['Description'], 'Reservation Entry': ['Serial No.']})
     """
@@ -785,13 +1343,14 @@ def fetch_batch(batch_name, sheet_cols):
     line_cols = list(sheet_cols.get("Purchase Line", []))
     res_cols = list(sheet_cols.get("Reservation Entry", []))
 
-    # Internal-only columns needed for the Last_Updated_No fallback/write-
-    # back below — usp_FetchBatch includes whatever's requested that
-    # actually exists as a real column, so this piggybacks on the same
-    # dynamic-column mechanism without any SQL changes.
-    header_req = header_cols + ["Id", "No.", "Last_Updated_No", "PO_Number_Format"]
-    line_req = line_cols + ["Purchase_Header_ID", "Document No."]
-    res_req = res_cols + ["Id", "Purchase_Header_ID", "Source ID", "Entry No.", "Last_Updated_Entry_No"]
+    # Internal-only columns needed below — usp_FetchBatch includes whatever's
+    # requested that actually exists as a real column, so this piggybacks on
+    # the same dynamic-column mechanism without any SQL changes. Deduped so
+    # a column already in the caller's own requested list isn't asked for
+    # twice.
+    header_req = list(dict.fromkeys(header_cols + ["Id", "No.", "InvoiceNo"]))
+    line_req = list(dict.fromkeys(line_cols + ["Purchase_Header_ID", "Document No."]))
+    res_req = list(dict.fromkeys(res_cols + ["Id", "Purchase_Header_ID", "Source ID", "Entry No."]))
 
     conn = get_connection()
     try:
@@ -817,70 +1376,31 @@ def fetch_batch(batch_name, sheet_cols):
         cur.nextset()
         re_r = read_rows()
 
-        # Refresh each header's PO_Number_Format from the CURRENT template
-        # instead of the value frozen onto the row back when it was
-        # extracted (see save_grouped) - so editing a template's PO Number
-        # Format on the Template screen is reflected on THIS batch's very
-        # next download, for any header that hasn't been Loaded yet
-        # (fetch_batch is already scoped to headers not past READY TO LOAD,
-        # via usp_FetchBatch's @idset, and to this one batch_name). A
-        # changed format also re-prefixes Last_Updated_No (keeping its
-        # existing numeric sequence) so the download reflects it even when
-        # the caller didn't pass a custom doc_no to trigger a full
-        # renumber_batch. Both columns are written back to
-        # tbl_Purchase_Header immediately, not just used in-memory for this
-        # one export. Falls back to the row's own stored value when the
-        # source file's relative path no longer resolves to an active
-        # template (e.g. the template was deleted since).
-        header_ids = [row["Id"] for row in ph_r if row.get("Id") is not None]
-        if header_ids:
-            import template_store
-            placeholders = ",".join("?" * len(header_ids))
+        # A re-download of a batch that already has at least one invoice
+        # past Ready to Load (or Rejected) must never touch [No.] again —
+        # see batch_is_locked. Otherwise mint fresh numbers for everything
+        # still in the batch, then re-read all three result sets fresh
+        # from the database so the export reflects exactly what's now
+        # persisted (rather than an in-memory guess).
+        if not batch_is_locked(cur, batch_name):
+            _assign_document_numbers(cur, ph_r)
+            _assign_entry_numbers(cur, re_r)
+            conn.commit()
+
             cur.execute(
-                f"SELECT Purchase_Header_ID, RelPath FROM tbl_InputFile_Log "
-                f"WHERE Purchase_Header_ID IN ({placeholders})",
-                *header_ids,
+                "EXEC dbo.usp_FetchBatch ?, ?, ?, ?",
+                batch_name,
+                json.dumps(header_req),
+                json.dumps(line_req),
+                json.dumps(res_req),
             )
-            relpath_by_header = {r[0]: r[1] for r in cur.fetchall() if r[1]}
-            if relpath_by_header:
-                current_templates = get_templates_data()
-                updates = []  # (new_po_fmt, new_last_no_or_None, header_id)
-                for row in ph_r:
-                    rel = relpath_by_header.get(row.get("Id"))
-                    if not rel:
-                        continue
-                    entity, invoice_type, name = template_store.entity_type_name_from_relpath(rel)
-                    if entity is None:
-                        continue
-                    current = current_templates.get(f"{entity}\\{invoice_type}\\{name}")
-                    if current is None:
-                        continue
-                    new_po_fmt = current.get("PO_Number_Format", "")
-                    if new_po_fmt == (row.get("PO_Number_Format") or ""):
-                        continue  # unchanged - nothing to refresh for this header
+            ph_r = read_rows()
+            cur.nextset()
+            pl_r = read_rows()
+            cur.nextset()
+            re_r = read_rows()
 
-                    old_last_no = (row.get("Last_Updated_No") or row.get("No.") or "").strip()
-                    m = _DOC_NO_SUFFIX_RE.match(old_last_no) if old_last_no else None
-                    new_last_no = f"{new_po_fmt}{m.group(2)}" if (m and new_po_fmt) else old_last_no
-
-                    row["PO_Number_Format"] = new_po_fmt
-                    row["Last_Updated_No"] = new_last_no
-                    updates.append((new_po_fmt, new_last_no, row["Id"]))
-
-                for new_po_fmt, new_last_no, header_id in updates:
-                    cur.execute(
-                        "UPDATE tbl_Purchase_Header SET PO_Number_Format = ?, Last_Updated_No = ? WHERE Id = ?",
-                        new_po_fmt, new_last_no, header_id,
-                    )
-                if updates:
-                    conn.commit()
-
-        last_no_by_header = {}
         for row in ph_r:
-            effective = (row.get("No.") or "").strip() or (row.get("Last_Updated_No") or "").strip()
-            row["No."] = effective
-            if row.get("Id") is not None:
-                last_no_by_header[row["Id"]] = effective
             # Re-applied here (not just at save time in excel_export.py's
             # _link_override) so a download is correct even for invoices
             # saved before this prefix-strip existed - re.sub is a no-op on
@@ -906,8 +1426,6 @@ def fetch_batch(batch_name, sheet_cols):
             part_header_ids = {r[0] for r in cur.fetchall()}
 
         for row in pl_r:
-            if not (row.get("Document No.") or "").strip():
-                row["Document No."] = last_no_by_header.get(row.get("Purchase_Header_ID"), "")
             if (row.get("Type") == "Charge (Item)"
                     and row.get("Purchase_Header_ID") in part_header_ids):
                 if "No." in row:
@@ -926,10 +1444,6 @@ def fetch_batch(batch_name, sheet_cols):
                     row["GST Group Code"] = f"Service {rate:g}%"
 
         for row in re_r:
-            if not (row.get("Source ID") or "").strip():
-                row["Source ID"] = last_no_by_header.get(row.get("Purchase_Header_ID"), "")
-            if not (row.get("Entry No.") or "").strip():
-                row["Entry No."] = (row.get("Last_Updated_Entry_No") or "").strip()
             # Forced here too (not just at save time), same reasoning as
             # Consignment Note No. above - a row saved before this fix
             # still has the old "Order" text rather than BC's numeric
@@ -942,49 +1456,6 @@ def fetch_batch(batch_name, sheet_cols):
             "Purchase Line": {"columns": line_cols, "rows": pl_r},
             "Reservation Entry": {"columns": res_cols, "rows": re_r},
         }
-    finally:
-        conn.close()
-
-
-def update_last_updated_no(id_no_pairs):
-    """Bulk-update tbl_Purchase_Header.Last_Updated_No — called after a
-    batch download so a custom Document No./renumbering (excel_export.
-    renumber_batch) stays in sync with what will be finalized into [No.]
-    once the invoice is marked Loaded. `id_no_pairs`: [(header_id, no), ...].
-    Sample: update_last_updated_no([(42, 'PO-2627-00002')])"""
-    pairs = [(int(i), n) for i, n in (id_no_pairs or []) if i is not None]
-    if not pairs:
-        return
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.executemany(
-            "UPDATE dbo.tbl_Purchase_Header SET Last_Updated_No = ? WHERE Id = ?",
-            [(n, i) for i, n in pairs],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def update_last_updated_entry_no(id_no_pairs):
-    """Bulk-update tbl_Reservation_Entry.Last_Updated_Entry_No — the
-    Reservation Entry row-level counterpart to update_last_updated_no(),
-    called after a batch download so a renumbered [Entry No.] stays in
-    sync with what will be finalized once the invoice is marked Loaded.
-    `id_no_pairs`: [(reservation_row_id, entry_no), ...].
-    Sample: update_last_updated_entry_no([(7, '1001')])"""
-    pairs = [(int(i), n) for i, n in (id_no_pairs or []) if i is not None]
-    if not pairs:
-        return
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.executemany(
-            "UPDATE dbo.tbl_Reservation_Entry SET Last_Updated_Entry_No = ? WHERE Id = ?",
-            [(n, i) for i, n in pairs],
-        )
-        conn.commit()
     finally:
         conn.close()
 
@@ -1027,11 +1498,10 @@ def _invoice_list(where_sql, params):
         gst = "h.[Vendor GST Reg. No.]" if _hdr_col(cur, "Vendor GST Reg. No.") else "CAST(NULL AS NVARCHAR(50))"
         ddate = "h.[Document Date]" if _hdr_col(cur, "Document Date") else "CAST(NULL AS NVARCHAR(50))"
         docno = "h.[No.]" if _hdr_col(cur, "No.") else "CAST(NULL AS NVARCHAR(50))"
-        lastno = "h.Last_Updated_No" if _hdr_col(cur, "Last_Updated_No") else "CAST(NULL AS NVARCHAR(50))"
         sql = (
             "SELECT h.Id, h.InvoiceNo, pt.BatchName, pt.FileName, pt.TemplateFormat, "
             "s.StatusName, pt.IsActive, pt.IsSynced, ISNULL(pt.IsExcluded, 0), "
-            f"{vendor}, {gst}, {ddate}, pt.Id, pt.SourceJson, {docno}, pt.RejectRemark, {lastno} "
+            f"{vendor}, {gst}, {ddate}, pt.Id, pt.SourceJson, {docno}, pt.RejectRemark "
             "FROM dbo.tbl_Purchase_Tracker pt "
             "JOIN dbo.tbl_Purchase_Header h ON h.Id = pt.Purchase_Header_ID "
             "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
@@ -1052,7 +1522,6 @@ def _invoice_list(where_sql, params):
                 "invoice_type": _invoice_type_from_source_json(r[13]),
                 "navision_doc_no": r[14] or "",
                 "reject_remark": r[15] or "",
-                "last_updated_no": r[16] or "",
             })
         return out
     finally:
@@ -1275,19 +1744,22 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
     """Bulk-advance the tracker status of selected invoices (Load / Post /
     Complete). Only rows currently in one of `from_statuses` are moved.
     Sample: advance_status([12, 13], ['READY TO LOAD'], 'LOADED', 7)
-    Returns {'count': <rows changed>, 'files': [<FileName>, ...]} so the caller
-    can relocate each PDF into its new status folder.
+    Returns {'count': <rows changed>, 'files': [<FileName>, ...],
+    'header_ids': [...], 'duplicate_no': [{'header_id', 'no'}, ...]} so the
+    caller can relocate each PDF into its new status folder and alert on
+    any header that got blocked.
 
-    Advancing to LOADED also finalizes [No.] (tbl_Purchase_Header) /
-    [Document No.] (tbl_Purchase_Line) / [Source ID] (tbl_Reservation_Entry)
-    from Last_Updated_No — see fetch_batch/update_last_updated_no — the
-    working Document No. only becomes real/permanent once an invoice is
-    actually loaded. Only blank values are touched, so this never
-    overwrites an already-finalized number (e.g. a re-run)."""
+    [No.] is no longer generated/finalized here - it becomes real back at
+    Excel-download time (see fetch_batch/_assign_document_numbers).
+    Advancing to LOADED instead guards against a duplicate: any qualifying
+    header whose current (non-blank) [No.] already exists on a DIFFERENT
+    header is left exactly where it is - excluded from this advance - and
+    reported back in 'duplicate_no' so the caller can alert the user,
+    rather than silently letting two invoices share one Document No."""
     ids = [int(h) for h in (header_ids or [])]
     froms = [s for s in (from_statuses or []) if s]
     if not ids or not froms or not to_status:
-        return {"count": 0, "files": []}
+        return {"count": 0, "files": [], "header_ids": [], "duplicate_no": []}
 
     ensure_menu_schema()
     conn = get_connection()
@@ -1297,8 +1769,9 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
         from_ph = ", ".join("?" for _ in froms)
 
         # Files + header ids of the rows that actually qualify (for the
-        # folder move and the Load finalize step below — captured before
-        # the UPDATE changes their status out from under a later lookup).
+        # folder move below and, on Load, the duplicate check) — captured
+        # before the UPDATE changes their status out from under a later
+        # lookup.
         cur.execute(
             "SELECT pt.FileName, pt.Purchase_Header_ID FROM dbo.tbl_Purchase_Tracker pt "
             "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
@@ -1315,53 +1788,43 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
                 files.append(fname)
                 qualifying_ids.append(hid)
 
-        cur.execute(
-            "UPDATE pt "
-            "SET pt.StatusID = (SELECT StatusId FROM dbo.tbl_status WHERE StatusName = ?), "
-            "    pt.LastModifiedById = ?, pt.LastModifiedDatetime = GETDATE() "
-            "FROM dbo.tbl_Purchase_Tracker pt "
-            "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
-            f"WHERE pt.Purchase_Header_ID IN ({id_ph}) AND s.StatusName IN ({from_ph})",
-            to_status, user_id, *ids, *froms)
-        count = cur.rowcount if cur.rowcount is not None else len(files)
-
-        if to_status == "LOADED" and qualifying_ids and _existing_cols(cur, "tbl_Purchase_Header", ["Last_Updated_No"]):
+        duplicate_no = []
+        if to_status == "LOADED" and qualifying_ids and _hdr_col(cur, "No."):
             qid_ph = ", ".join("?" for _ in qualifying_ids)
             cur.execute(
-                "UPDATE dbo.tbl_Purchase_Header "
-                "SET [No.] = Last_Updated_No "
-                f"WHERE Id IN ({qid_ph}) AND (([No.] IS NULL) OR ([No.] = ''))",
+                f"SELECT Id, [No.] FROM dbo.tbl_Purchase_Header "
+                f"WHERE Id IN ({qid_ph}) AND [No.] IS NOT NULL AND [No.] <> ''",
                 *qualifying_ids)
-            if _existing_cols(cur, "tbl_Purchase_Line", ["Document No."]):
+            for hid, no in cur.fetchall():
                 cur.execute(
-                    "UPDATE l SET l.[Document No.] = h.Last_Updated_No "
-                    "FROM dbo.tbl_Purchase_Line l "
-                    "JOIN dbo.tbl_Purchase_Header h ON h.Id = l.Purchase_Header_ID "
-                    f"WHERE l.Purchase_Header_ID IN ({qid_ph}) "
-                    "AND (l.[Document No.] IS NULL OR l.[Document No.] = '')",
-                    *qualifying_ids)
-            if _table_exists(cur, "tbl_Reservation_Entry") and _existing_cols(cur, "tbl_Reservation_Entry", ["Source ID"]):
-                cur.execute(
-                    "UPDATE r SET r.[Source ID] = h.Last_Updated_No "
-                    "FROM dbo.tbl_Reservation_Entry r "
-                    "JOIN dbo.tbl_Purchase_Header h ON h.Id = r.Purchase_Header_ID "
-                    f"WHERE r.Purchase_Header_ID IN ({qid_ph}) "
-                    "AND (r.[Source ID] IS NULL OR r.[Source ID] = '')",
-                    *qualifying_ids)
-            # [Entry No.] is per-row (not shared across a header's rows like
-            # No./Source ID), so it finalizes from its own Last_Updated_Entry_No.
-            if _table_exists(cur, "tbl_Reservation_Entry") and len(_existing_cols(
-                cur, "tbl_Reservation_Entry", ["Entry No.", "Last_Updated_Entry_No"]
-            )) == 2:
-                cur.execute(
-                    "UPDATE r SET r.[Entry No.] = r.Last_Updated_Entry_No "
-                    "FROM dbo.tbl_Reservation_Entry r "
-                    f"WHERE r.Purchase_Header_ID IN ({qid_ph}) "
-                    "AND (r.[Entry No.] IS NULL OR r.[Entry No.] = '')",
-                    *qualifying_ids)
+                    "SELECT COUNT(*) FROM dbo.tbl_Purchase_Header WHERE [No.] = ? AND Id <> ?",
+                    no, hid)
+                if cur.fetchone()[0] > 0:
+                    duplicate_no.append({"header_id": hid, "no": no})
+
+        if duplicate_no:
+            blocked = {d["header_id"] for d in duplicate_no}
+            ids = [i for i in ids if i not in blocked]
+            keep = [i for i, hid in enumerate(qualifying_ids) if hid not in blocked]
+            files = [files[i] for i in keep]
+            qualifying_ids = [qualifying_ids[i] for i in keep]
+
+        count = 0
+        if ids:
+            id_ph = ", ".join("?" for _ in ids)
+            cur.execute(
+                "UPDATE pt "
+                "SET pt.StatusID = (SELECT StatusId FROM dbo.tbl_status WHERE StatusName = ?), "
+                "    pt.LastModifiedById = ?, pt.LastModifiedDatetime = GETDATE() "
+                "FROM dbo.tbl_Purchase_Tracker pt "
+                "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+                f"WHERE pt.Purchase_Header_ID IN ({id_ph}) AND s.StatusName IN ({from_ph})",
+                to_status, user_id, *ids, *froms)
+            count = cur.rowcount if cur.rowcount is not None else len(files)
 
         conn.commit()
-        return {"count": count, "files": files, "header_ids": qualifying_ids}
+        return {"count": count, "files": files, "header_ids": qualifying_ids,
+                "duplicate_no": duplicate_no}
     finally:
         conn.close()
 
@@ -1416,23 +1879,77 @@ def invoices_by_header_ids(header_ids):
     return _invoice_list(f"h.Id IN ({ph})", ids)
 
 
+def _later_batch_not_created(cur, batch_name):
+    """First batch (by creation order) AFTER `batch_name` whose status
+    isn't CREATED - i.e. it's already been downloaded or has real progress
+    (see _batch_status_and_lock). Used to block re-including an excluded
+    invoice back into an EARLIER batch once a LATER batch has already
+    relied on this one being cleared (see _batch_is_cleared) and moved
+    forward - re-including it here would retroactively reopen a batch a
+    later one's Document No. sequence already assumed was final.
+    Returns (later_batch_name, its_status), or None if every later batch
+    is still untouched."""
+    cur.execute(
+        "SELECT pt.BatchName, s.StatusName, COUNT(*) "
+        "FROM dbo.tbl_Purchase_Tracker pt "
+        "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+        "WHERE pt.BatchName IS NOT NULL AND pt.BatchName > ? "
+        "GROUP BY pt.BatchName, s.StatusName",
+        batch_name)
+    counts_by_batch = {}
+    for bname, sname, cnt in cur.fetchall():
+        counts_by_batch.setdefault(bname, {})[sname] = cnt
+    if not counts_by_batch:
+        return None
+
+    downloaded = set()
+    if _table_exists(cur, "tbl_BatchDownload"):
+        placeholders = ", ".join("?" for _ in counts_by_batch)
+        cur.execute(
+            f"SELECT BatchName FROM dbo.tbl_BatchDownload WHERE BatchName IN ({placeholders})",
+            *counts_by_batch)
+        downloaded = {r[0] for r in cur.fetchall()}
+
+    for bname in sorted(counts_by_batch):  # earliest of the later batches first
+        status, _locked = _batch_status_and_lock(counts_by_batch[bname], bname in downloaded)
+        if status != "CREATED":
+            return bname, status
+    return None
+
+
 def set_excluded(header_id, exclude, user_id=None):
     """Include / exclude one invoice. Excluding sets the tracker status to
     'Excluded' (remembering the prior status), flags IsExcluded and stamps
     ExcludedByID / ExcludedDatetime; including restores the prior status.
     Returns {file_name, new_status} so the caller can relocate the PDF.
+    Re-including (exclude=False) is refused with a ValueError if a LATER
+    batch has already progressed past CREATED - see
+    _later_batch_not_created.
     Sample: set_excluded(42, True, 7)"""
     ensure_menu_schema()
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT StatusID, PriorStatusID, FileName FROM dbo.tbl_Purchase_Tracker "
+            "SELECT StatusID, PriorStatusID, FileName, BatchName FROM dbo.tbl_Purchase_Tracker "
             "WHERE Purchase_Header_ID = ?", header_id)
         row = cur.fetchone()
         if not row:
             return None
         file_name = row[2]
+        batch_name = row[3]
+
+        if not exclude and batch_name:
+            blocker = _later_batch_not_created(cur, batch_name)
+            if blocker:
+                later_batch, later_status = blocker
+                raise ValueError(
+                    f"Can't re-include this invoice — the later batch "
+                    f"'{later_batch}' has already moved on (status: "
+                    f"{later_status}). Get it to LOADED/POSTED/COMPLETED "
+                    "(or otherwise resolve it) before including this "
+                    "invoice back into an earlier batch."
+                )
 
         if exclude:
             cur.execute(
@@ -1450,6 +1967,7 @@ def set_excluded(header_id, exclude, user_id=None):
                 "    ExcludedByID = NULL, ExcludedDatetime = NULL, "
                 "    LastModifiedById = ?, LastModifiedDatetime = GETDATE() "
                 "WHERE Purchase_Header_ID = ?", user_id, header_id)
+            _mark_batch_reincluded(cur, batch_name)
             cur.execute(
                 "SELECT s.StatusName FROM dbo.tbl_Purchase_Tracker pt "
                 "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
@@ -1709,6 +2227,42 @@ _MENU_TABLE_DDL = [
     # ---- Retired: Publish now stages locally, tracked in config.json's
     # publish_status instead of a per-server registration table.
     "IF OBJECT_ID('dbo.tbl_DeployServer') IS NOT NULL DROP TABLE dbo.tbl_DeployServer",
+    # ---- Retired: Document No. is minted fresh at every Excel download
+    # (see fetch_batch/_assign_document_numbers) - no staging column, and
+    # PO_Number_Format is resolved live from the template every time
+    # (see _po_number_formats_for_headers) rather than stored.
+    "IF COL_LENGTH('dbo.tbl_Purchase_Header','Last_Updated_No') IS NOT NULL "
+    "ALTER TABLE dbo.tbl_Purchase_Header DROP COLUMN Last_Updated_No",
+    "IF COL_LENGTH('dbo.tbl_Purchase_Header','PO_Number_Format') IS NOT NULL "
+    "ALTER TABLE dbo.tbl_Purchase_Header DROP COLUMN PO_Number_Format",
+    # ---- Retired: Entry No. is minted fresh at every Excel download too
+    # (see fetch_batch/_assign_entry_numbers) - no staging column.
+    "IF COL_LENGTH('dbo.tbl_Reservation_Entry','Last_Updated_Entry_No') IS NOT NULL "
+    "ALTER TABLE dbo.tbl_Reservation_Entry DROP COLUMN Last_Updated_Entry_No",
+    # ---- Remembers whether a batch's Excel has ever been downloaded, for
+    # the Dashboard's Batch Status column (Downloaded / Loaded / Posted /
+    # Completed) - see database.mark_batch_downloaded/batch_download_info.
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'tbl_BatchDownload')
+    CREATE TABLE tbl_BatchDownload (
+        BatchName          NVARCHAR(200) NOT NULL PRIMARY KEY,
+        FirstDownloadedAt  DATETIME NOT NULL,
+        LastDownloadedAt   DATETIME NOT NULL,
+        DownloadCount      INT NOT NULL DEFAULT 1
+    )
+    """,
+    # ---- Remembers whether a batch has ever had an Excluded invoice
+    # Included back in - see database._batch_ever_reincluded/
+    # _mark_batch_reincluded. Once marked, the batch is shown as at least
+    # DOWNLOADED (not locked) even if every remaining invoice reverts to a
+    # pre-Loaded status.
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'tbl_BatchReIncluded')
+    CREATE TABLE tbl_BatchReIncluded (
+        BatchName  NVARCHAR(200) NOT NULL PRIMARY KEY,
+        MarkedAt   DATETIME NOT NULL
+    )
+    """,
 ]
 
 # Table-valued parameter types used by the save procedures for bulk MERGE.
@@ -1895,27 +2449,12 @@ _MENU_PROC_DDL = [
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_SaveInvoiceBatch @HeaderCols='["InvoiceNo"]', @LineCols='["Description"]', @ResCols='["Serial No."]', @Headers='[{"InvoiceNo":"INV-001","_gid":0}]', @Lines='[{"Description":"Oil Filter","_gid":0}]', @Reservations='[]', @StartedByID=7, @StartedDatetime='2026-07-22T10:15:00', @StatusName='EXTRACTED'
 
-        -- Working Document No. (see Load's finalize step below): the caller
-        -- deliberately leaves [No.]/[Document No.]/[Source ID] blank at
-        -- save time (a download's renumbering must not disagree with what
-        -- got saved here) and sends the proposed number as Last_Updated_No
-        -- instead, self-healing the column on first use like InvoiceNo.
-        IF COL_LENGTH('dbo.tbl_Purchase_Header', 'Last_Updated_No') IS NULL
-            ALTER TABLE dbo.tbl_Purchase_Header ADD Last_Updated_No NVARCHAR(200) NULL;
-
-        -- The template's PO number prefix at the time this header was
-        -- saved, kept separately from Last_Updated_No so a later Dashboard
-        -- renumber can rebuild "prefix + new sequence" even when the
-        -- invoice_no fallback used for Last_Updated_No doesn't look like
-        -- "PREFIX000123" at all.
-        IF COL_LENGTH('dbo.tbl_Purchase_Header', 'PO_Number_Format') IS NULL
-            ALTER TABLE dbo.tbl_Purchase_Header ADD PO_Number_Format NVARCHAR(100) NULL;
-
-        -- Same idea for Reservation Entry's [Entry No.] — a working value
-        -- (Last_Updated_Entry_No) tracked per row, finalized into the
-        -- real column only once the invoice is marked Loaded.
-        IF COL_LENGTH('dbo.tbl_Reservation_Entry', 'Last_Updated_Entry_No') IS NULL
-            ALTER TABLE dbo.tbl_Reservation_Entry ADD Last_Updated_Entry_No NVARCHAR(50) NULL;
+        -- [No.]/[Document No.]/[Source ID]/[Entry No.] are all deliberately
+        -- left blank at save time - a real, unique Document No./Entry No.
+        -- is only minted at Excel-download time (see database.fetch_batch/
+        -- _assign_document_numbers/_assign_entry_numbers), resolving
+        -- PO_Number_Format live from the template rather than storing it
+        -- on the header at all.
 
         DECLARE @sql NVARCHAR(MAX), @cols NVARCHAR(MAX), @with NVARCHAR(MAX);
 
@@ -2214,6 +2753,23 @@ _MENU_PROC_DDL = [
         -- Sample: EXEC dbo.usp_SetUserActive @UserId=12, @IsActive=0, @ModifiedById=7
         UPDATE dbo.tbl_user
            SET IsActive = @IsActive,
+               LastModifiedById = @ModifiedById,
+               LastModifiedDatetime = GETDATE()
+         WHERE UserId = @UserId;
+        SELECT @@ROWCOUNT AS Affected;
+    END
+    """,
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_SetUserType
+        @UserId       INT,
+        @UserTypeID   INT,
+        @ModifiedById INT = NULL
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_SetUserType @UserId=12, @UserTypeID=1, @ModifiedById=7
+        UPDATE dbo.tbl_user
+           SET UserTypeID = @UserTypeID,
                LastModifiedById = @ModifiedById,
                LastModifiedDatetime = GETDATE()
          WHERE UserId = @UserId;
@@ -3614,6 +4170,25 @@ def set_user_active(user_id, is_active, modified_by=None):
         cur.execute(
             "EXEC dbo.usp_SetUserActive ?, ?, ?",
             user_id, 1 if is_active else 0, modified_by,
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+def set_user_type(user_id, user_type_id, modified_by=None):
+    """Change an existing user's role (see app.py's /api/users/change-type
+    for who's allowed to call this on whom). Sample: set_user_type(12, 1, 7)"""
+    init_user_table()
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "EXEC dbo.usp_SetUserType ?, ?, ?",
+            user_id, user_type_id, modified_by,
         )
         row = cur.fetchone()
         conn.commit()

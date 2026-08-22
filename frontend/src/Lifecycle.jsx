@@ -46,10 +46,14 @@ export default function Lifecycle({ user, stage }) {
     () => Array.from(new Set(rows.map((r) => r.batch).filter(Boolean))).sort(),
     [rows]);
 
-  // Batch filter = "batch-wise" selection: narrow the visible rows to a batch.
-  const visible = useMemo(
-    () => (batchFilter ? rows.filter((r) => r.batch === batchFilter) : rows),
-    [rows, batchFilter]);
+  // Load has no batch filter - it only ever shows invoices that already
+  // have a real Navision Document No. (minted at Excel-download time, see
+  // database._assign_document_numbers), so there's nothing un-downloaded
+  // to filter out by batch in the first place.
+  const visible = useMemo(() => {
+    if (stage === "load") return rows.filter((r) => r.navision_doc_no);
+    return batchFilter ? rows.filter((r) => r.batch === batchFilter) : rows;
+  }, [rows, batchFilter, stage]);
 
   const selectedIds = Object.keys(selected).filter((k) => selected[k]).map(Number);
   const allVisibleSelected = visible.length > 0 && visible.every((r) => selected[r.header_id]);
@@ -66,7 +70,15 @@ export default function Lifecycle({ user, stage }) {
     setAdvancing(true); setError(null); setMsg(null);
     try {
       const r = await advanceLifecycle(stage, selectedIds, user?.user_id);
-      setMsg(`${r.count} invoice(s) → ${r.to}.`);
+      const dupes = r.duplicate_no || [];
+      if (dupes.length) {
+        const list = dupes.map((d) => d.no).join(", ");
+        setError(
+          `${dupes.length} invoice(s) blocked - Document No. already in use: ${list}. `
+          + "Resolve the duplicate (re-download with a fresh number) before loading."
+        );
+      }
+      if (r.count) setMsg(`${r.count} invoice(s) → ${r.to}.`);
       load();
     } catch (e) { setError(e.message); }
     finally { setAdvancing(false); }
@@ -109,9 +121,12 @@ export default function Lifecycle({ user, stage }) {
                onChange={() => setSelected((s) => ({ ...s, [row.header_id]: !s[row.header_id] }))} />
       ) },
     { key: "invoice_no", label: "Invoice No.", render: invoiceCell },
+    ...((stage === "load" || stage === "post") ? [{
+      key: "doc_date", label: "Document Date",
+      render: (row) => row.doc_date || "—",
+    }] : []),
     { key: "navision_doc_no", label: "Navision Document No.",
-      render: (row) => row.navision_doc_no
-        || (stage === "load" ? row.last_updated_no : "") || "—" },
+      render: (row) => row.navision_doc_no || "—" },
     { key: "file_name", label: "File" },
     { key: "vendor", label: "Vendor" },
     { key: "status", label: "Status" },
@@ -137,18 +152,22 @@ export default function Lifecycle({ user, stage }) {
           <button className="btn btn-subtle btn-sm" onClick={load}>Refresh</button>
         </div>
         <p className="hint" style={{ marginTop: 0 }}>
-          Select invoices (individually or filter by batch) and {cfg.action.toLowerCase()}.
+          {stage === "load"
+            ? "Only invoices with a Navision Document No. (already downloaded) are shown. Select invoices and mark as loaded."
+            : `Select invoices and ${cfg.action.toLowerCase()}.`}
         </p>
 
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
-          <label className="muted" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
-            Batch
-            <select className="input" style={{ width: "auto" }} value={batchFilter}
-                    onChange={(e) => setBatchFilter(e.target.value)}>
-              <option value="">All batches</option>
-              {batches.map((b) => <option key={b} value={b}>{b}</option>)}
-            </select>
-          </label>
+          {stage !== "load" && stage !== "post" && (
+            <label className="muted" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+              Batch
+              <select className="input" style={{ width: "auto" }} value={batchFilter}
+                      onChange={(e) => setBatchFilter(e.target.value)}>
+                <option value="">All batches</option>
+                {batches.map((b) => <option key={b} value={b}>{b}</option>)}
+              </select>
+            </label>
+          )}
           <div style={{ flex: 1 }} />
           <span className="muted" style={{ fontSize: 13 }}>{selectedIds.length} selected</span>
           {canAct ? (
@@ -166,7 +185,7 @@ export default function Lifecycle({ user, stage }) {
 
         {loading ? <div className="empty">Loading…</div> : (
           <DataTable columns={columns} rows={visible.map((r) => ({ ...r, _key: r.header_id }))}
-                     searchKeys={["invoice_no", "navision_doc_no", "last_updated_no", "file_name", "vendor", "batch", "status"]}
+                     searchKeys={["invoice_no", "navision_doc_no", "file_name", "vendor", "batch", "status"]}
                      pageSizeOptions={[10, 20, 30, "all"]}
                      empty="No invoices are eligible for this step." />
         )}
