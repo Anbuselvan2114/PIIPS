@@ -7,6 +7,22 @@
 
 const API_BASE = import.meta?.env?.VITE_API_BASE ?? "";
 
+// Shared by request() and downloadBatchFile(): pull a clean message out of
+// a non-ok response's {"detail": ...} body (FastAPI's error shape).
+async function errorMessageFor(res) {
+  let detail;
+  try {
+    detail = (await res.json()).detail;
+  } catch {
+    detail = res.statusText;
+  }
+  const message =
+    typeof detail === "string"
+      ? detail
+      : (detail && detail.message) || JSON.stringify(detail);
+  return message || `Request failed (${res.status})`;
+}
+
 async function request(path, options = {}) {
   let res;
   try {
@@ -21,19 +37,7 @@ async function request(path, options = {}) {
     throw new Error("Could not reach the server. Check your connection and try again.");
   }
 
-  if (!res.ok) {
-    let detail;
-    try {
-      detail = (await res.json()).detail;
-    } catch {
-      detail = res.statusText;
-    }
-    const message =
-      typeof detail === "string"
-        ? detail
-        : (detail && detail.message) || JSON.stringify(detail);
-    throw new Error(message || `Request failed (${res.status})`);
-  }
+  if (!res.ok) throw new Error(await errorMessageFor(res));
 
   return res.json();
 }
@@ -142,6 +146,25 @@ export const batchDownloadUrl = (batch, docNo, entryNo) => {
   return url;
 };
 
+// A plain <a href> to this URL can't show a clean error - a failed
+// download (e.g. a Document No. collision) just navigates the browser to
+// the raw JSON. Fetch it instead so a rejection surfaces the same clean
+// message a normal API error would, and only save the file on success.
+export const downloadBatchFile = async (batch, docNo, entryNo) => {
+  let res;
+  try {
+    res = await fetch(batchDownloadUrl(batch, docNo, entryNo));
+  } catch {
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
+  if (!res.ok) throw new Error(await errorMessageFor(res));
+
+  const blob = await res.blob();
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  return { blob, filename: match ? match[1] : `${batch}.xlsx` };
+};
+
 export const getFormats = () => request("/api/formats");
 
 export const getMapping = () => request("/api/mapping");
@@ -210,6 +233,12 @@ export const adminResetPassword = (user_id, target_user_id, new_password) =>
   request("/api/users/reset-password", {
     method: "POST",
     body: JSON.stringify({ user_id, target_user_id, new_password: new_password || null }),
+  });
+
+export const adminChangeUserType = (user_id, target_user_id, new_user_type_id) =>
+  request("/api/users/change-type", {
+    method: "POST",
+    body: JSON.stringify({ user_id, target_user_id, new_user_type_id }),
   });
 
 export const getMailSettings = (user_id) =>

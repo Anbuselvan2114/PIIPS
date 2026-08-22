@@ -267,6 +267,20 @@ def _require_developer(user_id):
         raise HTTPException(status_code=403, detail="Super Admin access required.")
 
 
+def _require_not_viewer(user_id):
+    """Raise 403 if user_id is the read-only 'Viewer' role - it can see
+    every page but never change anything. A missing/unknown user_id is NOT
+    blocked here (many write endpoints are reachable before login in some
+    flows); this only ever blocks an identified Viewer."""
+    import database
+    try:
+        info = database.get_user_role(user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if info and (info["role"] or "").lower() == "viewer":
+        raise HTTPException(status_code=403, detail="Viewers have read-only access.")
+
+
 @app.get("/api/db-config")
 def get_db_config(user_id: Optional[int] = None):
     import database
@@ -446,6 +460,7 @@ class StartModel(BaseModel):
 @app.post("/api/process/start")
 def process_start(payload: Optional[StartModel] = None):
 
+    _require_not_viewer(payload.user_id if payload else None)
     folders = _require_folders()
 
     # Whoever clicks Start is the tracker's "started by".
@@ -615,8 +630,14 @@ def invoices_exclude(payload: ExcludeModel):
     including restores the prior status and folder."""
     import database
     import config_store
+
+    _require_not_viewer(payload.user_id)
     try:
         res = database.set_excluded(payload.header_id, payload.exclude, payload.user_id)
+    except ValueError as exc:
+        # A later batch already relies on this one staying cleared - see
+        # database._later_batch_not_created.
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
     if not res:
@@ -656,6 +677,7 @@ def invoices_set_buyer_order(payload: BuyerOrderModel):
     advances (Ready to Load / Extracted); the PDF moves to the new status
     folder."""
     import database
+    _require_not_viewer(payload.user_id)
     order_no = (payload.buyer_order_no or "").strip()
     if not order_no:
         raise HTTPException(status_code=400, detail="Buyer order no is required")
@@ -729,10 +751,14 @@ def lifecycle_advance(payload: LifecycleModel):
     (Load→LOADED, Post→POSTED, Complete→COMPLETED) and move each PDF into its
     new status folder. Posted/Completed invoices are also archived into
     <Folder Path>/ALL_INVOICES as "<Invoice No.>_<Vendor Name>.pdf" (a copy,
-    the original stays in its status folder)."""
+    the original stays in its status folder). On Load, any invoice whose
+    [No.] duplicates another invoice's is silently excluded from the
+    advance (see database.advance_status) and reported back in
+    'duplicate_no' so the caller can alert on it."""
     stage = (payload.stage or "").lower()
     if stage not in _LIFECYCLE:
         raise HTTPException(status_code=400, detail="Unknown stage")
+    _require_not_viewer(payload.user_id)
     if stage == "post":
         _require_post_access(payload.user_id)
     spec = _LIFECYCLE[stage]
@@ -768,7 +794,8 @@ def lifecycle_advance(payload: LifecycleModel):
             import traceback
             traceback.print_exc()
 
-    return {"ok": True, "count": res.get("count", 0), "to": spec["to"]}
+    return {"ok": True, "count": res.get("count", 0), "to": spec["to"],
+            "duplicate_no": res.get("duplicate_no", [])}
 
 
 class RejectModel(BaseModel):
@@ -832,39 +859,112 @@ def download_batch(batch: str, doc_no: Optional[str] = None, entry_no: Optional[
     start_doc_no = _to_int(doc_no, "doc_no")
     start_entry_no = _to_int(entry_no, "entry_no")
 
+    locked = database.is_batch_locked(name)
+    if locked:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch '{name}' has an invoice already Loaded, Excluded, "
+                "Posted, Completed, or Rejected — it can no longer be "
+                "downloaded or have its Document No./Entry No. renumbered."
+            ),
+        )
+
+    all_batches = database.list_batches()
+
+    # Batches must clear in creation order: an earlier batch not yet fully
+    # Loaded/Posted/Completed (ignoring its excluded invoices) blocks any
+    # newer batch's download, so Document Nos. never get ahead of a batch
+    # still pending - see database.list_batches's 'blocked_by'.
+    blocked_by = next(
+        (b.get("blocked_by", []) for b in all_batches if b.get("batch") == name),
+        [],
+    )
+    if blocked_by:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch '{name}' can't be downloaded yet — the earlier "
+                f"batch(es) {', '.join(blocked_by)} must be fully Loaded, "
+                "Posted, or Completed first."
+            ),
+        )
+
+    # Only one batch may be mid-flight (Downloaded or In Progress) at a
+    # time - if some OTHER batch is already sitting there, it must be
+    # taken to Loaded/Posted/Completed before a different batch may be
+    # downloaded, even if this one wouldn't otherwise be blocked by
+    # creation order.
+    active_others = [
+        b["batch"] for b in all_batches
+        if b["batch"] != name and b.get("batch_status") in ("DOWNLOADED", "IN PROGRESS")
+    ]
+    if active_others:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch(es) {', '.join(active_others)} still Downloaded/In "
+                "Progress — take it to Loaded, Posted, or Completed before "
+                f"downloading '{name}'."
+            ),
+        )
+
     try:
         sheet_data = database.fetch_batch(name, excel_export.sheet_columns())
+    except ValueError as exc:
+        # A Document No. collision against another batch (see
+        # database._find_no_collision) - nothing was written, refuse the
+        # download with a clear reason rather than a generic 500.
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
     if not sheet_data["Purchase Header"]["rows"]:
         raise HTTPException(status_code=404, detail=f"Batch '{name}' not found")
 
+    # database.fetch_batch() already wrote a real [No.]/[Entry No.] directly
+    # (see _assign_document_numbers/_assign_entry_numbers) - the batch being
+    # locked was already rejected above, so a custom doc_no/entry_no here is
+    # a deliberate user override on top of that, persisted the same way
+    # (overwriting what fetch_batch just auto-assigned).
     if start_doc_no is not None or start_entry_no is not None:
         excel_export.renumber_batch(sheet_data, start_doc_no, start_entry_no)
-
-    # Keep Last_Updated_No in sync with whatever was just exported (default
-    # numbering or a custom renumber) — the number that becomes real/
-    # permanent (see database.advance_status) once the invoice is Loaded.
-    try:
-        database.update_last_updated_no([
-            (row.get("Id"), row.get("No.", ""))
+        doc_pairs = {
+            row.get("Id"): row.get("No.", "")
             for row in sheet_data["Purchase Header"]["rows"]
             if row.get("Id") is not None
-        ])
-    except Exception:  # noqa: BLE001 - best-effort, download still succeeds
-        import traceback
-        traceback.print_exc()
-
-    # Same idea for Reservation Entry's Entry No. (see
-    # database.update_last_updated_entry_no) — row-local, not shared
-    # across a header's rows like No./Source ID.
-    try:
-        database.update_last_updated_entry_no([
-            (row.get("Id"), row.get("Entry No.", ""))
+        } if start_doc_no is not None else {}
+        entry_pairs = {
+            row.get("Id"): row.get("Entry No.", "")
             for row in sheet_data["Reservation Entry"]["rows"]
             if row.get("Id") is not None
-        ])
+        } if start_entry_no is not None else {}
+        try:
+            # Check BOTH mappings before writing EITHER - write_document_numbers
+            # and write_entry_numbers each commit independently, so without
+            # this upfront check a Document No. write could succeed and
+            # commit only for the paired Entry No. write to then collide,
+            # leaving the Document No. change persisted despite the overall
+            # request failing with "nothing was changed".
+            database.precheck_number_collisions(doc_pairs, entry_pairs)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if start_doc_no is not None:
+            try:
+                database.write_document_numbers(doc_pairs)
+            except ValueError as exc:
+                # A custom-chosen number collides with another batch's -
+                # nothing was written, refuse rather than export an Excel
+                # with a Document No. that never actually got saved.
+                raise HTTPException(status_code=400, detail=str(exc))
+        if start_entry_no is not None:
+            try:
+                database.write_entry_numbers(entry_pairs)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        database.mark_batch_downloaded(name)
     except Exception:  # noqa: BLE001 - best-effort, download still succeeds
         import traceback
         traceback.print_exc()
@@ -1237,6 +1337,7 @@ def get_mapping():
 @app.post("/api/mapping")
 def save_mapping(payload: MappingModel):
     import excel_export
+    _require_not_viewer(payload.user_id)
     return {"mapping": excel_export.save_mapping(payload.mapping, payload.user_id)}
 
 
@@ -1288,6 +1389,7 @@ def get_fields():
 def save_fields(payload: FieldsModel):
     """Save customized column lists {sheet: [columns]} (order matters)."""
     import excel_export
+    _require_not_viewer(payload.user_id)
     return {"columns": excel_export.save_columns(payload.columns, payload.user_id)}
 
 
@@ -1334,6 +1436,7 @@ def get_templates():
 @app.post("/api/templates")
 def save_template(payload: TemplateModel):
     import template_store
+    _require_not_viewer(payload.user_id)
     try:
         key, folder = template_store.save_template(
             payload.entity, payload.invoice_type, payload.name, payload.po_format,
@@ -1347,6 +1450,7 @@ def save_template(payload: TemplateModel):
 @app.post("/api/templates/delete")
 def delete_template(payload: TemplateKeyModel):
     import template_store
+    _require_not_viewer(payload.user_id)
     return {"deleted": template_store.delete_template(payload.key, payload.user_id)}
 
 
@@ -1488,6 +1592,12 @@ class UserResetPasswordModel(BaseModel):
     new_password: Optional[str] = None   # None = auto-generate
 
 
+class UserChangeTypeModel(BaseModel):
+    user_id: int          # the acting admin/super admin
+    target_user_id: int   # whose role is being changed
+    new_user_type_id: int
+
+
 def _email_result(email_sent, email_error):
     return {"email_sent": email_sent, "email_error": email_error}
 
@@ -1511,6 +1621,7 @@ def api_create_user(payload: UserCreateModel, request: Request):
     import database
     import mailer
 
+    _require_not_viewer(payload.created_by)
     name = (payload.username or "").strip()
     email = (payload.email or "").strip()
     if not name or not email:
@@ -1545,6 +1656,7 @@ def api_set_user_active(payload: UserActiveModel, request: Request):
     import database
     import mailer
 
+    _require_not_viewer(payload.modified_by)
     try:
         user = database.get_user_by_id(payload.user_id)
     except Exception as exc:  # noqa: BLE001
@@ -1643,6 +1755,54 @@ def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
             email_error = str(exc)
 
     return {"ok": True, **_email_result(email_sent, email_error)}
+
+
+@app.post("/api/users/change-type")
+def api_admin_change_user_type(payload: UserChangeTypeModel):
+    """Admin-triggered role change for an existing user, mirroring
+    /api/users/reset-password's exact permission rule: a Super Admin may
+    retarget anyone (including themselves) to any role. An Admin may only
+    retarget a plain User/Accounts account - never themselves, another
+    Admin, or a Super Admin - AND may only assign them another plain
+    User/Accounts role (never promote anyone to Admin/Super Admin)."""
+    import database
+
+    caller_role = database.get_user_role(payload.user_id)
+    if not caller_role or not caller_role["active"] or caller_role["role"].lower() not in ("admin", "super admin"):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    is_super_admin = caller_role["role"].lower() == "super admin"
+
+    target = database.get_user_by_id(payload.target_user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    types = {t["id"]: t["name"] for t in database.list_user_types()}
+    new_type_name = (types.get(payload.new_user_type_id) or "").lower()
+    if not new_type_name:
+        raise HTTPException(status_code=400, detail="Unknown user type.")
+
+    if not is_super_admin:
+        target_role_name = (target.get("UserTypeName") or "").lower()
+        if (payload.target_user_id == payload.user_id
+                or target_role_name in ("admin", "super admin")):
+            raise HTTPException(
+                status_code=403,
+                detail="Admins can only change the role of a regular User/Accounts account "
+                       "- not their own, another Admin's, or a Super Admin's.",
+            )
+        if new_type_name in ("admin", "super admin"):
+            raise HTTPException(
+                status_code=403,
+                detail="Admins can only assign the User or Accounts role - promoting to "
+                       "Admin or Super Admin requires a Super Admin.",
+            )
+
+    try:
+        database.set_user_type(payload.target_user_id, payload.new_user_type_id, payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    return {"ok": True, "user_type_name": types[payload.new_user_type_id]}
 
 
 class MailSettingsModel(BaseModel):

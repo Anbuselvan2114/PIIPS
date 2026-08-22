@@ -49,7 +49,6 @@ class ProcessingJob:
         self.export_file = ""            # generated Excel (process mode)
         self.db_saved = {}               # {table: rows_inserted} (process mode)
         self.batch_name = ""             # batch saved to the DB (process mode)
-        self._doc_seq = 0                # running Document No. sequence
         # Purchase-tracker attribution: who clicked Start, and when.
         self.started_by = started_by
         self.started_at = datetime.now()
@@ -279,10 +278,14 @@ class JobManager:
                 for it in data.get("items", []):
                     line_no = it.get("Line_No", "")
                     it["Document Type"] = ctx["doc_type"]
-                    it["Document No."] = ctx["doc_no"]
+                    # [Document No.] / [Source ID] are deliberately blank
+                    # until the Excel is downloaded (see fetch_batch,
+                    # which mints and saves the real one) - never a real
+                    # value here.
+                    it["Document No."] = ""
                     it["Source Type"] = "39"
                     it["Source Subtype"] = ctx["doc_type"]
-                    it["Source ID"] = ctx["doc_no"]
+                    it["Source ID"] = ""
                     it["Source Ref. No."] = line_no
 
                 # Write the JSON into Output mirroring the Input template
@@ -417,31 +420,23 @@ class JobManager:
                                 job.source_folder, src_path
                             )
 
-                            # ---- BC relationship keys (Header/Line/Reservation) ----
-                            job._doc_seq += 1
-                            po_fmt = static.get("PO_Number_Format", "") or ""
+                            # ---- BC relationship key (Header/Line/Reservation) ----
+                            # PO_Number_Format is resolved live from the
+                            # template at download time now (see
+                            # database._po_number_format_for_header), not
+                            # stored here - Document No./No./Source ID stay
+                            # blank until then too (see save_grouped).
                             doc_type = (
                                 static.get("Purchase Header", {}).get("Document Type")
                                 or static.get("Purchase Line", {}).get("Document Type")
                                 or "Order"
                             )
-                            doc_no = (
-                                f"{po_fmt}{job._doc_seq:06d}" if po_fmt
-                                else (data.get("invoice_no") or f"DOC{job._doc_seq:06d}")
-                            )
                             data["Document Type"] = doc_type
-                            data["Document No."] = doc_no
-                            # Kept separately (not just parsed back out of
-                            # Document No.) so a Dashboard renumber later
-                            # can rebuild "prefix + new sequence" even for
-                            # a header whose invoice_no fallback doesn't
-                            # look like "PREFIX000123" at all.
-                            data["PO_Number_Format"] = po_fmt
 
                             ctx = {
                                 "data": data, "filename": filename, "rel": rel,
                                 "fmt_name": fmt_name, "doc_type": doc_type,
-                                "doc_no": doc_no, "invoice_type": invoice_type,
+                                "invoice_type": invoice_type,
                                 "group_idx": group_idx, "multi": multi,
                                 "src_path": src_path, "inv_no": inv_no,
                                 "static": static, "tkey": tkey,

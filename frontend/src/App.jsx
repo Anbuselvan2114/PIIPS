@@ -51,6 +51,10 @@ const ROLE_MENUS = {
   user: ["dashboard", "input", "manual", "buyerorder", "load"],
   // Accounts run the downstream Post / Complete steps.
   accounts: ["dashboard", "input", "manual", "post", "complete"],
+  // Viewer sees every page (read-only) - every mutating action is blocked
+  // server-side too (app.py's _require_not_viewer), this is just so
+  // nothing is hidden from them.
+  viewer: MENU.map(([k]) => k),
 };
 
 // Load / Post / Complete are one component parameterised by stage.

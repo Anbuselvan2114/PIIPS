@@ -339,7 +339,6 @@ def build_rows_grouped(invoices, mapping=None):
             reservations.append(_row(inv, sf, "Reservation Entry", re_map, re_cols))
         groups.append({
             "invoice_no": inv.get("invoice_no", ""),
-            "po_number_format": inv.get("PO_Number_Format", ""),
             "header": header,
             "lines": lines,
             "reservations": reservations,
