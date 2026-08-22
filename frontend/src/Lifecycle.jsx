@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { getLifecycleInvoices, advanceLifecycle } from "./api";
-import { DataTable, PdfModal } from "./components";
+import { getLifecycleInvoices, advanceLifecycle, rejectInvoice } from "./api";
+import { DataTable, PdfModal, Modal } from "./components";
 
 // Load / Post / Complete lifecycle page (one component, parameterised by
 // `stage`). Lists invoices at the stage's source status(es); the user selects
@@ -14,6 +14,11 @@ const STAGES = {
 
 export default function Lifecycle({ user, stage }) {
   const cfg = STAGES[stage] || STAGES.load;
+  const canPostOrReject = ["accounts", "admin", "super admin"]
+    .includes((user?.user_type || "").toLowerCase());
+  // Posting and rejecting are Accounts/Admin/Super Admin only; Load and
+  // Complete stay open to everyone.
+  const canAct = stage !== "post" || canPostOrReject;
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -22,6 +27,10 @@ export default function Lifecycle({ user, stage }) {
   const [batchFilter, setBatchFilter] = useState("");
   const [advancing, setAdvancing] = useState(false);
   const [pdfFile, setPdfFile] = useState(null);
+  const [rejectTarget, setRejectTarget] = useState(null); // row being rejected
+  const [rejectRemark, setRejectRemark] = useState("");
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectError, setRejectError] = useState(null);
 
   const load = () => {
     setLoading(true); setError(null); setSelected({});
@@ -63,6 +72,22 @@ export default function Lifecycle({ user, stage }) {
     finally { setAdvancing(false); }
   };
 
+  const openReject = (row) => {
+    setRejectTarget(row); setRejectRemark(""); setRejectError(null);
+  };
+
+  const submitReject = async () => {
+    if (!rejectRemark.trim()) { setRejectError("A remark is required."); return; }
+    setRejecting(true); setRejectError(null);
+    try {
+      await rejectInvoice(rejectTarget.header_id, rejectRemark.trim(), user?.user_id);
+      setRejectTarget(null);
+      setMsg(`${rejectTarget.invoice_no || rejectTarget.file_name} → REJECTED BY ACCOUNTS.`);
+      load();
+    } catch (e) { setRejectError(e.message); }
+    finally { setRejecting(false); }
+  };
+
   const invoiceCell = (row) => (
     row.file_name ? (
       <button className="btn-link" onClick={() => setPdfFile(row.file_name)}
@@ -84,10 +109,23 @@ export default function Lifecycle({ user, stage }) {
                onChange={() => setSelected((s) => ({ ...s, [row.header_id]: !s[row.header_id] }))} />
       ) },
     { key: "invoice_no", label: "Invoice No.", render: invoiceCell },
+    { key: "navision_doc_no", label: "Navision Document No.",
+      render: (row) => row.navision_doc_no
+        || (stage === "load" ? row.last_updated_no : "") || "—" },
     { key: "file_name", label: "File" },
     { key: "vendor", label: "Vendor" },
     { key: "status", label: "Status" },
     { key: "batch", label: "Batch" },
+    { key: "reject_remark", label: "Reject Remark",
+      render: (row) => row.reject_remark || "—" },
+    ...(stage === "post" && canPostOrReject ? [{
+      key: "_reject", sortable: false, label: "",
+      render: (row) => (
+        <button className="btn btn-subtle btn-sm" onClick={() => openReject(row)}>
+          Reject
+        </button>
+      ),
+    }] : []),
   ];
 
   return (
@@ -113,10 +151,14 @@ export default function Lifecycle({ user, stage }) {
           </label>
           <div style={{ flex: 1 }} />
           <span className="muted" style={{ fontSize: 13 }}>{selectedIds.length} selected</span>
-          <button className="btn btn-primary" disabled={advancing || !selectedIds.length}
-                  onClick={advance}>
-            {advancing ? "Working…" : cfg.action}
-          </button>
+          {canAct ? (
+            <button className="btn btn-primary" disabled={advancing || !selectedIds.length}
+                    onClick={advance}>
+              {advancing ? "Working…" : cfg.action}
+            </button>
+          ) : (
+            <span className="muted" style={{ fontSize: 13 }}>Accounts, Admin, or Super Admin access required to post.</span>
+          )}
         </div>
 
         {error && <div className="alert alert-danger" style={{ marginBottom: 12 }}>{error}</div>}
@@ -124,12 +166,35 @@ export default function Lifecycle({ user, stage }) {
 
         {loading ? <div className="empty">Loading…</div> : (
           <DataTable columns={columns} rows={visible.map((r) => ({ ...r, _key: r.header_id }))}
-                     searchKeys={["invoice_no", "file_name", "vendor", "batch", "status"]}
+                     searchKeys={["invoice_no", "navision_doc_no", "last_updated_no", "file_name", "vendor", "batch", "status"]}
                      pageSizeOptions={[10, 20, 30, "all"]}
                      empty="No invoices are eligible for this step." />
         )}
       </div>
       {pdfFile && <PdfModal file={pdfFile} onClose={() => setPdfFile(null)} />}
+      {rejectTarget && (
+        <Modal title={`Reject ${rejectTarget.invoice_no || rejectTarget.file_name}`}
+               onClose={() => (!rejecting && setRejectTarget(null))} width={480}>
+          <p className="hint" style={{ marginTop: 0 }}>
+            This invoice moves back to REJECTED BY ACCOUNTS and reappears on the Load page.
+          </p>
+          <div className="field">
+            <label className="label">Remark</label>
+            <textarea className="input" rows={4} value={rejectRemark}
+                      onChange={(e) => setRejectRemark(e.target.value)}
+                      placeholder="Why is this invoice being rejected?" autoFocus />
+          </div>
+          {rejectError && <div className="alert alert-danger" style={{ marginBottom: 12 }}>{rejectError}</div>}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+            <button className="btn btn-subtle" disabled={rejecting}
+                    onClick={() => setRejectTarget(null)}>Cancel</button>
+            <button className="btn btn-danger" disabled={rejecting || !rejectRemark.trim()}
+                    onClick={submitReject}>
+              {rejecting ? "Rejecting…" : "Reject"}
+            </button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
