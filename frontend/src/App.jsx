@@ -157,6 +157,7 @@ export default function App() {
       : <Login
           onSuccess={(u) => { localStorage.setItem("piips_user", JSON.stringify(u)); setUser(u); setPage("dashboard"); }}
           onForgot={() => setAuthView("forgot")}
+          onDbError={() => setDbConfigured(false)}
         />;
   }
 

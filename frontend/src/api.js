@@ -37,7 +37,15 @@ async function request(path, options = {}) {
     throw new Error("Could not reach the server. Check your connection and try again.");
   }
 
-  if (!res.ok) throw new Error(await errorMessageFor(res));
+  if (!res.ok) {
+    const err = new Error(await errorMessageFor(res));
+    // Status is attached (not just the message) so a caller can tell a
+    // real database/server failure (5xx) apart from a normal rejection
+    // (e.g. 401 wrong password) without pattern-matching text - see
+    // Login.jsx, which bounces back to Database Configuration on a 5xx.
+    err.status = res.status;
+    throw err;
+  }
 
   return res.json();
 }

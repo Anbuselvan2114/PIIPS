@@ -43,8 +43,10 @@ def _bootstrap_menu_storage():
     import traceback
     try:
         import config_store
-        # Encrypt any legacy plaintext connection string in config.json.
-        config_store.ensure_secret_encrypted()
+        # Decrypt any legacy DPAPI-protected connection string in
+        # config.json back to plain text (db_connection is human-readable
+        # now - see config_store.save_config).
+        config_store.ensure_secret_plaintext()
 
         import database
         if (config_store.load_config().get("db_connection") or "").strip():

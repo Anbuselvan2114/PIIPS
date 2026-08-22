@@ -29,11 +29,14 @@ robocopy $Source $Destination /E /XJ /R:2 /W:5 /MT:8 /XD ".git" ".claude" "venv"
 ------------------------------------------------------------------
 Notes
 ------------------------------------------------------------------
-- config.json is deliberately excluded: its db_connection string is
-  encrypted with Windows DPAPI in LOCAL_MACHINE scope, so a copy taken
-  on this machine cannot be decrypted on the destination machine. On
-  the destination, open the app's Database Configuration screen once
-  and re-enter the connection details there instead.
+- config.json is deliberately excluded: each environment (dev/uat/live)
+  points at its own database, so copying this machine's config.json would
+  silently redirect the destination at the WRONG database. db_connection
+  is stored as plain, human-readable text (not encrypted) - on a fresh
+  destination with no config.json at all, the app itself shows a Database
+  Configuration screen before login (no login needed) so this is normally
+  a one-time fill-in-the-form step, not a file edit. If you do need to
+  edit it by hand (e.g. no browser access yet), see "Login fails" below.
 - venv/ and frontend/node_modules/ are excluded because they are
   environment-specific; reinstall them on the destination with
   `pip install --no-deps -r requirements.txt` / `npm install` per the
@@ -75,7 +78,7 @@ $Destination = "E:\PIIPS_Application"      # <-- EDIT THIS to the real server pa
                                             #     \\10.0.1.210\E$\PIIPS_Application
                                             #     if copying over the network)
 
-robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 /XD "venv" ".venv" "__pycache__" "node_modules" "logs" /XF "config.json" "config_nonencrypted.json" "*.log"
+robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 /XD "venv" ".venv" "__pycache__" "node_modules" "logs" /XF "config.json" "*.log"
 
 # /XD above is not optional: the staged build never contains venv/ or
 # __pycache__/ in the first place (excluded at staging time), so without
@@ -270,20 +273,26 @@ netsh interface ipv4 show excludedportrange protocol=tcp
 
 --- Login fails with: Database error: db_connection is not configured
     (server/database missing) ---
-config.json's db_connection is either empty, or still holds the DPAPI-
-encrypted blob copied from another machine (it cannot be decrypted on
-this server - see the Notes in Part 1). Fix on THIS server by setting a
-plaintext connection string directly in config.json - do it via
-PowerShell (safer than notepad, avoids encoding/formatting mistakes):
+config.json's db_connection is empty - normal on a fresh deploy, since
+config.json is deliberately never copied by Publish/robocopy (see the
+Notes in Part 1). The app itself now shows a Database Configuration
+screen BEFORE login when this happens - no login needed - so the usual
+fix is just opening the site in a browser and filling in the form there.
+Only edit config.json by hand if you don't have browser access to the
+server yet - db_connection is plain, human-readable text (not encrypted),
+so a plain PowerShell edit works directly:
 $configPath = "E:\PIIPS_Application\config.json"
 $config = Get-Content $configPath -Raw | ConvertFrom-Json
 $config.db_connection = "Server=<host>;Database=<db>;User Id=<user>;Password=<password>;"
 $config | ConvertTo-Json | Set-Content $configPath -Encoding utf8
 Restart-Service PIIPS_Backend
 Invoke-RestMethod http://127.0.0.1:8000/health
-# On restart, the app detects the plaintext value and DPAPI-encrypts it
-# in place using THIS machine's key - seeing config.json go back to
-# "enc:dpapi:..." after a restart is expected/correct, not a bug.
+# If this server has an OLDER config.json with a "enc:dpapi:..." value
+# from before db_connection was switched to plain text, the app decrypts
+# it back to plain text automatically on this next restart (it can only
+# do this on the SAME machine it was originally encrypted on - a blob
+# copied from a different machine can't be recovered this way; just
+# overwrite it with a fresh plain value instead, as above).
 
 --- Site opens fine at http://localhost:8080 ON THE SERVER, but times
     out from any other machine (e.g. http://<uat-server-ip>:8080) ---

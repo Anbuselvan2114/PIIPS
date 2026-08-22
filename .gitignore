@@ -9,7 +9,6 @@ venv/
 
 # Runtime / generated
 config.json
-config_nonencrypted.json
 format_model.json
 model_backups/
 New_Format/
