@@ -2381,6 +2381,20 @@ class OCREngine:
                     return True
             return False
 
+        def row_has_amount(vwords):
+            """True if the row carries a real value under the Amount
+            column - the one signal a genuine item line always has, that a
+            stray continuation fragment (e.g. a quantity/unit leaking onto
+            its own wrapped-description row) does not."""
+            if not value_cols:
+                return False
+            for w in vwords:
+                t = w["text"].strip()
+                col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
+                if col == "Amount" and (is_number(t) or number_with_unit(t) is not None):
+                    return True
+            return False
+
         item_seq = 0
 
 
@@ -2491,24 +2505,49 @@ class OCREngine:
                         break
 
             # Fallback: a data row with no leading serial (scanned invoices
-            # whose SI column is missing). Recognise it by an HSN code and
-            # synthesise a sequential serial. A charge line (freight/courier/
-            # etc.) with a full HSN/SAC code must NOT be swept in here — it
-            # has its own dedicated handling further below that correctly
-            # sets Quantity/Rate/the charge flag; this fallback would
-            # otherwise treat it as a generic table item and lose all of that.
-            # Also require some actual description text (letters) among the
-            # row's tokens: a genuine item always names the product, while a
-            # GST breakdown/tax-summary row that slipped past clean_table_rows
-            # (HSN | Rate% | Taxable Amt | CGST Amt | SGST Amt | Total Tax —
-            # all numbers, no label text of its own on that row) has none,
-            # and would otherwise be mistaken for a second phantom item.
+            # whose SI column is missing, or a layout with no SI column at
+            # all). Recognise it as a real item either by an HSN code, or
+            # (some layouts print no HSN on the item's own row at all - it's
+            # on a separate row further down) by a genuine Amount value
+            # sitting under that column - requiring HSN alone would miss the
+            # item entirely and let it fall through into the next unrelated
+            # row's description.
+            # Synthesise a sequential serial. A charge line (freight/courier/
+            # etc.) must NOT be swept in here — it has its own dedicated
+            # handling further below that correctly sets Quantity/Rate/the
+            # charge flag; this fallback would otherwise treat it as a
+            # generic table item and lose all of that.
+            # Also require a genuine, non-unit description word among the
+            # row's tokens: a real item always names the product, while a
+            # GST breakdown/tax-summary row or an unlabelled running-total
+            # row ("QTY | 02 | Rs.4366.00") that slipped past
+            # clean_table_rows has no description text of its own - at
+            # most a bare unit word ("QTY"/"Nos") - and would otherwise be
+            # mistaken for a second phantom item.
+            # The Amount check (rather than any one of Quantity/Rate/Amount)
+            # matters too: a genuine item line always states its line total,
+            # while a wrapped-description continuation that merely has a
+            # stray quantity/unit bleeding onto its own row ("Godown: Main
+            # Location | 2.00 Nos") does not, and must stay folded into the
+            # current item's description instead of being promoted into an
+            # incomplete phantom item.
+            # A rounding adjustment ("Rounded Off", "Less : Rounded Off (-)")
+            # has real (non-unit) label text and a genuine Amount, so it
+            # would otherwise pass every check above and get misfiled as a
+            # purchased item worth a few paise/rupees - exclude it by name.
             if (
                 serial is None
                 and value_cols
                 and not any(k in lower for k in CHARGE_KW)
-                and any(is_hsn(t.replace(",", "")) for t in texts)
-                and any(re.search(r"[A-Za-z]{2,}", t) for t in texts)
+                and not re.search(r"round(?:ed)?[\s-]*off", lower)
+                and (
+                    any(is_hsn(t.replace(",", "")) for t in texts)
+                    or row_has_amount(words)
+                )
+                and any(
+                    re.search(r"[A-Za-z]{2,}", t) and not is_unit(t)
+                    for t in texts
+                )
             ):
                 item_seq += 1
                 serial = str(item_seq)

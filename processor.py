@@ -501,20 +501,37 @@ class JobManager:
                                     "batch": job.batch_name, "header_id": None, "excluded": False,
                                 }
 
-                            if fmt_name is None or not inv_no:
+                            # A PART invoice with no real "Item" line at all
+                            # (only Charge (Item)/freight lines, or nothing)
+                            # means the table layout wasn't actually
+                            # understood, even though the format matched by
+                            # GSTIN - the parts themselves got lost, not
+                            # just some field on them. Trusting that as a
+                            # genuine (empty) invoice would save a PART
+                            # purchase with no parts on it; treated the same
+                            # as an unrecognized format instead.
+                            no_real_items = (
+                                invoice_type == "PART"
+                                and not any(not it.get("_charge") for it in data.get("items", []))
+                            )
+                            if fmt_name is None or not inv_no or no_real_items:
                                 # Either the format itself is unrecognized,
-                                # or no Vendor Invoice No. could be read off
-                                # this PDF at all - neither leaves anything
-                                # trustworthy to hand to Service First or to
-                                # generate a real Document No. from. Park it
-                                # as NEW TEMPLATE instead of guessing;
-                                # new_format=True below still triggers the
-                                # same New_Format training-copy as the
-                                # per-item "SF doesn't know this part" case.
+                                # no Vendor Invoice No. could be read off
+                                # this PDF at all, or (PART only) no real
+                                # item line was found - none of these leave
+                                # anything trustworthy to hand to Service
+                                # First or to generate a real Document No.
+                                # from. Park it as NEW TEMPLATE instead of
+                                # guessing; new_format=True below still
+                                # triggers the same New_Format training-copy
+                                # as the per-item "SF doesn't know this
+                                # part" case.
                                 reason = (
                                     "Unrecognized invoice format — needs training"
                                     if fmt_name is None else
                                     "Vendor Invoice No. not extracted — needs training"
+                                    if not inv_no else
+                                    "No item line found on a PART invoice — needs training"
                                 )
                                 verdict = {"status": "NEW TEMPLATE", "is_active": False,
                                            "is_synced": False, "new_format": True,
