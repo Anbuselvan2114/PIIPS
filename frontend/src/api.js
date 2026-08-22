@@ -92,6 +92,12 @@ export const advanceLifecycle = (stage, header_ids, user_id) =>
     body: JSON.stringify({ stage, header_ids, user_id }),
   });
 
+export const rejectInvoice = (header_id, remark, user_id) =>
+  request("/api/lifecycle/reject", {
+    method: "POST",
+    body: JSON.stringify({ header_id, remark, user_id }),
+  });
+
 export const getDbConfig = (user_id) =>
   request(`/api/db-config${user_id != null ? `?user_id=${user_id}` : ""}`);
 

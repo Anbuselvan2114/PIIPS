@@ -681,10 +681,25 @@ def invoices_set_buyer_order(payload: BuyerOrderModel):
 # Load / Post / Complete lifecycle. Each stage lists invoices at its source
 # status(es) and advances the selected ones to its target status.
 _LIFECYCLE = {
-    "load":     {"from": ["READY TO LOAD"],           "to": "LOADED"},
-    "post":     {"from": ["READY TO LOAD", "LOADED"], "to": "POSTED"},
-    "complete": {"from": ["POSTED"],                  "to": "COMPLETED"},
+    "load":     {"from": ["READY TO LOAD", "REJECTED BY ACCOUNTS"], "to": "LOADED"},
+    "post":     {"from": ["LOADED"],  "to": "POSTED"},
+    "complete": {"from": ["POSTED"],  "to": "COMPLETED"},
 }
+
+
+_POST_ROLES = {"accounts", "admin", "super admin"}
+
+
+def _require_post_access(user_id):
+    """Raise 403 unless user_id is an active Accounts, Admin, or Super Admin
+    user (the Post page's mark-as-posted and reject actions)."""
+    import database
+    try:
+        info = database.get_user_role(user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not info or not info["active"] or (info["role"] or "").lower() not in _POST_ROLES:
+        raise HTTPException(status_code=403, detail="Accounts, Admin, or Super Admin access required.")
 
 
 @app.get("/api/lifecycle/invoices")
@@ -718,6 +733,8 @@ def lifecycle_advance(payload: LifecycleModel):
     stage = (payload.stage or "").lower()
     if stage not in _LIFECYCLE:
         raise HTTPException(status_code=400, detail="Unknown stage")
+    if stage == "post":
+        _require_post_access(payload.user_id)
     spec = _LIFECYCLE[stage]
     import database
     try:
@@ -752,6 +769,41 @@ def lifecycle_advance(payload: LifecycleModel):
             traceback.print_exc()
 
     return {"ok": True, "count": res.get("count", 0), "to": spec["to"]}
+
+
+class RejectModel(BaseModel):
+    header_id: int
+    remark: str
+    user_id: Optional[int] = None
+
+
+@app.post("/api/lifecycle/reject")
+def lifecycle_reject(payload: RejectModel):
+    """Accounts/Admin/Super Admin: reject one LOADED invoice, on the Post
+    page, back to REJECTED BY ACCOUNTS with a required remark. The invoice
+    reappears on the Load page (alongside READY TO LOAD) with the remark
+    visible, for another attempt."""
+    import database
+    _require_post_access(payload.user_id)
+    remark = (payload.remark or "").strip()
+    if not remark:
+        raise HTTPException(status_code=400, detail="A remark is required to reject an invoice.")
+    try:
+        res = database.reject_invoice(payload.header_id, remark, payload.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not res:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    moved = ""
+    if res.get("file_name"):
+        try:
+            moved = config_store.move_pdf_to_status(res["file_name"], "REJECTED BY ACCOUNTS")
+        except Exception:  # noqa: BLE001 - file move is best-effort
+            import traceback
+            traceback.print_exc()
+    return {"ok": True, "new_status": "REJECTED BY ACCOUNTS", "moved_to": moved}
 
 
 @app.get("/api/batches/download")

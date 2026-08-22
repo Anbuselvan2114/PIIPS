@@ -39,6 +39,7 @@ STATUS_VALUES = [
     "POSTED",
     "COMPLETED",
     "EXCLUDED",
+    "REJECTED BY ACCOUNTS",
 ]
 
 # User type values for tbl_UserType. "Accounts" runs the Load/Post/Complete
@@ -1025,10 +1026,12 @@ def _invoice_list(where_sql, params):
         vendor = "h.[Buy-from Vendor Name]" if _hdr_col(cur, "Buy-from Vendor Name") else "CAST(NULL AS NVARCHAR(400))"
         gst = "h.[Vendor GST Reg. No.]" if _hdr_col(cur, "Vendor GST Reg. No.") else "CAST(NULL AS NVARCHAR(50))"
         ddate = "h.[Document Date]" if _hdr_col(cur, "Document Date") else "CAST(NULL AS NVARCHAR(50))"
+        docno = "h.[No.]" if _hdr_col(cur, "No.") else "CAST(NULL AS NVARCHAR(50))"
+        lastno = "h.Last_Updated_No" if _hdr_col(cur, "Last_Updated_No") else "CAST(NULL AS NVARCHAR(50))"
         sql = (
             "SELECT h.Id, h.InvoiceNo, pt.BatchName, pt.FileName, pt.TemplateFormat, "
             "s.StatusName, pt.IsActive, pt.IsSynced, ISNULL(pt.IsExcluded, 0), "
-            f"{vendor}, {gst}, {ddate}, pt.Id, pt.SourceJson "
+            f"{vendor}, {gst}, {ddate}, pt.Id, pt.SourceJson, {docno}, pt.RejectRemark, {lastno} "
             "FROM dbo.tbl_Purchase_Tracker pt "
             "JOIN dbo.tbl_Purchase_Header h ON h.Id = pt.Purchase_Header_ID "
             "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
@@ -1047,6 +1050,9 @@ def _invoice_list(where_sql, params):
                 "doc_date": str(r[11]) if r[11] else "",
                 "tracker_id": r[12],
                 "invoice_type": _invoice_type_from_source_json(r[13]),
+                "navision_doc_no": r[14] or "",
+                "reject_remark": r[15] or "",
+                "last_updated_no": r[16] or "",
             })
         return out
     finally:
@@ -1360,6 +1366,44 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
         conn.close()
 
 
+def reject_invoice(header_id, remark, user_id=None):
+    """Accounts/Admin/Super Admin action on the Post page: reject one LOADED
+    invoice back to REJECTED BY ACCOUNTS with a required remark explaining
+    why. Stays
+    IsActive=1 so it reappears on the Load page (alongside READY TO LOAD)
+    for another attempt, with the remark visible there.
+    Sample: reject_invoice(8, "Wrong GST rate on line 2", 11)"""
+    remark = (remark or "").strip()
+    if not remark:
+        raise ValueError("A remark is required to reject an invoice.")
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT pt.Id, pt.FileName, s.StatusName "
+            "FROM dbo.tbl_Purchase_Tracker pt "
+            "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+            "WHERE pt.Purchase_Header_ID = ?", header_id)
+        row = cur.fetchone()
+        if not row:
+            return None
+        tracker_id, file_name, status_name = row
+        if status_name != "LOADED":
+            raise ValueError(f"Invoice is '{status_name}', not LOADED — it can't be rejected from here.")
+        cur.execute(
+            "UPDATE dbo.tbl_Purchase_Tracker "
+            "SET StatusID = (SELECT StatusId FROM dbo.tbl_status WHERE StatusName = 'REJECTED BY ACCOUNTS'), "
+            "    IsActive = 1, RejectRemark = ?, RejectedByID = ?, RejectedDatetime = GETDATE(), "
+            "    LastModifiedById = ?, LastModifiedDatetime = GETDATE() "
+            "WHERE Id = ?",
+            remark, user_id, user_id, tracker_id)
+        conn.commit()
+        return {"file_name": file_name}
+    finally:
+        conn.close()
+
+
 def invoices_by_header_ids(header_ids):
     """Invoices for a specific set of header ids, in the same shape as
     invoices_by_status/invoices_by_batch (used to build the invoice-no +
@@ -1637,6 +1681,14 @@ _MENU_TABLE_DDL = [
     "ALTER TABLE dbo.tbl_Purchase_Tracker ADD ExcludedDatetime DATETIME NULL",
     "IF COL_LENGTH('dbo.tbl_Purchase_Tracker','PriorStatusID') IS NULL "
     "ALTER TABLE dbo.tbl_Purchase_Tracker ADD PriorStatusID INT NULL",
+    # Accounts can reject a LOADED invoice back to REJECTED BY ACCOUNTS with
+    # a required remark - see reject_invoice().
+    "IF COL_LENGTH('dbo.tbl_Purchase_Tracker','RejectRemark') IS NULL "
+    "ALTER TABLE dbo.tbl_Purchase_Tracker ADD RejectRemark NVARCHAR(500) NULL",
+    "IF COL_LENGTH('dbo.tbl_Purchase_Tracker','RejectedByID') IS NULL "
+    "ALTER TABLE dbo.tbl_Purchase_Tracker ADD RejectedByID INT NULL",
+    "IF COL_LENGTH('dbo.tbl_Purchase_Tracker','RejectedDatetime') IS NULL "
+    "ALTER TABLE dbo.tbl_Purchase_Tracker ADD RejectedDatetime DATETIME NULL",
     "IF COL_LENGTH('dbo.tbl_Purchase_Tracker','InvoiceTypeID') IS NULL "
     "ALTER TABLE dbo.tbl_Purchase_Tracker ADD InvoiceTypeID INT NULL "
     "CONSTRAINT FK_Purchase_Tracker_InvoiceType REFERENCES dbo.tbl_InvoiceType(InvoiceTypeId)",
