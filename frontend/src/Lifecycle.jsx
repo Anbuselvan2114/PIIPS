@@ -121,8 +121,8 @@ export default function Lifecycle({ user, stage }) {
     ...(stage === "post" && canPostOrReject ? [{
       key: "_reject", sortable: false, label: "",
       render: (row) => (
-        <button className="btn btn-subtle btn-sm" onClick={() => openReject(row)}>
-          Reject
+        <button className="btn btn-danger btn-sm" onClick={() => openReject(row)}>
+          ✕ Reject
         </button>
       ),
     }] : []),
