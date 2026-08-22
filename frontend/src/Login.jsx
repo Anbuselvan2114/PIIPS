@@ -2,7 +2,11 @@ import { useState } from "react";
 import { login } from "./api";
 import { Logo, PasswordInput } from "./components";
 
-export default function Login({ onSuccess, onForgot }) {
+// `onDbError` (from App.jsx) is called when login fails with a 5xx - a real
+// database/server problem, not just a wrong password (401) - so the user
+// is bounced back to Database Configuration instead of being stuck staring
+// at a login form that can never succeed.
+export default function Login({ onSuccess, onForgot, onDbError }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState(null);
@@ -16,6 +20,10 @@ export default function Login({ onSuccess, onForgot }) {
     try {
       onSuccess(await login(username.trim(), password));
     } catch (err) {
+      if (onDbError && err.status >= 500) {
+        onDbError();
+        return;
+      }
       setError(err.message);
     } finally {
       setBusy(false);

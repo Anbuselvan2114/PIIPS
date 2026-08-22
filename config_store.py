@@ -152,10 +152,13 @@ def save_config(updates):
         if value is not None:
             config[key] = value
 
-    # Persist with the connection string encrypted at rest; keep the
-    # in-memory copy plaintext for the caller.
+    # Written as plain, human-readable text - DPAPI encryption ties the
+    # value to the exact machine it was saved on, which repeatedly broke
+    # moving/redeploying config.json between servers (a copy taken on one
+    # machine can't be decrypted on another - see secret_store.py). A
+    # config.json copied around, or edited by hand, must just work.
     on_disk = dict(config)
-    on_disk["db_connection"] = secret_store.protect(config.get("db_connection") or "")
+    on_disk["db_connection"] = config.get("db_connection") or ""
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as file:
         json.dump(on_disk, file, indent=4, ensure_ascii=False)
@@ -166,11 +169,17 @@ def save_config(updates):
     return config
 
 
-def ensure_secret_encrypted():
-    """One-time migration: if config.json holds a plaintext db_connection,
-    rewrite that single field encrypted (DPAPI). Idempotent — a value that is
-    already protected is left untouched. Only that field is rewritten so the
-    rest of the file is preserved verbatim."""
+def ensure_secret_plaintext():
+    """One-time migration (reversed from the old DPAPI-encrypting version):
+    if config.json holds a DPAPI-protected db_connection from before this
+    was switched to plain text, decrypt it back to plain text ON THIS SAME
+    MACHINE (the only place that ever could) and rewrite just that field -
+    the rest of the file is preserved verbatim. Idempotent - a value that's
+    already plain text is left untouched. Run this once more per machine
+    before removing DPAPI encryption entirely: a value that's still
+    protected AND can no longer be decrypted here (e.g. copied from another
+    machine - see secret_store.py) is left as-is rather than raising, since
+    Database Configuration can still overwrite it with a fresh plain value."""
     if not os.path.exists(CONFIG_FILE):
         return
     try:
@@ -180,8 +189,12 @@ def ensure_secret_encrypted():
         return
 
     dbc = raw.get("db_connection") or ""
-    if dbc and not secret_store.is_protected(dbc):
-        raw["db_connection"] = secret_store.protect(dbc)
+    if dbc and secret_store.is_protected(dbc):
+        try:
+            raw["db_connection"] = secret_store.unprotect(dbc)
+        except Exception:  # noqa: BLE001 - protected under a different machine's key
+            traceback.print_exc()
+            return
         with open(CONFIG_FILE, "w", encoding="utf-8") as file:
             json.dump(raw, file, indent=4, ensure_ascii=False)
 
