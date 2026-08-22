@@ -284,7 +284,13 @@ def _require_not_viewer(user_id):
 @app.get("/api/db-config")
 def get_db_config(user_id: Optional[int] = None):
     import database
-    _require_developer(user_id)
+    # Bootstrap exception: with nothing configured yet, there's no way to
+    # be logged in (auth itself needs a working DB), so the frontend's
+    # pre-login setup screen (see App.jsx) must be able to read/save this
+    # without a Super Admin session. Once a connection exists, every call
+    # goes back through the normal Super-Admin-only gate.
+    if (config_store.load_config().get("db_connection") or "").strip():
+        _require_developer(user_id)
     raw = config_store.load_config().get("db_connection") or ""
     p = database.parse_dotnet_connection(raw)
     return {
@@ -300,7 +306,12 @@ def get_db_config(user_id: Optional[int] = None):
 @app.post("/api/db-config")
 def save_db_config(payload: DbConfigModel):
     import database
-    _require_developer(payload.user_id)
+    # Same bootstrap exception as GET /api/db-config above - only skipped
+    # while nothing is configured yet. The moment a real connection exists
+    # (including the one this very call is about to save), changing it
+    # again requires an authenticated Super Admin.
+    if (config_store.load_config().get("db_connection") or "").strip():
+        _require_developer(payload.user_id)
 
     server = (payload.server or "").strip()
     db_name = (payload.database or "").strip()

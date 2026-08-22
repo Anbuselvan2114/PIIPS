@@ -19,6 +19,7 @@ import MailSettings from "./MailSettings";
 import Announcement from "./Announcement";
 import Manuals from "./Manuals";
 import Publish from "./Publish";
+import { getConfig } from "./api";
 
 // key, label, icon, nav group
 const MENU = [
@@ -93,6 +94,24 @@ export default function App() {
   const [page, setPage] = useState("dashboard");
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("piips_collapsed") === "1");
   const [theme, setTheme] = useState(() => localStorage.getItem("piips_theme") || "standard");
+  // null = still checking. Logging in needs a working DB, so a fresh
+  // deploy with an empty/missing config.json would otherwise strand
+  // everyone on a Login screen that can never succeed, with no way to
+  // reach Database Configuration (that page is normally only reachable
+  // AFTER logging in). Checked before rendering Login at all - see
+  // /api/config's public db_configured flag and /api/db-config's matching
+  // bootstrap exception (both skip the Super-Admin gate only while this
+  // is false).
+  const [dbConfigured, setDbConfigured] = useState(null);
+
+  useEffect(() => {
+    getConfig()
+      .then((c) => setDbConfigured(!!c.db_configured))
+      // If /api/config itself can't be reached, the backend is down for
+      // everyone regardless - fail open to the normal Login screen rather
+      // than get stuck showing nothing.
+      .catch(() => setDbConfigured(true));
+  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -123,6 +142,14 @@ export default function App() {
   const toggleCollapsed = () => {
     setCollapsed((c) => { localStorage.setItem("piips_collapsed", c ? "0" : "1"); return !c; });
   };
+
+  if (dbConfigured === null) {
+    return <div className="page"><div className="card">Loading…</div></div>;
+  }
+
+  if (!dbConfigured) {
+    return <DatabaseConfig onSaved={() => setDbConfigured(true)} />;
+  }
 
   if (!user) {
     return authView === "forgot"

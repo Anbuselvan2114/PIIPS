@@ -1498,13 +1498,17 @@ def _invoice_list(where_sql, params):
         gst = "h.[Vendor GST Reg. No.]" if _hdr_col(cur, "Vendor GST Reg. No.") else "CAST(NULL AS NVARCHAR(50))"
         ddate = "h.[Document Date]" if _hdr_col(cur, "Document Date") else "CAST(NULL AS NVARCHAR(50))"
         docno = "h.[No.]" if _hdr_col(cur, "No.") else "CAST(NULL AS NVARCHAR(50))"
+        # NOLOCK: pure display (Dashboard pop-ups, Lifecycle page listings) -
+        # never gates a write decision itself (advance_status/lifecycle_advance
+        # re-check fresh data at submit time), so a dirty/stale read here is
+        # harmless and keeps this off the numbering/status write path.
         sql = (
             "SELECT h.Id, h.InvoiceNo, pt.BatchName, pt.FileName, pt.TemplateFormat, "
             "s.StatusName, pt.IsActive, pt.IsSynced, ISNULL(pt.IsExcluded, 0), "
             f"{vendor}, {gst}, {ddate}, pt.Id, pt.SourceJson, {docno}, pt.RejectRemark "
-            "FROM dbo.tbl_Purchase_Tracker pt "
-            "JOIN dbo.tbl_Purchase_Header h ON h.Id = pt.Purchase_Header_ID "
-            "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+            "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
+            "JOIN dbo.tbl_Purchase_Header h WITH (NOLOCK) ON h.Id = pt.Purchase_Header_ID "
+            "LEFT JOIN dbo.tbl_status s WITH (NOLOCK) ON s.StatusId = pt.StatusID "
             f"WHERE {where_sql} ORDER BY h.Id"
         )
         cur.execute(sql, *params)
@@ -1637,7 +1641,7 @@ def get_invoice_field_check(header_id):
         if header_cols:
             cur.execute(
                 f"SELECT {', '.join(_q(c) for c in header_cols)} "
-                "FROM dbo.tbl_Purchase_Header WHERE Id = ?",
+                "FROM dbo.tbl_Purchase_Header WITH (NOLOCK) WHERE Id = ?",
                 header_id,
             )
             row = cur.fetchone()
@@ -1653,7 +1657,7 @@ def get_invoice_field_check(header_id):
         if line_cols:
             cur.execute(
                 f"SELECT {', '.join(_q(c) for c in line_cols)} "
-                "FROM dbo.tbl_Purchase_Line WHERE Purchase_Header_ID = ?",
+                "FROM dbo.tbl_Purchase_Line WITH (NOLOCK) WHERE Purchase_Header_ID = ?",
                 header_id,
             )
             line_rows = [dict(zip(line_cols, r)) for r in cur.fetchall()]
@@ -1663,7 +1667,7 @@ def get_invoice_field_check(header_id):
         if res_cols:
             cur.execute(
                 f"SELECT {', '.join(_q(c) for c in res_cols)} "
-                "FROM dbo.tbl_Reservation_Entry WHERE Purchase_Header_ID = ?",
+                "FROM dbo.tbl_Reservation_Entry WITH (NOLOCK) WHERE Purchase_Header_ID = ?",
                 header_id,
             )
             res_rows = [dict(zip(res_cols, r)) for r in cur.fetchall()]
@@ -2690,9 +2694,10 @@ _MENU_PROC_DDL = [
             RETURN;
         END
         -- Every status appears, even with a 0 count (for the bar chart).
+        -- NOLOCK: pure display (Dashboard tiles), never gates a write decision.
         SELECT s.StatusId, s.StatusName, COUNT(pt.Id) AS Cnt
-        FROM dbo.tbl_status s
-        LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.StatusID = s.StatusId
+        FROM dbo.tbl_status s WITH (NOLOCK)
+        LEFT JOIN dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) ON pt.StatusID = s.StatusId
         GROUP BY s.StatusId, s.StatusName
         ORDER BY s.StatusId;
     END
@@ -2940,7 +2945,7 @@ _MENU_PROC_DDL = [
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_GetSheetColumns
         SELECT SheetName, ColumnName
-        FROM dbo.tbl_SheetColumn
+        FROM dbo.tbl_SheetColumn WITH (NOLOCK)
         WHERE IsActive = 1
         ORDER BY SheetName, SortOrder, Id;
     END
@@ -2952,7 +2957,7 @@ _MENU_PROC_DDL = [
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_GetFieldMapping
         SELECT SheetName, ColumnName, JsonField
-        FROM dbo.tbl_FieldMapping
+        FROM dbo.tbl_FieldMapping WITH (NOLOCK)
         WHERE IsActive = 1 AND JsonField IS NOT NULL AND JsonField <> '';
     END
     """,
@@ -2963,12 +2968,12 @@ _MENU_PROC_DDL = [
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_GetTemplates
         SELECT Id, TemplateKey, PONumberFormat
-        FROM dbo.tbl_Template
+        FROM dbo.tbl_Template WITH (NOLOCK)
         WHERE IsActive = 1;
 
         SELECT sv.TemplateId, sv.SheetName, sv.ColumnName, sv.StaticValue
-        FROM dbo.tbl_TemplateStaticValue sv
-        JOIN dbo.tbl_Template t ON t.Id = sv.TemplateId AND t.IsActive = 1
+        FROM dbo.tbl_TemplateStaticValue sv WITH (NOLOCK)
+        JOIN dbo.tbl_Template t WITH (NOLOCK) ON t.Id = sv.TemplateId AND t.IsActive = 1
         WHERE sv.IsActive = 1;
     END
     """,
@@ -2985,7 +2990,7 @@ _MENU_PROC_DDL = [
                          CAST(NULL AS NVARCHAR(100)) AS UserTypeName;
             RETURN;
         END
-        SELECT UserTypeId, UserTypeName FROM dbo.tbl_UserType ORDER BY UserTypeId;
+        SELECT UserTypeId, UserTypeName FROM dbo.tbl_UserType WITH (NOLOCK) ORDER BY UserTypeId;
     END
     """,
     """
@@ -2998,8 +3003,8 @@ _MENU_PROC_DDL = [
                u.Email, u.MustChangePassword,
                u.CreatedById, u.CreatedDatetime,
                u.LastModifiedById, u.LastModifiedDatetime
-        FROM dbo.tbl_user u
-        LEFT JOIN dbo.tbl_UserType t ON u.UserTypeID = t.UserTypeId
+        FROM dbo.tbl_user u WITH (NOLOCK)
+        LEFT JOIN dbo.tbl_UserType t WITH (NOLOCK) ON u.UserTypeID = t.UserTypeId
         ORDER BY u.UserId;
     END
     """,
