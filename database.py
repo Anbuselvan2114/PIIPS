@@ -572,17 +572,18 @@ def reset_input_files(relpaths):
 def get_processed_invoices():
     """
     {(invoice_no, buyer_order_no_lower): {"batch": earliest_batch,
-        "header_id": int, "excluded": bool}}
+        "header_id": int, "reprocessable": bool}}
     for every invoice already saved in tbl_Purchase_Header (any batch) -
     keyed on the combination of Invoice No. and Buyer's Order No. together
     (not Invoice No. alone - different vendors, or the same vendor's
     invoices against different POs, can coincidentally reuse an invoice
     number). Used to skip re-processing an invoice that is already in the
-    database - unless its only existing record has been Excluded, in which
-    case the caller re-processes it into that same header instead of
-    flagging a duplicate (see processor.py and reprocess_excluded_header).
-    Backfills InvoiceNo from the mapped 'Vendor Invoice No.' column for rows
-    saved before InvoiceNo existed.
+    database - unless its only existing record is in one of
+    _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/New
+    Template), in which case the caller re-processes it into that same
+    header instead of flagging a duplicate (see processor.py and
+    reprocess_reworkable_header). Backfills InvoiceNo from the mapped
+    'Vendor Invoice No.' column for rows saved before InvoiceNo existed.
 
     Sample: get_processed_invoices()
     """
@@ -592,48 +593,71 @@ def get_processed_invoices():
         cur = conn.cursor()
         cur.execute("EXEC dbo.usp_GetProcessedInvoices")
         out = {}
-        for inv_no, batch, header_id, is_excluded, buyer_order_no in cur.fetchall():
+        for inv_no, batch, header_id, is_reprocessable, buyer_order_no in cur.fetchall():
             po = str(buyer_order_no or "").strip().lower()
             out[(inv_no, po)] = {
-                "batch": batch, "header_id": header_id, "excluded": bool(is_excluded),
+                "batch": batch, "header_id": header_id,
+                "reprocessable": bool(is_reprocessable),
             }
         return out
     finally:
         conn.close()
 
 
-def reprocess_excluded_header(existing_header_id, new_header_id):
+
+# Statuses an existing header may be re-processed FROM (in place, same
+# header/batch/No.) instead of the re-upload being parked as a DUPLICATE -
+# see reprocess_reworkable_header. All four represent an invoice that never
+# reached a real, final outcome the first time - Excluded is a deliberate
+# drop (a real re-inclusion - see _mark_batch_reincluded); Pending In SF
+# just means the part hadn't reached Service First yet; Data Mismatch and
+# New Template mean the data/format wasn't usable last time - in every
+# case, a fresh upload deserves a fresh look rather than being told it's a
+# duplicate of itself. This re-processing only ever happens when a USER
+# deliberately re-uploads that exact file and starts a run - nothing here
+# pulls a file back in on its own (see processor.py's main loop, which is
+# the only caller, driven by whatever the user just uploaded).
+# KEEP IN SYNC with usp_GetProcessedInvoices' own copy of this list.
+_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "DATA MISMATCH", "NEW TEMPLATE")
+
+
+def reprocess_reworkable_header(existing_header_id, new_header_id):
     """After a fresh save_grouped() insert created `new_header_id` for an
-    invoice whose only prior record (`existing_header_id`) was Excluded,
-    merge the newly-inserted row's data back onto the EXISTING Header and
-    Tracker rows in place (same Id - the invoice a user has been looking at
-    stays the same record, genuinely updated, not replaced by a new one),
-    replace its Line/Reservation children with the freshly-inserted ones
-    (re-parented onto the existing header - counts can legitimately differ
-    from before, so there's no stable old-row-to-new-row identity to update
-    against), then discard the now-empty temporary new_header_id shell.
-    Re-checks the existing tracker is actually Excluded itself (not just
-    trusting a caller's earlier read) so this can never silently overwrite
-    a live invoice under any other status. The existing header's BatchName
-    and [No.] are preserved as-is (not overwritten by the new insert's) -
-    re-processing re-includes the invoice into the batch it already
-    belonged to, with whatever Document No. it already had (even blank),
-    rather than moving it into a new batch or resetting its numbering.
-    Sample: reprocess_excluded_header(42, 57)"""
+    invoice whose only prior record (`existing_header_id`) is in one of
+    _REPROCESSABLE_STATUSES, merge the newly-inserted row's data back onto
+    the EXISTING Header and Tracker rows in place (same Id - the invoice a
+    user has been looking at stays the same record, genuinely updated, not
+    replaced by a new one), replace its Line/Reservation children with the
+    freshly-inserted ones (re-parented onto the existing header - counts
+    can legitimately differ from before, so there's no stable old-row-to-
+    new-row identity to update against), then discard the now-empty
+    temporary new_header_id shell. Re-checks the existing tracker's status
+    itself (not just trusting a caller's earlier read) so this can never
+    silently overwrite a live invoice under any other status. The existing
+    header's [No.] is preserved as-is (not overwritten by the new insert's
+    blank one) - re-processing brings in fresh extracted data, not a fresh
+    Document No.; whatever it already had (even blank) is left exactly as
+    it is, to be minted fresh at the next download of whichever batch it
+    ends up in regardless (see fetch_batch/_assign_document_numbers, which
+    always re-mints on every download). BatchName, however, IS overwritten
+    - a reprocessed invoice moves into the batch of the run that just
+    reprocessed it (e.g. re-uploaded and re-Started alongside genuinely new
+    files), not left behind in whatever batch it belonged to before.
+    Sample: reprocess_reworkable_header(42, 57)"""
     ensure_menu_schema()
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT s.StatusName, pt.BatchName FROM dbo.tbl_Purchase_Tracker pt "
+            "SELECT s.StatusName FROM dbo.tbl_Purchase_Tracker pt "
             "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
             "WHERE pt.Purchase_Header_ID = ?",
             existing_header_id,
         )
         row = cur.fetchone()
-        if not row or (row[0] or "").strip().upper() != "EXCLUDED":
+        existing_status = (row[0] or "").strip().upper() if row else ""
+        if not row or existing_status not in _REPROCESSABLE_STATUSES:
             return False
-        batch_name = row[1]
 
         # ---- Header: copy every real data column from new -> existing,
         # EXCEPT [No.] - re-processing brings in fresh extracted data, not
@@ -668,15 +692,14 @@ def reprocess_excluded_header(existing_header_id, new_header_id):
         # ---- Tracker: copy the new tracker's fields onto the EXISTING
         # tracker row in place (clears IsExcluded/PriorStatusID, adopts the
         # fresh verdict/status), then drop the temporary new tracker.
-        # BatchName is deliberately NOT overwritten - re-processing an
-        # excluded invoice re-includes it into the batch it already
-        # belonged to, not whatever batch this particular reprocessing run
-        # happened to be, so it downloads/numbers alongside its original
-        # batch instead of silently jumping to a new one ----
+        # BatchName IS included here (not excluded) - a reprocessed invoice
+        # moves into the batch of the run that just reprocessed it, same as
+        # any genuinely new file in that same run, rather than staying
+        # associated with whatever batch it belonged to before ----
         cur.execute(
             "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.tbl_Purchase_Tracker')")
         t_cols = [r[0] for r in cur.fetchall()
-                  if r[0] not in ("Id", "Purchase_Header_ID", "CreatedById", "CreatedDatetime", "BatchName")]
+                  if r[0] not in ("Id", "Purchase_Header_ID", "CreatedById", "CreatedDatetime")]
         if t_cols:
             cur.execute(
                 f"SELECT {', '.join(_q(c) for c in t_cols)} FROM dbo.tbl_Purchase_Tracker "
@@ -697,11 +720,12 @@ def reprocess_excluded_header(existing_header_id, new_header_id):
         )
         cur.execute("DELETE FROM dbo.tbl_Purchase_Tracker WHERE Purchase_Header_ID = ?", new_header_id)
         cur.execute("DELETE FROM dbo.tbl_Purchase_Header WHERE Id = ?", new_header_id)
-        # Reprocessing an Excluded invoice back to a real status (e.g. Ready
-        # To Load) is a re-inclusion just like the manual Include button -
-        # see _mark_batch_reincluded - so the batch is shown as at least
-        # Downloaded rather than quietly looking freshly Created again.
-        _mark_batch_reincluded(cur, batch_name)
+        # No _mark_batch_reincluded call here: since the invoice now moves
+        # into the NEW batch entirely (see the BatchName note above), its
+        # OLD batch no longer contains it at all - marking the old batch
+        # "reincluded" wouldn't reflect anything real about it anymore,
+        # and the new batch is freshly Created and already
+        # displays accurately as such.
         conn.commit()
         return True
     finally:
@@ -722,9 +746,12 @@ _BATCH_LOCK_STATUSES = ("LOADED", "POSTED", "COMPLETED", "REJECTED BY ACCOUNTS")
 # _batch_status_and_lock). Each is either inert (Excluded/Duplicate never
 # need further action - a duplicate is already handled under a different
 # header) or off on its own separate resolution path (New Template needs
-# retraining, Data Mismatch needs a data fix) that shouldn't hold up this
-# batch's own status label, or any batch behind it, indefinitely.
-_BATCH_IGNORED_STATUSES = ("EXCLUDED", "NEW TEMPLATE", "DUPLICATE", "DATA MISMATCH")
+# retraining, Data Mismatch needs a data fix, Pending In SF needs Service
+# First to catch up) that shouldn't hold up this batch's own status label,
+# or any batch behind it, indefinitely - e.g. 9 real invoices Loaded plus 1
+# still Pending In SF must show the batch as LOADED, not stuck looking
+# unresolved forever waiting on a part SF may take days to receive.
+_BATCH_IGNORED_STATUSES = ("EXCLUDED", "NEW TEMPLATE", "DUPLICATE", "DATA MISMATCH", "PENDING IN SF")
 
 
 def _batch_is_cleared(counts):
@@ -936,20 +963,32 @@ def list_statuses():
 _DOC_NO_SUFFIX_RE = re.compile(r"^(.*?)(\d+)$")
 
 
-def _next_doc_no_seq(cur, po_fmt):
+def _next_doc_no_seq(cur, po_fmt, exclude_header_ids=None):
     """Next sequence number for a PO_Number_Format prefix, continuing from
-    the highest number already used ANYWHERE in tbl_Purchase_Header.[No.]
-    under that exact prefix - never restarting at 1 for a fresh
-    batch/run - so two separate downloads that happen to share a prefix
-    can never mint the same Document No."""
+    the highest number already used in tbl_Purchase_Header.[No.] under that
+    exact prefix - never restarting at 1 for a fresh batch/run - so two
+    separate downloads that happen to share a prefix can never mint the
+    same Document No.
+
+    `exclude_header_ids` (the header(s) about to be re-minted in this very
+    call - see _assign_document_numbers, which re-mints every header in the
+    batch on every download, even ones that already have a number) are left
+    out of the "already used" scan. Without this, a batch's own current
+    numbers would always count against itself, so a re-download could never
+    reuse the range an Excluded sibling just freed (see set_excluded, which
+    clears an Excluded invoice's [No.] entirely) - the remaining included
+    invoices would just keep climbing to ever-higher numbers on every
+    re-download instead of closing the gap and staying in their original
+    order."""
     like_escaped = po_fmt.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    exclude_ids = {h for h in (exclude_header_ids or []) if h is not None}
     cur.execute(
-        "SELECT [No.] FROM dbo.tbl_Purchase_Header WHERE [No.] LIKE ? ESCAPE '\\'",
+        "SELECT Id, [No.] FROM dbo.tbl_Purchase_Header WHERE [No.] LIKE ? ESCAPE '\\'",
         like_escaped + "%",
     )
     best = 0
-    for (no,) in cur.fetchall():
-        if not no or not no.startswith(po_fmt):
+    for header_id, no in cur.fetchall():
+        if header_id in exclude_ids or not no or not no.startswith(po_fmt):
             continue
         suffix = no[len(po_fmt):]
         if suffix.isdigit():
@@ -1043,15 +1082,24 @@ def _po_number_formats_for_headers(cur, header_ids):
     return result
 
 
-def _find_no_collision(cur, id_to_no):
+def _find_no_collision(cur, id_to_no, batch_name=None):
     """Check a proposed {header_id: no} mapping against every header
     ALREADY in the table before it's written. Returns (no, other_batch)
-    for the first Document No. that's already in use by a DIFFERENT
-    header, or None if the whole mapping is safe to write. Used by both
-    the default per-download minting (_assign_document_numbers) and a
+    for the first Document No. that's already in use by a header in a
+    DIFFERENT batch, or None if the whole mapping is safe to write. Used by
+    both the default per-download minting (_assign_document_numbers) and a
     user's custom renumber (write_document_numbers) so a duplicate Document
     No. across two batches is refused outright rather than silently
-    written - see the callers for what happens on a collision."""
+    written - see the callers for what happens on a collision.
+
+    Pass `batch_name` (the batch the caller is writing) so a match that
+    belongs to that SAME batch is never treated as a collision. Without
+    this, re-downloading a batch that has an Excluded invoice (which
+    permanently keeps its own old Document No. - usp_FetchBatch's @idset
+    stops offering it for re-minting once Excluded) could see its own
+    sibling's frozen number and refuse the whole re-download, reporting
+    that batch as colliding "with another batch" that is, confusingly,
+    itself."""
     for header_id, no in id_to_no.items():
         if not no:
             continue
@@ -1061,7 +1109,7 @@ def _find_no_collision(cur, id_to_no):
             "WHERE h.[No.] = ? AND h.Id <> ?",
             no, header_id)
         row = cur.fetchone()
-        if row:
+        if row and (not batch_name or (row[0] or "") != batch_name):
             return no, row[0]
     return None
 
@@ -1074,23 +1122,34 @@ def _no_collision_error(no, other_batch):
     )
 
 
-def _assign_document_numbers(cur, header_rows):
+def _assign_document_numbers(cur, header_rows, batch_name=None):
     """Mint a FRESH, real, globally-unique Document No. for every header
     row passed in - every call re-mints, even a header that already has
     one (see fetch_batch, which skips calling this entirely once the batch
     is locked) - continuing each header's live template PO_Number_Format's
-    sequence from whatever's already used across the whole table, and
-    writes it directly to tbl_Purchase_Header.[No.] (propagated onto that
-    header's tbl_Purchase_Line.[Document No.] / tbl_Reservation_Entry.
+    sequence from whatever's already used OUTSIDE this same set of headers,
+    and writes it directly to tbl_Purchase_Header.[No.] (propagated onto
+    that header's tbl_Purchase_Line.[Document No.] / tbl_Reservation_Entry.
     [Source ID] rows). Mutates each row's "No."/"PO_Number_Format" in
     place; PO_Number_Format is resolved live here, never stored.
 
+    Headers are numbered in ascending Id (original creation) order - so
+    excluding one invoice and re-downloading closes the gap it leaves and
+    keeps the rest in their original relative order, rather than each
+    header just climbing to an ever-higher number on every re-download
+    (see _next_doc_no_seq, which excludes this same header set from its
+    own "already used" scan so a batch's own current numbers never block
+    reusing the range an Excluded sibling just freed - see set_excluded).
+
     Computes every header's new number FIRST and checks the whole set for
     a collision against another batch's already-persisted [No.] (see
-    _find_no_collision) before writing anything - raises ValueError and
-    writes nothing at all if one is found (a concurrent download's race,
-    or two headers whose no-template fallback happens to collide), rather
-    than silently letting two batches share a Document No."""
+    _find_no_collision, passed this same `batch_name` so a match that's
+    actually one of this batch's OWN other headers is never treated as a
+    collision) before writing anything - raises ValueError and writes
+    nothing at all if one is found (a concurrent download's race, or two
+    headers whose no-template fallback happens to collide), rather than
+    silently letting two batches share a Document No."""
+    header_rows = sorted(header_rows, key=lambda r: r.get("Id") or 0)
     header_ids = [row.get("Id") for row in header_rows]
     po_fmt_by_header = _po_number_formats_for_headers(cur, header_ids)
     seq_by_prefix = {}
@@ -1103,7 +1162,7 @@ def _assign_document_numbers(cur, header_rows):
         row["PO_Number_Format"] = po_fmt
         if po_fmt:
             if po_fmt not in seq_by_prefix:
-                seq_by_prefix[po_fmt] = _next_doc_no_seq(cur, po_fmt)
+                seq_by_prefix[po_fmt] = _next_doc_no_seq(cur, po_fmt, header_ids)
             new_no = f"{po_fmt}{seq_by_prefix[po_fmt]:06d}"
             seq_by_prefix[po_fmt] += 1
         else:
@@ -1112,7 +1171,7 @@ def _assign_document_numbers(cur, header_rows):
             new_no = (row.get("InvoiceNo") or f"DOC{header_id}").strip()
         proposed[header_id] = new_no
 
-    collision = _find_no_collision(cur, proposed)
+    collision = _find_no_collision(cur, proposed, batch_name)
     if collision:
         raise _no_collision_error(*collision)
 
@@ -1133,7 +1192,7 @@ def _assign_document_numbers(cur, header_rows):
                 new_no, header_id)
 
 
-def write_document_numbers(id_to_no):
+def write_document_numbers(id_to_no, batch_name=None):
     """Bulk-write an explicit {header_id: no} mapping straight to
     tbl_Purchase_Header.[No.] (used for a user-chosen custom renumber, see
     excel_export.renumber_batch), propagating each value onto that header's
@@ -1141,15 +1200,17 @@ def write_document_numbers(id_to_no):
     same way. Checks the whole mapping against every other header's
     already-persisted [No.] first (see _find_no_collision) and writes
     nothing at all - raising ValueError instead - if a custom-chosen number
-    collides with one another batch already has.
-    Sample: write_document_numbers({42: 'PO-2627-000010'})"""
+    collides with one another batch already has. Pass `batch_name` (the
+    batch being renumbered) so a match against one of its OWN other headers
+    is never treated as a collision.
+    Sample: write_document_numbers({42: 'PO-2627-000010'}, 'PIIPS_Batch_20260722_101500')"""
     pairs = [(int(i), n) for i, n in (id_to_no or {}).items() if i is not None and n]
     if not pairs:
         return
     conn = get_connection()
     try:
         cur = conn.cursor()
-        collision = _find_no_collision(cur, dict(pairs))
+        collision = _find_no_collision(cur, dict(pairs), batch_name)
         if collision:
             raise _no_collision_error(*collision)
         cur.executemany(
@@ -1167,12 +1228,15 @@ def write_document_numbers(id_to_no):
         conn.close()
 
 
-def _find_entry_no_collision(cur, id_to_entry_no):
+def _find_entry_no_collision(cur, id_to_entry_no, batch_name=None):
     """Reservation Entry counterpart to _find_no_collision: checks a
     proposed {reservation_row_id: entry_no} mapping against every
     reservation row ALREADY in the table. Returns (entry_no, other_batch)
-    for the first Entry No. already in use by a DIFFERENT row, or None if
-    the whole mapping is safe to write."""
+    for the first Entry No. already in use by a row in a DIFFERENT batch,
+    or None if the whole mapping is safe to write. Pass `batch_name` so a
+    match belonging to that SAME batch (e.g. an Excluded sibling's
+    permanently-frozen Entry No.) is never treated as a collision - see
+    _find_no_collision's docstring for why."""
     for row_id, entry_no in id_to_entry_no.items():
         if not entry_no:
             continue
@@ -1182,7 +1246,7 @@ def _find_entry_no_collision(cur, id_to_entry_no):
             "WHERE r.[Entry No.] = ? AND r.Id <> ?",
             str(entry_no), row_id)
         row = cur.fetchone()
-        if row:
+        if row and (not batch_name or (row[0] or "") != batch_name):
             return entry_no, row[0]
     return None
 
@@ -1195,17 +1259,26 @@ def _entry_no_collision_error(entry_no, other_batch):
     )
 
 
-def _next_entry_no_seq(cur):
+def _next_entry_no_seq(cur, exclude_row_ids=None):
     """Next sequential integer for Entry No., continuing from the highest
-    already used ANYWHERE in tbl_Reservation_Entry.[Entry No.] - never
-    restarting at 1 for a fresh batch/run, so two separate downloads can
-    never mint the same Entry No. Unlike Document No. this has no prefix,
-    just a plain running integer."""
+    already used in tbl_Reservation_Entry.[Entry No.] - never restarting at
+    1 for a fresh batch/run, so two separate downloads can never mint the
+    same Entry No. Unlike Document No. this has no prefix, just a plain
+    running integer.
+
+    `exclude_row_ids` (the reservation rows about to be re-minted in this
+    very call) are left out of the scan - see _next_doc_no_seq's own
+    docstring for why: without this, a batch's own current numbers would
+    always count against itself and could never reuse the range an
+    Excluded sibling's row just freed (see set_excluded)."""
+    exclude_ids = {r for r in (exclude_row_ids or []) if r is not None}
     cur.execute(
-        "SELECT [Entry No.] FROM dbo.tbl_Reservation_Entry "
+        "SELECT Id, [Entry No.] FROM dbo.tbl_Reservation_Entry "
         "WHERE [Entry No.] IS NOT NULL AND [Entry No.] <> ''")
     best = 0
-    for (v,) in cur.fetchall():
+    for row_id, v in cur.fetchall():
+        if row_id in exclude_ids:
+            continue
         try:
             best = max(best, int(str(v).strip()))
         except (TypeError, ValueError):
@@ -1213,18 +1286,25 @@ def _next_entry_no_seq(cur):
     return best + 1
 
 
-def _assign_entry_numbers(cur, res_rows):
+def _assign_entry_numbers(cur, res_rows, batch_name=None):
     """Mint a FRESH, real, globally-unique Entry No. for every reservation
     row passed in - every call re-mints, even a row that already has one
     (see fetch_batch, which skips calling this entirely once the batch is
     locked) - continuing the running sequence from whatever's already used
-    across the whole table, and writes it directly to
-    tbl_Reservation_Entry.[Entry No.]. Mutates each row's "Entry No." in
-    place. Computes every row's new number first and checks the whole set
-    for a collision against another batch's already-persisted Entry No.
-    (see _find_entry_no_collision) before writing anything - raises
-    ValueError and writes nothing at all if one is found, rather than
-    silently letting two batches share an Entry No."""
+    outside this same set of rows (see _next_entry_no_seq), and writes it
+    directly to tbl_Reservation_Entry.[Entry No.]. Rows are numbered in
+    ascending Id order, same reasoning as _assign_document_numbers: excluding
+    one invoice and re-downloading closes the gap it leaves instead of
+    every remaining row climbing to an ever-higher number each time.
+    Mutates each row's "Entry No." in place. Computes every row's new
+    number first and checks the whole set for a collision against another
+    batch's already-persisted Entry No. (see _find_entry_no_collision,
+    passed this same `batch_name` so a match that's one of this batch's OWN
+    other rows is never treated as a collision) before writing anything -
+    raises ValueError and writes nothing at all if one is found, rather
+    than silently letting two batches share an Entry No."""
+    res_rows = sorted(res_rows, key=lambda r: r.get("Id") or 0)
+    row_ids = [row.get("Id") for row in res_rows]
     seq = None
     proposed = {}
     for row in res_rows:
@@ -1232,11 +1312,11 @@ def _assign_entry_numbers(cur, res_rows):
         if row_id is None:
             continue
         if seq is None:
-            seq = _next_entry_no_seq(cur)
+            seq = _next_entry_no_seq(cur, row_ids)
         proposed[row_id] = str(seq)
         seq += 1
 
-    collision = _find_entry_no_collision(cur, proposed)
+    collision = _find_entry_no_collision(cur, proposed, batch_name)
     if collision:
         raise _entry_no_collision_error(*collision)
 
@@ -1248,22 +1328,24 @@ def _assign_entry_numbers(cur, res_rows):
             row["Entry No."] = proposed[row_id]
 
 
-def write_entry_numbers(id_to_entry_no):
+def write_entry_numbers(id_to_entry_no, batch_name=None):
     """Bulk-write an explicit {reservation_row_id: entry_no} mapping
     straight to tbl_Reservation_Entry.[Entry No.] (used for a user-chosen
     custom renumber, see excel_export.renumber_batch). Checks the whole
     mapping against every other row's already-persisted Entry No. first
     (see _find_entry_no_collision) and writes nothing at all - raising
     ValueError instead - if a custom-chosen number collides with one
-    another batch already has.
-    Sample: write_entry_numbers({7: '1001'})"""
+    another batch already has. Pass `batch_name` (the batch being
+    renumbered) so a match against one of its OWN other rows is never
+    treated as a collision.
+    Sample: write_entry_numbers({7: '1001'}, 'PIIPS_Batch_20260722_101500')"""
     pairs = [(int(i), str(n)) for i, n in (id_to_entry_no or {}).items() if i is not None and n]
     if not pairs:
         return
     conn = get_connection()
     try:
         cur = conn.cursor()
-        collision = _find_entry_no_collision(cur, dict(pairs))
+        collision = _find_entry_no_collision(cur, dict(pairs), batch_name)
         if collision:
             raise _entry_no_collision_error(*collision)
         cur.executemany(
@@ -1274,7 +1356,7 @@ def write_entry_numbers(id_to_entry_no):
         conn.close()
 
 
-def precheck_number_collisions(id_to_no, id_to_entry_no):
+def precheck_number_collisions(id_to_no, id_to_entry_no, batch_name=None):
     """Check a proposed Document No. mapping AND a proposed Entry No.
     mapping for collisions in one shared connection, before either
     write_document_numbers or write_entry_numbers runs. A custom renumber
@@ -1282,10 +1364,12 @@ def precheck_number_collisions(id_to_no, id_to_entry_no):
     independently - without this upfront check, a Document No. write could
     succeed and commit, only for the paired Entry No. write to then hit a
     collision and abort, leaving the Document No. change persisted despite
-    the overall request failing with "nothing was changed". Raises
-    ValueError on the first collision found (of either kind); returns None
-    if both mappings are safe to write.
-    Sample: precheck_number_collisions({42: 'PO-2627-000010'}, {7: '1001'})"""
+    the overall request failing with "nothing was changed". Pass
+    `batch_name` (the batch being renumbered) so a match against one of its
+    OWN other rows is never treated as a collision. Raises ValueError on
+    the first collision found (of either kind); returns None if both
+    mappings are safe to write.
+    Sample: precheck_number_collisions({42: 'PO-2627-000010'}, {7: '1001'}, 'PIIPS_Batch_20260722_101500')"""
     no_pairs = [(int(i), n) for i, n in (id_to_no or {}).items() if i is not None and n]
     entry_pairs = [(int(i), str(n)) for i, n in (id_to_entry_no or {}).items() if i is not None and n]
     if not no_pairs and not entry_pairs:
@@ -1294,11 +1378,11 @@ def precheck_number_collisions(id_to_no, id_to_entry_no):
     try:
         cur = conn.cursor()
         if no_pairs:
-            collision = _find_no_collision(cur, dict(no_pairs))
+            collision = _find_no_collision(cur, dict(no_pairs), batch_name)
             if collision:
                 raise _no_collision_error(*collision)
         if entry_pairs:
-            collision = _find_entry_no_collision(cur, dict(entry_pairs))
+            collision = _find_entry_no_collision(cur, dict(entry_pairs), batch_name)
             if collision:
                 raise _entry_no_collision_error(*collision)
     finally:
@@ -1383,8 +1467,8 @@ def fetch_batch(batch_name, sheet_cols):
         # from the database so the export reflects exactly what's now
         # persisted (rather than an in-memory guess).
         if not batch_is_locked(cur, batch_name):
-            _assign_document_numbers(cur, ph_r)
-            _assign_entry_numbers(cur, re_r)
+            _assign_document_numbers(cur, ph_r, batch_name)
+            _assign_entry_numbers(cur, re_r, batch_name)
             conn.commit()
 
             cur.execute(
@@ -1572,6 +1656,82 @@ def invoices_by_statuses(status_names, active_only=False):
     return _invoice_list(where, names)
 
 
+def buyer_order_nos_for_status(status_name):
+    """Distinct, non-blank Buyer's Order Nos for invoices currently at
+    `status_name` - feeds the Service First GetPurchaseLineSpecification-
+    MismatchRecord lookup for the Part Description Update menu.
+    Sample: buyer_order_nos_for_status('DATA MISMATCH')"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT pt.BuyerOrderNo "
+            "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
+            "JOIN dbo.tbl_Status s WITH (NOLOCK) ON s.StatusId = pt.StatusID "
+            "WHERE s.StatusName = ? AND ISNULL(pt.IsExcluded, 0) = 0 "
+            "AND pt.BuyerOrderNo IS NOT NULL AND pt.BuyerOrderNo <> ''",
+            status_name,
+        )
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def invoice_details_by_buyer_order(order_nos, status_name=None):
+    """{BuyerOrderNo: {"descriptions": [...], "invoices": [{"InvoiceNo",
+    "FileName"}, ...]}} for the given POs - PIIPS's own invoice(s) for each
+    PO (Purchase Details column) and their Purchase Line Description text
+    (Part Description Update screen's autocomplete), matching a Service
+    First row's PurchaseOrderNo against what's actually in PIIPS for that
+    same PO. "descriptions" excludes "Charge (Item)" lines (Freight
+    Outward/Courier) - those aren't real parts, so they're never valid
+    matches for a Service First part row and shouldn't be offered as a
+    selectable description.
+    A PO can carry multiple tracker rows across earlier re-uploads/re-runs
+    (superseded ones parked DUPLICATE) - pass `status_name` (the same status
+    the caller scoped `order_nos` to) to only surface the invoice(s) that
+    are still actually at that status, instead of every stale sibling ever
+    filed under this PO.
+    Sample: invoice_details_by_buyer_order(['SPRPUR/2026/04/27-83650'], 'DATA MISMATCH')"""
+    order_nos = [str(n).strip() for n in (order_nos or []) if n and str(n).strip()]
+    if not order_nos:
+        return {}
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        placeholders = ", ".join("?" for _ in order_nos)
+        where = f"pt.BuyerOrderNo IN ({placeholders})"
+        params = list(order_nos)
+        if status_name:
+            where += " AND s.StatusName = ?"
+            params.append(status_name)
+        cur.execute(
+            "SELECT DISTINCT pt.BuyerOrderNo, h.InvoiceNo, pt.FileName, "
+            "  pl.[Description], pl.[Type] "
+            "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
+            "JOIN dbo.tbl_Purchase_Header h WITH (NOLOCK) ON h.Id = pt.Purchase_Header_ID "
+            "JOIN dbo.tbl_Status s WITH (NOLOCK) ON s.StatusId = pt.StatusID "
+            "LEFT JOIN dbo.tbl_Purchase_Line pl WITH (NOLOCK) "
+            "  ON pl.Purchase_Header_ID = pt.Purchase_Header_ID "
+            f"WHERE {where}",
+            params,
+        )
+        by_po = {}
+        for po, invoice_no, file_name, desc, line_type in cur.fetchall():
+            entry = by_po.setdefault(po, {"descriptions": [], "invoices": []})
+            if desc and (line_type or "").strip() != "Charge (Item)":
+                if desc not in entry["descriptions"]:
+                    entry["descriptions"].append(desc)
+            pair = {"InvoiceNo": invoice_no or "", "FileName": file_name or ""}
+            if pair not in entry["invoices"]:
+                entry["invoices"].append(pair)
+        return by_po
+    finally:
+        conn.close()
+
+
 def _existing_cols(cur, table, wanted):
     """Subset of `wanted` that actually exist as columns on `table` (case-
     insensitive), preserving `wanted`'s order."""
@@ -1617,8 +1777,16 @@ def get_invoice_field_check(header_id):
                 if source == "None":
                     continue
                 missing = not v.strip()
+                # Purchase Line's own "Description" column is the invoice's
+                # (PDF's) item description - displayed as "Invoice Part
+                # Description" in the Fields popup to sit clearly alongside
+                # "SF Part Description" (Service First's own item-master
+                # description for the same line, see with_nav_part_description
+                # below). Internal lookups below still key off the real
+                # "Description" column name (`n`), only the popup label changes.
+                display_field = "Invoice Part Description" if (sheet == "Purchase Line" and n == "Description") else n
                 row_out = {
-                    "field": n, "value": v, "missing": missing,
+                    "field": display_field, "value": v, "missing": missing,
                     "source": source,
                 }
                 # Purchase Line "No." (Nav Item No.) only ever comes from
@@ -1629,7 +1797,7 @@ def get_invoice_field_check(header_id):
                 # data problem. Surfacing the reason directly saves a trip
                 # into the API logs to find out why.
                 if sheet == "Purchase Line" and n == "No." and missing and source == "Service First":
-                    row_out["reason"] = "missing- item description in PDF and SF are different"
+                    row_out["reason"] = "Invoice Part Description and SF Part Description are different"
                 rows.append(row_out)
             return rows
 
@@ -1662,6 +1830,90 @@ def get_invoice_field_check(header_id):
             )
             line_rows = [dict(zip(line_cols, r)) for r in cur.fetchall()]
 
+        # Nav_Part_Description (Service First's GetHSNDetails item-master
+        # description) isn't a saved tbl_Purchase_Line column - it only ever
+        # lived in the extracted JSON at process time (see
+        # service_api._apply_hsn_map / _description_mismatch, the actual
+        # DATA MISMATCH check for this). Reload it from the tracker's
+        # SourceJson (same lookup as apply_manual_buyer_order) and key it by
+        # cleaned Description so it can be shown alongside the PDF's own
+        # Description for comparison - not a mandatory field, just extra
+        # context for why SF's description didn't match.
+        nav_part_desc_by_desc = {}
+        cur.execute(
+            "SELECT SourceJson FROM dbo.tbl_Purchase_Tracker WITH (NOLOCK) "
+            "WHERE Purchase_Header_ID = ?", header_id,
+        )
+        json_row = cur.fetchone()
+        json_path = json_row[0] if json_row else None
+        if json_path and os.path.isfile(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as fp:
+                    source_data = json.load(fp)
+                for item in source_data.get("items", []) or []:
+                    key = str(item.get("Description") or "").strip().lower()
+                    if key:
+                        nav_part_desc_by_desc[key] = str(item.get("Nav_Part_Description") or "")
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        def with_nav_part_description(ln, rows):
+            # Freight Outward / Courier lines are "Charge (Item)" rows, not
+            # "Item" - they're never looked up in GetHSNDetails at all (see
+            # service_api._hsn_lookup_items/_apply_hsn_map skipping "_charge"
+            # items), so Nav_Part_Description has no meaning for them.
+            if ln.get("Type") != "Item":
+                return rows
+            desc_key = str(ln.get("Description") or "").strip().lower()
+            if desc_key not in nav_part_desc_by_desc:
+                return rows
+            v = nav_part_desc_by_desc[desc_key]
+            new_field = {
+                "field": "SF Part Description", "value": v, "missing": not v.strip(),
+                "source": "Service First",
+            }
+            idx = next((i for i, f in enumerate(rows) if f["field"] == "Invoice Part Description"), None)
+            if idx is None:
+                return rows + [new_field]
+            result = rows[:idx + 1] + [new_field] + rows[idx + 1:]
+            # "No." otherwise lands at the very end (required_fields_for_line_type
+            # appends it last) - move it to sit right after SF Part
+            # Description instead, so the two SF-sourced item-match fields
+            # are shown together.
+            no_idx = next((i for i, f in enumerate(result) if f["field"] == "No."), None)
+            if no_idx is not None:
+                no_field = result.pop(no_idx)
+                result.insert(idx + 2, no_field)
+            return result
+
+        def with_hsn_fields(ln, rows):
+            # ProductNo (the item's HSN Number, not a Navision item no. -
+            # despite the name) and HSN_Type are already saved on the line
+            # as "HSN/SAC Code" / "GST Group Type" (see the field mapping:
+            # HSN/SAC Code <- ProductNo, GST Group Type <- HSN_Type). For an
+            # "Item" line that value came from Service First's GetHSNDetails
+            # match; for a "Charge (Item)" (Freight Outward/Courier) line SF
+            # is never queried at all (see service_api._hsn_lookup_items
+            # skipping "_charge" items), so whatever's stored there is the
+            # PDF's own extracted value instead - shown here under the SF
+            # field names either way so both line types can be compared
+            # against what Service First actually calls them.
+            source = "Service First" if ln.get("Type") == "Item" else "PDF"
+            product_no = str(ln.get("HSN/SAC Code") or "")
+            hsn_type = str(ln.get("GST Group Type") or "")
+            extra = [
+                {"field": "ProductNo", "value": product_no,
+                 "missing": not product_no.strip(), "source": source},
+                {"field": "HSN_Type", "value": hsn_type,
+                 "missing": not hsn_type.strip(), "source": source},
+            ]
+            idx = next((i for i, f in enumerate(rows) if f["field"] == "No."), None)
+            if idx is None:
+                idx = next((i for i, f in enumerate(rows)
+                            if f["field"] in ("SF Part Description", "Invoice Part Description")),
+                           len(rows) - 1)
+            return rows[:idx + 1] + extra + rows[idx + 1:]
+
         res_cols = _existing_cols(cur, "tbl_Reservation_Entry", excel_export.REQUIRED_RESERVATION_FIELDS)
         res_rows = []
         if res_cols:
@@ -1681,9 +1933,9 @@ def get_invoice_field_check(header_id):
             "header": field_rows("Purchase Header", header_wanted, header_values),
             "lines": [
                 {"label": ln.get("Description", "") or f"Line {i + 1}",
-                 "fields": field_rows(
+                 "fields": with_hsn_fields(ln, with_nav_part_description(ln, field_rows(
                      "Purchase Line",
-                     excel_export.required_fields_for_line_type(ln.get("Type")), ln)}
+                     excel_export.required_fields_for_line_type(ln.get("Type")), ln)))}
                 for i, ln in enumerate(line_rows)
             ],
             "reservations": [
@@ -1883,42 +2135,25 @@ def invoices_by_header_ids(header_ids):
     return _invoice_list(f"h.Id IN ({ph})", ids)
 
 
-def _later_batch_not_created(cur, batch_name):
-    """First batch (by creation order) AFTER `batch_name` whose status
-    isn't CREATED - i.e. it's already been downloaded or has real progress
-    (see _batch_status_and_lock). Used to block re-including an excluded
-    invoice back into an EARLIER batch once a LATER batch has already
-    relied on this one being cleared (see _batch_is_cleared) and moved
-    forward - re-including it here would retroactively reopen a batch a
-    later one's Document No. sequence already assumed was final.
-    Returns (later_batch_name, its_status), or None if every later batch
-    is still untouched."""
+def _current_batch_status(cur, batch_name):
+    """This ONE batch's status label ('CREATED'/'DOWNLOADED'/'IN PROGRESS'/
+    'LOADED'/'POSTED'/'COMPLETED'/'EXCLUDED'), same derivation
+    list_batches/the Dashboard uses (see _batch_status_and_lock) - used to
+    gate Include/Exclude purely on the invoice's OWN batch, never any
+    other batch's."""
     cur.execute(
-        "SELECT pt.BatchName, s.StatusName, COUNT(*) "
-        "FROM dbo.tbl_Purchase_Tracker pt "
+        "SELECT s.StatusName, COUNT(*) FROM dbo.tbl_Purchase_Tracker pt "
         "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
-        "WHERE pt.BatchName IS NOT NULL AND pt.BatchName > ? "
-        "GROUP BY pt.BatchName, s.StatusName",
+        "WHERE pt.BatchName = ? GROUP BY s.StatusName",
         batch_name)
-    counts_by_batch = {}
-    for bname, sname, cnt in cur.fetchall():
-        counts_by_batch.setdefault(bname, {})[sname] = cnt
-    if not counts_by_batch:
-        return None
-
-    downloaded = set()
+    counts = {sname: cnt for sname, cnt in cur.fetchall()}
+    downloaded = False
     if _table_exists(cur, "tbl_BatchDownload"):
-        placeholders = ", ".join("?" for _ in counts_by_batch)
-        cur.execute(
-            f"SELECT BatchName FROM dbo.tbl_BatchDownload WHERE BatchName IN ({placeholders})",
-            *counts_by_batch)
-        downloaded = {r[0] for r in cur.fetchall()}
-
-    for bname in sorted(counts_by_batch):  # earliest of the later batches first
-        status, _locked = _batch_status_and_lock(counts_by_batch[bname], bname in downloaded)
-        if status != "CREATED":
-            return bname, status
-    return None
+        cur.execute("SELECT 1 FROM dbo.tbl_BatchDownload WHERE BatchName = ?", batch_name)
+        downloaded = cur.fetchone() is not None
+    ever_reincluded = _batch_ever_reincluded(cur, batch_name)
+    status, _locked = _batch_status_and_lock(counts, downloaded, ever_reincluded)
+    return status
 
 
 def set_excluded(header_id, exclude, user_id=None):
@@ -1926,9 +2161,13 @@ def set_excluded(header_id, exclude, user_id=None):
     'Excluded' (remembering the prior status), flags IsExcluded and stamps
     ExcludedByID / ExcludedDatetime; including restores the prior status.
     Returns {file_name, new_status} so the caller can relocate the PDF.
-    Re-including (exclude=False) is refused with a ValueError if a LATER
-    batch has already progressed past CREATED - see
-    _later_batch_not_created.
+    Both directions are gated purely on this invoice's OWN batch's current
+    status (see _current_batch_status) - allowed while it's CREATED or
+    DOWNLOADED, refused with a ValueError otherwise (IN PROGRESS/LOADED/
+    POSTED/COMPLETED/EXCLUDED). No OTHER batch's status is ever considered.
+    Once a batch has real progress, its Document Nos./Reservation data may
+    already be committed downstream (Navision), so pulling an invoice out
+    of or back into it at that point could change the batch after the fact.
     Sample: set_excluded(42, True, 7)"""
     ensure_menu_schema()
     conn = get_connection()
@@ -1943,16 +2182,14 @@ def set_excluded(header_id, exclude, user_id=None):
         file_name = row[2]
         batch_name = row[3]
 
-        if not exclude and batch_name:
-            blocker = _later_batch_not_created(cur, batch_name)
-            if blocker:
-                later_batch, later_status = blocker
+        if batch_name:
+            status = _current_batch_status(cur, batch_name)
+            if status not in ("CREATED", "DOWNLOADED"):
+                action = "re-include" if not exclude else "exclude"
                 raise ValueError(
-                    f"Can't re-include this invoice — the later batch "
-                    f"'{later_batch}' has already moved on (status: "
-                    f"{later_status}). Get it to LOADED/POSTED/COMPLETED "
-                    "(or otherwise resolve it) before including this "
-                    "invoice back into an earlier batch."
+                    f"Can't {action} this invoice — its batch '{batch_name}' "
+                    f"is already {status}. This is only allowed while a "
+                    "batch is still Created or Downloaded."
                 )
 
         if exclude:
@@ -1963,6 +2200,29 @@ def set_excluded(header_id, exclude, user_id=None):
                 "    IsExcluded = 1, ExcludedByID = ?, ExcludedDatetime = GETDATE(), "
                 "    LastModifiedById = ?, LastModifiedDatetime = GETDATE() "
                 "WHERE Purchase_Header_ID = ?", user_id, user_id, header_id)
+            # Release this invoice's minted Document No./Entry No. entirely
+            # rather than letting it hold them forever - usp_FetchBatch's
+            # @idset stops offering an Excluded header for re-minting, so a
+            # frozen [No.] left in place would sit there indefinitely and
+            # (before _find_no_collision became batch-aware) could even
+            # make a later re-download of this SAME batch look like it
+            # collided with "another batch" that was, confusingly, itself.
+            # Clearing it also means a future re-Include (see the `else`
+            # branch below/reprocess_reworkable_header) gets a genuinely
+            # fresh number next download, same as any other blank-No. invoice.
+            cur.execute("UPDATE dbo.tbl_Purchase_Header SET [No.] = NULL WHERE Id = ?", header_id)
+            if _existing_cols(cur, "tbl_Purchase_Line", ["Document No."]):
+                cur.execute(
+                    "UPDATE dbo.tbl_Purchase_Line SET [Document No.] = NULL "
+                    "WHERE Purchase_Header_ID = ?", header_id)
+            if _table_exists(cur, "tbl_Reservation_Entry"):
+                res_cols = [c for c in ("Source ID", "Entry No.")
+                            if _existing_cols(cur, "tbl_Reservation_Entry", [c])]
+                if res_cols:
+                    set_clause = ", ".join(f"{_q(c)} = NULL" for c in res_cols)
+                    cur.execute(
+                        f"UPDATE dbo.tbl_Reservation_Entry SET {set_clause} "
+                        "WHERE Purchase_Header_ID = ?", header_id)
             new_status = "EXCLUDED"
         else:
             cur.execute(
@@ -2899,25 +3159,29 @@ _MENU_PROC_DDL = [
         ;WITH wanted AS (SELECT value AS RelPath FROM OPENJSON(@Paths)),
         ranked AS (
             SELECT l.RelPath, l.FileName, l.InitiatedByID, l.InitiatedDatetime, l.StatusID,
-                   pt.IsExcluded,
+                   s.StatusName,
                    ROW_NUMBER() OVER (PARTITION BY l.RelPath
                                       ORDER BY l.InitiatedDatetime DESC, l.Id DESC) AS rn
             FROM dbo.tbl_InputFile_Log l
             JOIN wanted w ON w.RelPath = l.RelPath
             LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID
+            LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID
         )
         -- StatusID = 0 means the file was reset (moved to New_Format) and may
         -- be uploaded again by anyone, so it is NOT treated as a duplicate.
-        -- Same for a file whose linked invoice record has since been
-        -- Excluded on the Dashboard - re-uploading it is a deliberate
-        -- correction (see processor.py's Excluded re-process path), not a
-        -- duplicate, so it must reach processing rather than being silently
-        -- skipped here before it ever gets that far.
+        -- Same for a file whose linked invoice is currently in any of
+        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/New
+        -- Template) - KEEP THIS LIST IN SYNC with database._REPROCESSABLE_
+        -- STATUSES. Re-uploading one of these is a deliberate correction
+        -- (see processor.py/reprocess_reworkable_header), not a duplicate,
+        -- so it must reach processing rather than being silently skipped
+        -- here before it ever gets that far.
         SELECT r.RelPath, r.FileName, r.InitiatedByID, u.UserName AS InitiatedByName,
                r.InitiatedDatetime
         FROM ranked r
         LEFT JOIN dbo.tbl_user u ON u.UserId = r.InitiatedByID
-        WHERE r.rn = 1 AND ISNULL(r.StatusID, -1) <> 0 AND ISNULL(r.IsExcluded, 0) = 0;
+        WHERE r.rn = 1 AND ISNULL(r.StatusID, -1) <> 0
+          AND ISNULL(r.StatusName, '') NOT IN ('EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE');
     END
     """,
     # ---- Reset input-file log entries (moved to New_Format) --------------
@@ -3077,8 +3341,8 @@ _MENU_PROC_DDL = [
         -- 1) Per-batch summary. `exportable` = invoices that would appear in
         -- the Excel (active AND not excluded); the UI hides Download when 0.
         -- Ordered by BatchName itself (newest first), not MIN(h.CreatedAt) -
-        -- a header re-processed into an existing Excluded record (see
-        -- database.reprocess_excluded_header) deliberately keeps its
+        -- a header re-processed into an existing record (see
+        -- database.reprocess_reworkable_header) deliberately keeps its
         -- original CreatedAt, so that column no longer reflects when the
         -- batch containing it was actually run. BatchName is always
         -- "PIIPS_Batch_YYYYMMDD_HHMMSS" (job.batch_name in processor.py),
@@ -3123,9 +3387,12 @@ _MENU_PROC_DDL = [
             EXEC('UPDATE dbo.tbl_Purchase_Header SET InvoiceNo = [Vendor Invoice No.] '
                + 'WHERE InvoiceNo IS NULL AND [Vendor Invoice No.] IS NOT NULL');
         -- BatchName now lives on the tracker (informational for dedup).
-        -- HeaderId/IsExcluded let the caller re-process an invoice whose
-        -- only existing record was excluded, instead of flagging it as a
-        -- duplicate (see database.get_processed_invoices) - picks one
+        -- HeaderId/IsReprocessable let the caller re-process an invoice
+        -- whose only existing record is in one of database.
+        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/
+        -- New Template), instead of flagging it as a duplicate (see
+        -- database.get_processed_invoices/reprocess_reworkable_header) -
+        -- KEEP THIS LIST IN SYNC with _REPROCESSABLE_STATUSES. Picks one
         -- representative header per invoice no. (MIN Id) since an invoice
         -- no. is expected to map to a single real header in practice.
         -- BuyerOrderNo comes from the tracker (a fixed schema column,
@@ -3134,10 +3401,13 @@ _MENU_PROC_DDL = [
         -- field mapping) - part of the (InvoiceNo, vendor, PO) match key.
         SELECT h.InvoiceNo, MIN(pt.BatchName) AS BatchName,
                MIN(h.Id) AS HeaderId,
-               MAX(CASE WHEN ISNULL(pt.IsExcluded, 0) = 1 THEN 1 ELSE 0 END) AS IsExcluded,
+               MAX(CASE WHEN s.StatusName IN (
+                       'EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE'
+                   ) THEN 1 ELSE 0 END) AS IsReprocessable,
                MIN(pt.BuyerOrderNo) AS BuyerOrderNo
         FROM dbo.tbl_Purchase_Header h
         LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = h.Id
+        LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID
         WHERE h.InvoiceNo IS NOT NULL AND h.InvoiceNo <> ''
         GROUP BY h.InvoiceNo;
     END

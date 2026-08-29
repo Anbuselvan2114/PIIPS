@@ -2063,6 +2063,12 @@ class OCREngine:
 
             "bank details",
 
+            # Some layouts label this section just "Bank:" rather than
+            # "Bank Details" (e.g. "Bank: Kotak Mahindra Bank" as its own
+            # row) - without this, "bank details" never matches and the
+            # whole Bank/IFSC/A/C block gets scanned as more item rows.
+            "bank:",
+
             "terms",
 
             "e.& o.e",
@@ -2364,20 +2370,28 @@ class OCREngine:
 
         def row_has_values(vwords):
             """True if the row (minus its serial token) carries item data —
-            an HSN code or a number under the Quantity/Rate/Amount column.
-            A row with only descriptive text is a wrapped-description
-            continuation, not a new item."""
+            an HSN code under the HSN column, or a number under the
+            Quantity/Rate/Amount column. A row with only descriptive text is
+            a wrapped-description continuation, not a new item.
+            The HSN check is column-gated (not "any 4-10 digit token
+            anywhere in the row") because a wrapped description can itself
+            contain a bare number that happens to be HSN-shaped - e.g. a
+            part number OCR split across two lines as "1000" + "Base-T"
+            (from "1000Base-T...") lands the "1000" fragment under the
+            Description column, not HSN; without this gate it would be
+            mistaken for a real HSN code and the continuation row wrongly
+            treated as a new item."""
             for w in vwords:
                 t = w["text"].strip()
-                if is_hsn(t.replace(",", "")):
-                    return True
                 if value_cols:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
+                    if col == "HSN" and is_hsn(t.replace(",", "")):
+                        return True
                     if col in ("Quantity", "Rate", "Amount") and (
                         is_number(t) or number_with_unit(t) is not None
                     ):
                         return True
-                elif is_number(t):
+                elif is_hsn(t.replace(",", "")) or is_number(t):
                     return True
             return False
 
@@ -2535,13 +2549,25 @@ class OCREngine:
             # has real (non-unit) label text and a genuine Amount, so it
             # would otherwise pass every check above and get misfiled as a
             # purchased item worth a few paise/rupees - exclude it by name.
+            # The HSN check is column-gated (not "any 4-10 digit token
+            # anywhere in the row") for the same reason as row_has_values
+            # below: a wrapped description can itself contain a bare number
+            # that happens to be HSN-shaped - e.g. a part number OCR split
+            # across two lines as "1000" + "Base-T..." (from
+            # "1000Base-T...") lands the "1000" fragment under the
+            # Description column, not HSN, and would otherwise start a
+            # phantom new item out of a genuine continuation row.
             if (
                 serial is None
                 and value_cols
                 and not any(k in lower for k in CHARGE_KW)
                 and not re.search(r"round(?:ed)?[\s-]*off", lower)
                 and (
-                    any(is_hsn(t.replace(",", "")) for t in texts)
+                    any(
+                        is_hsn(t.replace(",", ""))
+                        and min(value_cols, key=lambda c: abs(w["x"] - value_cols[c])) == "HSN"
+                        for w, t in zip(words, texts)
+                    )
                     or row_has_amount(words)
                 )
                 and any(
@@ -2795,11 +2821,29 @@ class OCREngine:
                     or any(_SIZE_SPEC_RE.match(w["text"].strip()) for w in words)
                 )
 
+                # "continued"/"contd" is a multi-page invoice's own page-
+                # footer marker ("continued ...", printed below the table on
+                # every page but the last), and "this is a computer
+                # generated invoice" is the standalone footer line every
+                # page of this layout prints at the very bottom - both have
+                # no leading serial and real letters, so without excluding
+                # them here they silently glue onto whichever item happened
+                # to be last on that page's table (e.g. "Hinges ... Part No
+                # : 5H50S29037 continued" / "... This is a Computer
+                # Generated Invoice").
+                # "Rounded Off" (past tense) is the actual wording several
+                # vendors print ("Dell Mouse MS116 Rounded Off", "...Less :
+                # Rounded Off (-)0.40") - "round off"/"round-off"/"roundoff"
+                # above don't substring-match it (the "ed" breaks it), so it
+                # slipped through and glued onto the previous item exactly
+                # like "continued" did.
                 EXCLUDE_KW = ("output", "igst", "cgst", "sgst", "tax amount",
                               "total", "round off", "round-off", "roundoff",
+                              "rounded off",
                               "rupees", "inr ", "grand total", "tax rate",
                               "taxable", "amount chargeable", "in words",
-                              "declaration")
+                              "declaration", "continued", "contd",
+                              "computer generated invoice")
 
                 is_charge = (has_text
                              and any(k in lower for k in CHARGE_KW)

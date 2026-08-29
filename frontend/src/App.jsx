@@ -11,6 +11,7 @@ import Mapping from "./Mapping";
 import Template from "./Template";
 import UserManagement from "./UserManagement";
 import BuyerOrderEntry from "./BuyerOrderEntry";
+import PartDescriptionUpdate from "./PartDescriptionUpdate";
 import Lifecycle from "./Lifecycle";
 import Login from "./Login";
 import ForgotPassword from "./ForgotPassword";
@@ -27,6 +28,7 @@ const MENU = [
   ["input", "File Explorer", "🗂", "Main"],
   ["manual", "Manual", "📖", "Main"],
   ["buyerorder", "Buyer Order Entry", "✎", "Review"],
+  ["partdescupdate", "Part Description Mapping", "📝", "Review"],
   ["load", "Load", "📥", "Accounts"],
   ["post", "Post", "📮", "Accounts"],
   ["complete", "Complete", "✅", "Accounts"],
@@ -49,7 +51,7 @@ const ROLE_MENUS = {
   admin: ["dashboard", "input", "manual", "buyerorder", "load", "post", "complete",
           "configuration", "apiconfig", "template", "createfield", "users"],
   // Users process invoices, fix Buyer Order Nos, and Load them.
-  user: ["dashboard", "input", "manual", "buyerorder", "load"],
+  user: ["dashboard", "input", "manual", "buyerorder", "partdescupdate", "load"],
   // Accounts run the downstream Post / Complete steps.
   accounts: ["dashboard", "input", "manual", "post", "complete"],
   // Viewer sees every page (read-only) - every mutating action is blocked
@@ -68,6 +70,7 @@ const PAGES = {
   training: Training, createfield: CreateField, mapping: Mapping,
   template: Template, users: UserManagement, dbconfig: DatabaseConfig,
   apiconfig: ApiConfiguration, buyerorder: BuyerOrderEntry,
+  partdescupdate: PartDescriptionUpdate,
   load: Load, post: Post, complete: Complete, manual: Manuals,
   publish: Publish, mailsettings: MailSettings, announcement: Announcement,
 };

@@ -122,9 +122,8 @@
         Write-Host "IIS Domain       : https://piips.precisionit.co.in:8010"
                 
 
-#run without nssm
-cd E:\Source\piips; E:\Source\piips\venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
-
+#run without nssm  
+    PS C:\Windows\system32> cd E:\Source\piips; & "E:\Source\piips\venv\Scripts\python.exe" -m uvicorn main:app --host 127.0.0.1 --port 8000
 #when sit crash 
 # 1. Stop PIIPS Backend
 Stop-Service PIIPS_Backend

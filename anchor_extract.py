@@ -255,9 +255,127 @@ def _value_right_or_below(rows, ri, anchor_word, matched_phrase):
     return ""
 
 
+# A single-word label that continues onto the NEXT physical row, e.g. a
+# narrow "Invoice Details" column that wraps "Invoice No. :" as "Invoice" /
+# "No. :" on two separate lines. Every RIGHT_FIELDS phrase for these fields
+# needs both halves on ONE line to ever match (see _merge_wrapped_labels);
+# without merging them, the row-by-row scan below never sees "invoice no"
+# as a substring and the field is silently left empty.
+_WRAPPED_LABEL_CONTINUATIONS = {
+    "invoice": ("no", "number", "#"),
+    "purchase": ("order",),
+    "reference": ("no", "number"),
+}
+
+
+def _merge_wrapped_labels(rows):
+    """Splice a row that is JUST one of _WRAPPED_LABEL_CONTINUATIONS's keys
+    with the next row, when that next row starts with the expected
+    continuation word - into one virtual row (word spans combined) so the
+    normal phrase-matching loop in extract() sees them as a single line,
+    the same as an unwrapped layout would. Deliberately narrow (whole-row
+    text must be EXACTLY the bare label word, not just contain it) so an
+    unrelated two-line sequence is never merged and its values
+    misattributed."""
+    merged = []
+    skip = False
+    for i, row in enumerate(rows):
+        if skip:
+            skip = False
+            continue
+        text = _row_text(row).strip().lower().rstrip(":.")
+        continuations = _WRAPPED_LABEL_CONTINUATIONS.get(text)
+        if continuations and i + 1 < len(rows):
+            next_text = _row_text(rows[i + 1]).strip().lower()
+            if any(next_text.startswith(c) for c in continuations):
+                merged.append(row + rows[i + 1])
+                skip = True
+                continue
+        merged.append(row)
+    return merged
+
+
+def _split_three_column_header(rows):
+    """Detect a layout where Bill To / Ship To / Invoice Details print as
+    separate columns SIDE BY SIDE on one row - e.g. "Bill to: Ship to:
+    Invoice Details:" - rather than the more common Tally layout where
+    "Buyer (Bill To)"/"Consignee (Ship To)" are separate STACKED section
+    markers within one left column, or a plain 2-column (party block /
+    invoice metadata) split.
+
+    Row-grouping bands text by Y-position across the WHOLE page width, so
+    with 3 unequal-height columns side by side, a row typically ends up
+    containing fragments of BOTH the Bill To and Ship To (and Invoice
+    Details) columns interleaved together, and a narrow label that wraps
+    onto 2 lines in one column (e.g. "Invoice" / "No. :") lands on
+    different rows than its own value. Without isolating each column, the
+    normal party-block scan sees "bill to" and "ship to" together on the
+    same row and applies whichever section it checks first to everything
+    (silently discarding the other party's block), and the wrapped
+    "Invoice"/"No. :" label never matches as one phrase.
+
+    Returns (marker_ri, bill_rows, ship_rows, detail_rows, bill_x, ship_x) -
+    each *_rows a list of per-row word-lists narrowed to just that column,
+    in original vertical order - or None if this row shape isn't present.
+    """
+    for ri, row in enumerate(rows):
+        text, spans = _row_text_with_spans(row)
+        low = text.lower()
+        bill_idx = low.find("bill to")
+        ship_idx = low.find("ship to")
+        if bill_idx == -1 or ship_idx == -1:
+            continue
+
+        def _x_at(char_idx):
+            return next((w["x"] for start, end, w in spans if start <= char_idx < end), None)
+
+        bill_x = _x_at(bill_idx)
+        ship_x = _x_at(ship_idx)
+        if bill_x is None or ship_x is None or ship_x <= bill_x:
+            continue
+        details_idx = next(
+            (low.find(p) for p in ("invoice details", "invoice detail", "details")
+             if low.find(p) != -1),
+            -1,
+        )
+        details_x = _x_at(details_idx) if details_idx != -1 else None
+        mid = (bill_x + ship_x) / 2
+        ship_hi = ((ship_x + details_x) / 2) if (details_x and details_x > ship_x) else float("inf")
+
+        bill_rows, ship_rows, detail_rows = [], [], []
+        for later in rows[ri + 1:]:
+            bw = [w for w in later if bill_x - 1 <= w["x"] < mid]
+            sw = [w for w in later if mid <= w["x"] < ship_hi]
+            dw = [w for w in later if w["x"] >= ship_hi] if ship_hi != float("inf") else []
+            if bw:
+                bill_rows.append(bw)
+            if sw:
+                ship_rows.append(sw)
+            if dw:
+                detail_rows.append(dw)
+
+        return ri, bill_rows, ship_rows, detail_rows, bill_x, ship_x
+    return None
+
+
+def _marker_row(label, x, sample_row):
+    y = sample_row[0].get("y", 0) if sample_row else 0
+    return [{"text": label, "x": x, "y": y}]
+
+
 def extract(header_rows, footer_rows, page_width):
     fields = {}
-    rows = header_rows
+    three_col = _split_three_column_header(header_rows)
+    if three_col is not None:
+        marker_ri, bill_rows, ship_rows, detail_rows, bill_x, ship_x = three_col
+        # Invoice Details' own words, isolated from Bill To/Ship To, feed
+        # the ordinary right-field anchor scan below exactly like a normal
+        # single-column layout would - including _merge_wrapped_labels
+        # picking up an "Invoice"/"No. :" 2-line wrap that's now a clean,
+        # uninterleaved sequence.
+        rows = _merge_wrapped_labels(header_rows[:marker_ri] + detail_rows)
+    else:
+        rows = _merge_wrapped_labels(header_rows)
     divider = page_width * 0.42
     # Rows whose LEFT-hand text (the half the party-block pass reads) was
     # already consumed by a labeled anchor there — e.g. "Customer Name: Acme
@@ -321,6 +439,24 @@ def extract(header_rows, footer_rows, page_width):
                             meta_row = ri
                     break
 
+    # Invoice No. fallback for the isolated Invoice Details column (3-column
+    # header - see _split_three_column_header): OCR's row-banding can pair
+    # "Invoice"'s value on the SAME row as "Invoice" itself, while "No. :"
+    # (the rest of the wrapped label) lands on the NEXT row entirely (e.g.
+    # "Invoice RSI/26-27/1399" / "No. :") - "invoice no" then never appears
+    # as one phrase anywhere, so the anchor loop above finds nothing. Only
+    # tried within the isolated detail column (never the whole page) and
+    # only accepts a non-date value, so it can't collide with an "Invoice"
+    # + bare-date row (that's Invoice DATE, not Invoice No.) or misfire on
+    # an ordinary "Tax Invoice" title elsewhere on the page.
+    if "Invoice No." not in fields and three_col is not None:
+        for row in detail_rows:
+            text = _row_text(row)
+            m = re.match(r"^invoice\s+(\S.*)$", text, re.IGNORECASE)
+            if m and not DATE_RE.fullmatch(m.group(1).strip()):
+                fields["Invoice No."] = _clean_value(m.group(1))
+                break
+
     # Dated fallback: some layouts print the document date right next to
     # the Invoice No. value with no "Date"/"Dated" label of its own (e.g.
     # "Inv No.PW/GST/26-27-041   04/08/2026") - the label-anchored pass
@@ -358,14 +494,18 @@ def extract(header_rows, footer_rows, page_width):
     # ------------------------------------------------------------------
     # Party blocks: Seller (top), then Buyer / Consignee by marker.
     # ------------------------------------------------------------------
-    def _party_pass(forced_switch_row=None):
+    def _party_pass(forced_switch_row=None, rows_override=None):
         """One left-column scan, classifying each line as Seller/Buyer/
         Consignee content. Returns (fields, any_marker_switch). Seeded
         fresh from the outer `fields` each call so a retry (see below)
         starts clean rather than compounding a failed first attempt.
         `forced_switch_row` is only used on that retry, to force the
         Seller->Buyer switch at the invoice-metadata row when the
-        document has no textual section marker at all."""
+        document has no textual section marker at all. `rows_override`
+        (see _side_by_side_party_rows) replaces the normal row scan and
+        divider cut entirely - its indices don't correspond to the real
+        page, so claimed_rows (a same-row-title-banner edge case that
+        cannot occur in a synthesized column split) is not applied there."""
         out = dict(fields)
         section = "Seller"
         # A party's Name may already be set by the anchored-field pass
@@ -375,8 +515,9 @@ def extract(header_rows, footer_rows, page_width):
         named = {p: bool(out.get(f"{p} Name")) for p in ("Seller", "Buyer", "Consignee")}
         any_switch = False
 
-        for ri, row in enumerate(rows):
-                if ri in claimed_rows:
+        scan_rows = rows_override if rows_override is not None else rows
+        for ri, row in enumerate(scan_rows):
+                if rows_override is None and ri in claimed_rows:
                     continue
 
                 # A page-wide document-title row (e.g. "Invoice Cum Delivery
@@ -398,7 +539,14 @@ def extract(header_rows, footer_rows, page_width):
                     if whole and _is_label(whole):
                         continue
 
-                left = sorted([w for w in row if w["x"] < divider], key=lambda w: w["x"])
+                # A rows_override row is already narrowed to one column's
+                # words (or is a single synthetic marker word) - use it as
+                # given rather than re-slicing it by the page-wide divider,
+                # which has no meaning for a synthesized column split.
+                left = (
+                    sorted(row, key=lambda w: w["x"]) if rows_override is not None
+                    else sorted([w for w in row if w["x"] < divider], key=lambda w: w["x"])
+                )
                 if not left:
                     continue
                 text = " ".join(w["text"].strip() for w in left).strip()
@@ -434,7 +582,7 @@ def extract(header_rows, footer_rows, page_width):
                 # duplicates this row's left-side text — a shape no genuine
                 # Seller-block metadata row has (those pair a left LABEL
                 # with a right VALUE, never identical text on both sides).
-                if section == "Seller" and named["Seller"]:
+                if rows_override is None and section == "Seller" and named["Seller"]:
                     right = sorted([w for w in row if w["x"] >= divider], key=lambda w: w["x"])
                     right_text = " ".join(w["text"].strip() for w in right).strip()
                     if right_text and re.sub(r"\s+", "", low) == re.sub(r"\s+", "", right_text.lower()):
@@ -542,7 +690,16 @@ def extract(header_rows, footer_rows, page_width):
 
         return out, any_switch
 
-    party_fields, any_switch = _party_pass()
+    if three_col is not None:
+        marker_row_src = header_rows[marker_ri]
+        side_by_side_rows = (
+            header_rows[:marker_ri]
+            + [_marker_row("Bill to", bill_x, marker_row_src)] + bill_rows
+            + [_marker_row("Ship to", ship_x, marker_row_src)] + ship_rows
+        )
+        party_fields, any_switch = _party_pass(rows_override=side_by_side_rows)
+    else:
+        party_fields, any_switch = _party_pass()
     if not any_switch and not party_fields.get("Buyer Name") and meta_row is not None:
         # No textual or structural section marker fired anywhere in this
         # document - retry once, using the invoice-metadata row as the
@@ -559,9 +716,24 @@ def extract(header_rows, footer_rows, page_width):
     for row in footer_rows:
         text = _row_text(row)
         low = text.lower()
-        if low.startswith(("rupees", "inr", "indian rupees")) and "only" in low:
+        if "only" not in low:
+            continue
+        if low.startswith(("rupees", "inr", "indian rupees")):
             fields.setdefault("Amount Chargeable (in words)", text)
             break
+        # Some layouts label this "In Words:" rather than starting the line
+        # with the currency name outright, and may glue the next summary
+        # field onto the SAME row (e.g. "In Words: ... Rupees Only Total:
+        # 15,340.00") - cut at "only" so that trailing fragment is dropped.
+        idx = low.find("in words")
+        if idx != -1:
+            only_end = low.find("only", idx) + len("only")
+            value = re.sub(
+                r"^in\s*words\s*:?\s*", "", text[idx:only_end], flags=re.IGNORECASE
+            ).strip()
+            if value:
+                fields.setdefault("Amount Chargeable (in words)", value)
+                break
 
     # "Place of Supply" implies the buyer's state when not stated separately.
     if not fields.get("Buyer State Name") and fields.get("Place of Supply"):
