@@ -6,9 +6,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime
+from urllib.parse import quote
 
 import config_store
 from processor import job_manager
@@ -609,23 +611,35 @@ def invoice_field_check(header_id: int):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+def _inline_content_disposition(filename):
+    """Build a Content-Disposition header carrying BOTH a plain ASCII
+    `filename=` and an RFC 5987 `filename*=` for the same name. Starlette's
+    own FileResponse(filename=...) emits ONLY filename*= (percent-encoded)
+    whenever quote() changes the name at all - which a bare space already
+    triggers, so any invoice file name with a space (the common case here,
+    e.g. "Armtech - 1748.pdf") loses the plain fallback entirely. Most
+    browsers handle filename*= fine, but anything that only understands the
+    plain form then falls back to a name derived from the URL instead of the
+    real file name - so both forms are always sent together here."""
+    ascii_fallback = re.sub(r'[^\x20-\x7E]', "_", filename).replace('"', "'")
+    return f"inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
 @app.get("/api/invoices/pdf")
 def invoice_pdf(file: str):
     """Serve an invoice's PDF/image inline (clicking an invoice no./file
     name anywhere in the app opens it in the shared PdfModal viewer, which
     all route through this one endpoint). Located by file name across the
-    Folder Path. `filename=` is passed explicitly so the real file name is
-    always what gets used if the user downloads/saves it from the viewer -
-    without it, FileResponse omits the filename from Content-Disposition
-    entirely, and a save falls back to something derived from the URL
-    itself (e.g. "pdf") instead of the actual invoice file name."""
+    Folder Path. The real file name is always what gets used if the user
+    downloads/saves it from the viewer - see _inline_content_disposition."""
     path = config_store.find_pdf(file)
     if not path or not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="File not found")
     media = _VIEW_MEDIA.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+    name = os.path.basename(path)
     return FileResponse(
-        path, media_type=media, content_disposition_type="inline",
-        filename=os.path.basename(path),
+        path, media_type=media,
+        headers={"content-disposition": _inline_content_disposition(name)},
     )
 
 

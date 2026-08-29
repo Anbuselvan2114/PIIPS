@@ -126,7 +126,7 @@ export default function PartDescriptionUpdate() {
   const columns = [
     { key: "purchaseDetails", label: "Purchase Details", sortable: false,
       render: (row) => (
-        <div style={{ lineHeight: 1.6, whiteSpace: "nowrap" }}>
+        <div style={{ lineHeight: 1.6, whiteSpace: "normal", overflowWrap: "break-word", maxWidth: 220 }}>
           <div><b>PO:</b> {row.PurchaseOrderNo || "—"}</div>
           {(row.PdfInvoices && row.PdfInvoices.length ? row.PdfInvoices : [{}]).map((inv, i) => (
             <div key={i}>
@@ -136,7 +136,8 @@ export default function PartDescriptionUpdate() {
                 {inv.FileName ? (
                   <button className="btn-link" onClick={() => setPdfFile(inv.FileName)}
                           style={{ background: "none", border: "none", padding: 0, color: "var(--primary)",
-                                   cursor: "pointer", textDecoration: "underline", font: "inherit" }}>
+                                   cursor: "pointer", textDecoration: "underline", font: "inherit",
+                                   whiteSpace: "normal", overflowWrap: "break-word", textAlign: "left" }}>
                     {inv.FileName}
                   </button>
                 ) : "—"}
@@ -147,14 +148,14 @@ export default function PartDescriptionUpdate() {
       ) },
     { key: "partDetails", label: "Part Details", sortable: false,
       render: (row) => (
-        <div style={{ lineHeight: 1.6, whiteSpace: "nowrap" }}>
+        <div style={{ lineHeight: 1.6, whiteSpace: "normal", overflowWrap: "break-word", maxWidth: 220 }}>
           <div><b>Part No:</b> {row.PartNo || "—"}</div>
-          <div><b>Specification:</b> {row.PartSpecification || "—"}</div>
           <div><b>Quantity:</b> {row.Quantity ?? "—"}</div>
           <div><b>Unit Price:</b> {row.UnitPrice ?? "—"}</div>
+          <div><b>SF Part Specification:</b> {row.PartSpecification || "—"}</div>
         </div>
       ) },
-    { key: "Nav_Part_Description", label: "Invoice Part Description", sortable: false,
+    { key: "Nav_Part_Description", label: "Invoice Part Description (IN SF)", sortable: false,
       render: (row) => {
         // Plain <input list=...> (native datalist) truncates the shown text
         // to the box's width and doesn't support a textarea at all - a

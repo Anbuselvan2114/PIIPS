@@ -20,6 +20,7 @@ RIGHT_FIELDS = {
     "Invoice No.": [
         "invoice no", "invoice number", "invoice #", "inv no", "bill no",
         "invioce no",  # genuine vendor-template typo seen on a real invoice, not an OCR artifact
+        "invoice :",  # some vendors label it bare "Invoice :" with no "No."/"No" at all
     ],
     "Dated": ["dated", "invoice date", "date"],
     "Buyer's Order No.": [
@@ -95,8 +96,19 @@ DATE_RE = re.compile(r"\d{1,2}[-/][A-Za-z0-9]{2,}[-/]\d{2,4}")
 def _gstin_from_text(text):
     """Return a GSTIN found in `text`, reconstructing the common OCR split
     where the 2-digit state code is separated from the 13-char core
-    (e.g. 'GSTIN/UIN  AABCP8005C2ZZ 33'). Returns '' if none found."""
-    g = GSTIN_RE.search(text.replace(" ", ""))
+    (e.g. 'GSTIN/UIN  AABCP8005C2ZZ 33'). Returns '' if none found.
+
+    Tries the ORIGINAL text first (spaces intact) before the space-stripped
+    version: GSTIN_RE's trailing \\b needs a word/non-word transition right
+    after the 15th character, and blindly stripping every space can glue a
+    real GSTIN straight onto the next word with no separator left at all
+    (e.g. "...9257H2ZC INVOICE :..." -> "...9257H2ZCINVOICE:..." - now "C"
+    is followed by "I", both word characters, so \\b never matches even
+    though the source text plainly had a GSTIN there). Stripped-text search
+    stays as the fallback for the OCR-garbled case this was written for
+    (the state code split off with its OWN stray space, e.g.
+    "GSTIN/UIN  AABCP8005C2ZZ 33")."""
+    g = GSTIN_RE.search(text) or GSTIN_RE.search(text.replace(" ", ""))
     if g:
         return g.group(1)
     alnum = re.sub(r"[^A-Z0-9]", "", text.upper()).replace("GSTIN", "").replace("UIN", "")
@@ -190,23 +202,30 @@ def _clean_value(text):
     return text.strip().lstrip(":").strip(" :-.–")
 
 
-def _anchor_glued_value(anchor_word, matched_phrase):
+def _anchor_glued_value(anchor_word, offset):
     """
     Some PDFs render a label and its value as ONE OCR token with no space
-    (e.g. "Invoice No.D/2026-27/341" or "Date:15-07-2026"). In that case the
-    anchor word IS the only token — there's nothing separate to its right —
-    so return whatever follows the matched phrase inside that same token.
-    Returns "" if the phrase isn't actually found inside the token's text
-    (e.g. the anchor was chosen via the fallback `srow[0]`).
+    (e.g. "Invoice No.D/2026-27/341" or "Date:15-07-2026"), or split the
+    matched phrase itself across two adjacent tokens with the tail landing
+    glued to the value (e.g. label token "INVOICE" ends the phrase "invoice
+    :", and the very next token is ": ACSPLTN2627/1748" — the anchor, since
+    the phrase's END falls inside IT). Either way `offset` is where the
+    matched phrase's end falls inside anchor_word's own text (computed by
+    the caller from the row-wide match position vs. this token's own span
+    start) — whatever follows at that offset is the value. Returns "" when
+    that leaves nothing usable (offset at/past the token's own end — the
+    phrase's end wasn't actually inside this token, e.g. the fallback
+    `srow[0]` anchor, which the caller signals with offset=None).
     """
-    text = anchor_word["text"]
-    idx = text.lower().find(matched_phrase)
-    if idx == -1:
+    if offset is None:
         return ""
-    return _clean_value(text[idx + len(matched_phrase):])
+    text = anchor_word["text"]
+    if offset <= 0 or offset >= len(text):
+        return ""
+    return _clean_value(text[offset:])
 
 
-def _value_right_or_below(rows, ri, anchor_word, matched_phrase):
+def _value_right_or_below(rows, ri, anchor_word, offset):
     """
     Given the row index and the anchor word that matched, return the value:
     tokens to the right on the same row (minus another label), else tokens in
@@ -217,7 +236,7 @@ def _value_right_or_below(rows, ri, anchor_word, matched_phrase):
     ax = anchor_word["x"]
 
     # --- label and value OCR-glued into the anchor's own token, no space ---
-    glued = _anchor_glued_value(anchor_word, matched_phrase)
+    glued = _anchor_glued_value(anchor_word, offset)
     if glued:
         return glued
 
@@ -295,6 +314,46 @@ def _merge_wrapped_labels(rows):
     return merged
 
 
+def _merge_wrapped_values(rows):
+    """Splice a bare value-continuation fragment - e.g. "UG392" wrapping the
+    tail of "Inv No. :ZCPLM2627A-" printed on the row above, in a narrow
+    Invoice-Details column - back onto the specific word it wraps, so the
+    normal right-of-anchor value scan in extract() sees the whole value as
+    one token instead of just its first half.
+
+    A fragment row's own x position (not the previous row's LAST word) picks
+    the merge target: two unrelated fields (e.g. "Inv No. :X- Date :Y") can
+    share one row, so blindly extending the last word would staple a wrap
+    onto the wrong value. The target is whichever word's cell the fragment
+    visually falls under - the closest word starting AT OR BEFORE the
+    fragment's x (a label+value glued into one token, as in "Order No.
+    :SPRPUR/2026", can start well to the left of where its value visually
+    ends, so a plain nearest-by-distance match would miss it entirely).
+    Deliberately narrow - the fragment must be a single word with no ':' of
+    its own (so it can never be a fresh field's row) and not a recognized
+    label - so an unrelated one-word row is never misattributed."""
+    merged = []
+    for row in rows:
+        srow = sorted(row, key=lambda w: w["x"])
+        text = " ".join(w["text"].strip() for w in srow).strip()
+        words = text.split()
+        if merged and len(words) == 1 and ":" not in text and not _is_label(text):
+            prev_row = merged[-1]
+            frag_x = srow[0]["x"]
+            before = [w for w in prev_row if w["x"] <= frag_x]
+            target = (
+                max(before, key=lambda w: w["x"]) if before
+                else min(prev_row, key=lambda w: abs(w["x"] - frag_x)) if prev_row
+                else None
+            )
+            if target is not None and abs(target["x"] - frag_x) <= 300:
+                new_target = dict(target, text=target["text"].rstrip("-") + text)
+                merged[-1] = [w for w in prev_row if w is not target] + [new_target]
+                continue
+        merged.append(row)
+    return merged
+
+
 def _split_three_column_header(rows):
     """Detect a layout where Bill To / Ship To / Invoice Details print as
     separate columns SIDE BY SIDE on one row - e.g. "Bill to: Ship to:
@@ -339,10 +398,32 @@ def _split_three_column_header(rows):
             -1,
         )
         details_x = _x_at(details_idx) if details_idx != -1 else None
+        if details_x is None:
+            # No explicit "Invoice Details"/"Details" caption on the marker
+            # row - some layouts start the third column directly with its
+            # first real sub-label instead (e.g. "Bill To, Ship To Inv No.
+            # :... Date :..."). Fall back to the first word on this row that
+            # starts strictly after the "Ship To" phrase ends - the true
+            # start of column 3 either way, captioned or not.
+            ship_end = ship_idx + len("ship to")
+            details_x = next(
+                (w["x"] for start, end, w in spans if start >= ship_end and w["x"] > ship_x),
+                None,
+            )
         mid = (bill_x + ship_x) / 2
         ship_hi = ((ship_x + details_x) / 2) if (details_x and details_x > ship_x) else float("inf")
 
         bill_rows, ship_rows, detail_rows = [], [], []
+        # The marker row itself often already carries the first Invoice
+        # Details value alongside "Bill To"/"Ship To" (e.g. "Inv No.
+        # :ZCPLM2627A-" on the very same line) - without capturing its own
+        # column-3 words here too, that value is silently lost entirely
+        # (this row is otherwise skipped: `header_rows[:marker_ri]` stops
+        # BEFORE it, and the scan below only covers rows AFTER it).
+        if ship_hi != float("inf"):
+            marker_dw = [w for w in row if w["x"] >= ship_hi]
+            if marker_dw:
+                detail_rows.append(marker_dw)
         for later in rows[ri + 1:]:
             bw = [w for w in later if bill_x - 1 <= w["x"] < mid]
             sw = [w for w in later if mid <= w["x"] < ship_hi]
@@ -373,7 +454,7 @@ def extract(header_rows, footer_rows, page_width):
         # single-column layout would - including _merge_wrapped_labels
         # picking up an "Invoice"/"No. :" 2-line wrap that's now a clean,
         # uninterleaved sequence.
-        rows = _merge_wrapped_labels(header_rows[:marker_ri] + detail_rows)
+        rows = _merge_wrapped_labels(header_rows[:marker_ri] + _merge_wrapped_values(detail_rows))
     else:
         rows = _merge_wrapped_labels(header_rows)
     divider = page_width * 0.42
@@ -424,13 +505,17 @@ def extract(header_rows, footer_rows, page_width):
                     # suffix on the same row (e.g. "Invoice No." vs.
                     # "e-Way Bill No." both contain "no").
                     match_end = idx + len(ph)
-                    anchor = next(
-                        (w for start, end, w in spans if start < match_end <= end),
+                    anchor_span = next(
+                        ((start, w) for start, end, w in spans if start < match_end <= end),
                         None,
                     )
-                    if anchor is None:
+                    if anchor_span is not None:
+                        anchor_start, anchor = anchor_span
+                        offset = match_end - anchor_start
+                    else:
                         anchor = srow[0]
-                    val = _value_right_or_below(rows, ri, anchor, ph)
+                        offset = None
+                    val = _value_right_or_below(rows, ri, anchor, offset)
                     if val:
                         fields[field] = val
                         if anchor["x"] < divider:
@@ -598,22 +683,10 @@ def extract(header_rows, footer_rows, page_width):
                         # seller's own letterhead.
                         section = "Buyer"
 
-                # GSTIN on this line -> party gstin
-                g = GSTIN_RE.search(text.replace(" ", ""))
-                if "gstin" in low or "uin" in low or g:
-                    val = ""
-                    if g:
-                        val = g.group(1)
-                    else:
-                        # OCR sometimes splits the GSTIN (state code separated from
-                        # the 13-char core). Reconstruct: <state code> + <core>.
-                        alnum = re.sub(r"[^A-Z0-9]", "", text.upper())
-                        alnum = alnum.replace("GSTIN", "").replace("UIN", "")
-                        core = re.search(r"[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]", alnum)
-                        if core:
-                            rest = alnum.replace(core.group(0), "")
-                            st = re.search(r"\d{2}", rest)
-                            val = (st.group(0) if st else "") + core.group(0)
+                # GSTIN on this line -> party gstin (see _gstin_from_text
+                # for why the original, un-stripped text is tried first)
+                val = _gstin_from_text(text)
+                if "gstin" in low or "uin" in low or val:
                     if val:
                         out.setdefault(f"{section} GSTIN/UIN", val)
                     continue

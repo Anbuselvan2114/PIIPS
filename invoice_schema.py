@@ -106,6 +106,21 @@ def _normalize_date(value):
             year = "20" + year
         return f"{int(day):02d}-{int(mon):02d}-{year}"
 
+    # yyyy-mm-dd / yyyy/mm/dd (ISO-style, common on computer-generated GST
+    # e-invoices, e.g. "2026-08-22") - a 4-digit year FIRST, so it must be
+    # checked separately: it never matches the dd-mm-yyyy pattern above
+    # (that one's leading \d{1,2} group can only ever consume 2 of the 4
+    # digits, leaving no separator where it expects one, so it correctly
+    # never misfires on this format either way).
+    match = re.match(
+        r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b",
+        value
+    )
+
+    if match:
+        year, mon, day = match.groups()
+        return f"{int(day):02d}-{int(mon):02d}-{year}"
+
     # Doesn't match either recognized date shape — likely OCR noise from a
     # garbled scan (e.g. "03.0.7") rather than a genuine date in some other
     # format. Passing that through as if it were a real date is worse than

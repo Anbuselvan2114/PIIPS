@@ -2310,7 +2310,16 @@ class OCREngine:
                 "qty",
                 "nos",
                 "each",
-                "ea"
+                "ea",
+                # A bare "days" (the other half of a Warranty column's "90
+                # days" split from its own number by OCR) with no number
+                # attached is warranty-period noise, not description text -
+                # a genuine product description never uses the bare word on
+                # its own. The number itself ("90") is already dropped
+                # elsewhere as a stray non-column figure; only the leftover
+                # word needs excluding here.
+                "day",
+                "days",
             ]
 
         def descriptive_text(wds):
@@ -2331,8 +2340,23 @@ class OCREngine:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
                     if col in ("Quantity", "Rate", "Amount"):
                         continue
-                out.append(t)
-            return " ".join(out).strip()
+                out.append((w, t))
+            if not out:
+                return ""
+            # A number glued straight onto the next word with no space
+            # (e.g. "1000Base-T") can land as two overlapping/touching OCR
+            # boxes rather than one - joining every kept word with a plain
+            # space would then insert a space that was never actually
+            # there. Only omit it when the boxes actually touch or overlap
+            # (gap <= 2); two genuinely separate words always have a real
+            # gap between their boxes.
+            result = out[0][1]
+            for i in range(1, len(out)):
+                prev_w = out[i - 1][0]
+                w, t = out[i]
+                gap = w["x"] - prev_w.get("right", prev_w["x"])
+                result += t if gap <= 2 else " " + t
+            return result.strip()
 
 
 
@@ -2415,8 +2439,17 @@ class OCREngine:
         for row in table_rows:
 
 
+            # Sort by center, not left edge: a number immediately glued to
+            # the next word with no space (e.g. "1000Base-T") can get OCR'd
+            # as two overlapping boxes - a wide one for the trailing text
+            # whose left edge is drawn a bit early, and a narrow one for the
+            # leading digits nested inside it (e.g. digits box left=203,
+            # right=243 vs text box left=180, right=880). Sorting by left
+            # edge alone then puts the wide box first - splicing "1000" in
+            # after "DGS-" instead of before "Base-T" - while the digits'
+            # box center is still safely left of the wide box's center.
             row.sort(
-                key=lambda x:x["x"]
+                key=lambda x: x.get("center_x", x["x"])
             )
 
 
@@ -2634,7 +2667,21 @@ class OCREngine:
 
                     "Rate": None,
 
-                    "Amount": None
+                    "Amount": None,
+
+                    # A freight/courier/shipping line printed WITH its own
+                    # explicit serial number (e.g. "2 | Freight Charges |
+                    # ... | 500.00") reaches here via the genuine-serial
+                    # path above, bypassing the CHARGE_KW check further up
+                    # that only guards the no-serial fallback - without
+                    # tagging it here too, it's saved as a normal "Item"
+                    # (Service First tries to match it as a real part, and
+                    # it wrongly shows up as a selectable description on
+                    # the Part Description Mapping screen).
+                    "charge": (
+                        any(k in lower for k in CHARGE_KW)
+                        and not any(k in lower for k in ("total", "tax", "output"))
+                    ),
 
                 }
                 pending_lead_in = ""
@@ -2897,6 +2944,22 @@ class OCREngine:
                         float(charge_rate_match.group(1)) if charge_rate_match else None
                     )
 
+                    # A bare charge-keyword row with no number of its own,
+                    # immediately after an already-open charge line (e.g.
+                    # "Freight Charges" on one row, then a lone "Shipping"
+                    # wrapping onto the very next row with no amount/HSN of
+                    # its own) is that same charge's label wrapping onto a
+                    # second line, not a second charge - fold it into the
+                    # open charge's own Description instead of closing it
+                    # out and opening an empty duplicate charge line (which
+                    # then fails mandatory-field validation with no
+                    # Quantity/Rate of its own).
+                    if amt is None and current_item and current_item.get("charge"):
+                        current_item["Description"] = (
+                            current_item["Description"] + " " + label
+                        ).strip()
+                        continue
+
                     if current_item:
                         items.append(current_item)
                     item_seq += 1
@@ -2974,7 +3037,22 @@ class OCREngine:
             # (Line_No = SI * 10000).
             item["SI"] = seq
 
-
+            # A charge line (freight/courier/shipping/...) that reached
+            # "Item" creation via its OWN printed serial number (e.g. "2 |
+            # Freight Charges | 996532 | 200.00") only ever gets its flat
+            # Amount filled from the row's own columns - unlike the
+            # dedicated no-serial charge path further above, nothing here
+            # states a per-unit Rate or a Quantity, so both stay None and
+            # the line fails mandatory Quantity/Direct Unit Cost validation
+            # even though the invoice states its amount perfectly clearly.
+            # A flat charge is conceptually "1 unit costing the stated
+            # amount" - default it the same way the dedicated path already
+            # does, rather than leaving it incomplete.
+            if item.get("charge") and item.get("Amount") is not None:
+                if item.get("Quantity") is None:
+                    item["Quantity"] = 1
+                if item.get("Rate") is None:
+                    item["Rate"] = item["Amount"]
 
         return items
 
