@@ -6,9 +6,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime
+from urllib.parse import quote
 
 import config_store
 from processor import job_manager
@@ -609,15 +611,36 @@ def invoice_field_check(header_id: int):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+def _inline_content_disposition(filename):
+    """Build a Content-Disposition header carrying BOTH a plain ASCII
+    `filename=` and an RFC 5987 `filename*=` for the same name. Starlette's
+    own FileResponse(filename=...) emits ONLY filename*= (percent-encoded)
+    whenever quote() changes the name at all - which a bare space already
+    triggers, so any invoice file name with a space (the common case here,
+    e.g. "Armtech - 1748.pdf") loses the plain fallback entirely. Most
+    browsers handle filename*= fine, but anything that only understands the
+    plain form then falls back to a name derived from the URL instead of the
+    real file name - so both forms are always sent together here."""
+    ascii_fallback = re.sub(r'[^\x20-\x7E]', "_", filename).replace('"', "'")
+    return f"inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
 @app.get("/api/invoices/pdf")
 def invoice_pdf(file: str):
-    """Serve an invoice's PDF/image inline (clicking an invoice no. in a table
-    opens it in a viewer). Located by file name across the Folder Path."""
+    """Serve an invoice's PDF/image inline (clicking an invoice no./file
+    name anywhere in the app opens it in the shared PdfModal viewer, which
+    all route through this one endpoint). Located by file name across the
+    Folder Path. The real file name is always what gets used if the user
+    downloads/saves it from the viewer - see _inline_content_disposition."""
     path = config_store.find_pdf(file)
     if not path or not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="File not found")
     media = _VIEW_MEDIA.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
-    return FileResponse(path, media_type=media, content_disposition_type="inline")
+    name = os.path.basename(path)
+    return FileResponse(
+        path, media_type=media,
+        headers={"content-disposition": _inline_content_disposition(name)},
+    )
 
 
 @app.get("/api/invoices/by-batch")
@@ -675,6 +698,52 @@ def invoices_buyer_order_missing():
             ["BUYER ORDER NO DOESN'T EXIST"])}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/part-description-update/items")
+def part_description_update_items():
+    """Service First's own purchase-line records (SpareRequestID, PartNo,
+    PartSpecification, Nav_Part_Description, pricing) for every Buyer's
+    Order No currently sitting at DATA MISMATCH - Part Description Update
+    menu, so a user can see what SF actually has on file for a PO's parts.
+    Each row also carries PdfInvoices (PIIPS's own InvoiceNo/FileName for
+    that PO - Purchase Details column) and PdfDescriptions (the invoice's
+    own Purchase Line Description text(s) for that PO - the screen's
+    autocomplete when typing a corrected SF description)."""
+    import database
+    import service_api
+    try:
+        order_nos = database.buyer_order_nos_for_status("DATA MISMATCH")
+        items = service_api.get_specification_mismatch_records(order_nos)
+        details_by_po = database.invoice_details_by_buyer_order(order_nos, "DATA MISMATCH")
+        for item in items:
+            details = details_by_po.get(item.get("PurchaseOrderNo"), {})
+            item["PdfInvoices"] = details.get("invoices", [])
+            item["PdfDescriptions"] = details.get("descriptions", [])
+        return {"items": items}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+class PartDescriptionSaveModel(BaseModel):
+    part_no_map_id: int
+    description: str
+
+
+@app.post("/api/part-description-update/save")
+def part_description_update_save(payload: PartDescriptionSaveModel):
+    """Push a corrected description for one Service First part back to SF -
+    Part Description Mapping menu's Update button (UpdateInvoiceDescription-
+    InPurchaseLine). part_no_map_id is stores_SparePurchaseLine.PartNoMapID
+    (from a GetPurchaseLineSpecificationMismatchRecord row's own
+    "PartNoMapID" field) - NOT its "PartID", a different column entirely on
+    the same table."""
+    import service_api
+    try:
+        result = service_api.update_invoice_description(payload.part_no_map_id, payload.description)
+        return {"result": result}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Service First update failed: {exc}")
 
 
 class BuyerOrderModel(BaseModel):
@@ -959,12 +1028,12 @@ def download_batch(batch: str, doc_no: Optional[str] = None, entry_no: Optional[
             # commit only for the paired Entry No. write to then collide,
             # leaving the Document No. change persisted despite the overall
             # request failing with "nothing was changed".
-            database.precheck_number_collisions(doc_pairs, entry_pairs)
+            database.precheck_number_collisions(doc_pairs, entry_pairs, name)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if start_doc_no is not None:
             try:
-                database.write_document_numbers(doc_pairs)
+                database.write_document_numbers(doc_pairs, name)
             except ValueError as exc:
                 # A custom-chosen number collides with another batch's -
                 # nothing was written, refuse rather than export an Excel
@@ -972,7 +1041,7 @@ def download_batch(batch: str, doc_no: Optional[str] = None, entry_no: Optional[
                 raise HTTPException(status_code=400, detail=str(exc))
         if start_entry_no is not None:
             try:
-                database.write_entry_numbers(entry_pairs)
+                database.write_entry_numbers(entry_pairs, name)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
 

@@ -2063,6 +2063,12 @@ class OCREngine:
 
             "bank details",
 
+            # Some layouts label this section just "Bank:" rather than
+            # "Bank Details" (e.g. "Bank: Kotak Mahindra Bank" as its own
+            # row) - without this, "bank details" never matches and the
+            # whole Bank/IFSC/A/C block gets scanned as more item rows.
+            "bank:",
+
             "terms",
 
             "e.& o.e",
@@ -2304,7 +2310,16 @@ class OCREngine:
                 "qty",
                 "nos",
                 "each",
-                "ea"
+                "ea",
+                # A bare "days" (the other half of a Warranty column's "90
+                # days" split from its own number by OCR) with no number
+                # attached is warranty-period noise, not description text -
+                # a genuine product description never uses the bare word on
+                # its own. The number itself ("90") is already dropped
+                # elsewhere as a stray non-column figure; only the leftover
+                # word needs excluding here.
+                "day",
+                "days",
             ]
 
         def descriptive_text(wds):
@@ -2325,8 +2340,23 @@ class OCREngine:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
                     if col in ("Quantity", "Rate", "Amount"):
                         continue
-                out.append(t)
-            return " ".join(out).strip()
+                out.append((w, t))
+            if not out:
+                return ""
+            # A number glued straight onto the next word with no space
+            # (e.g. "1000Base-T") can land as two overlapping/touching OCR
+            # boxes rather than one - joining every kept word with a plain
+            # space would then insert a space that was never actually
+            # there. Only omit it when the boxes actually touch or overlap
+            # (gap <= 2); two genuinely separate words always have a real
+            # gap between their boxes.
+            result = out[0][1]
+            for i in range(1, len(out)):
+                prev_w = out[i - 1][0]
+                w, t = out[i]
+                gap = w["x"] - prev_w.get("right", prev_w["x"])
+                result += t if gap <= 2 else " " + t
+            return result.strip()
 
 
 
@@ -2364,20 +2394,28 @@ class OCREngine:
 
         def row_has_values(vwords):
             """True if the row (minus its serial token) carries item data —
-            an HSN code or a number under the Quantity/Rate/Amount column.
-            A row with only descriptive text is a wrapped-description
-            continuation, not a new item."""
+            an HSN code under the HSN column, or a number under the
+            Quantity/Rate/Amount column. A row with only descriptive text is
+            a wrapped-description continuation, not a new item.
+            The HSN check is column-gated (not "any 4-10 digit token
+            anywhere in the row") because a wrapped description can itself
+            contain a bare number that happens to be HSN-shaped - e.g. a
+            part number OCR split across two lines as "1000" + "Base-T"
+            (from "1000Base-T...") lands the "1000" fragment under the
+            Description column, not HSN; without this gate it would be
+            mistaken for a real HSN code and the continuation row wrongly
+            treated as a new item."""
             for w in vwords:
                 t = w["text"].strip()
-                if is_hsn(t.replace(",", "")):
-                    return True
                 if value_cols:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
+                    if col == "HSN" and is_hsn(t.replace(",", "")):
+                        return True
                     if col in ("Quantity", "Rate", "Amount") and (
                         is_number(t) or number_with_unit(t) is not None
                     ):
                         return True
-                elif is_number(t):
+                elif is_hsn(t.replace(",", "")) or is_number(t):
                     return True
             return False
 
@@ -2401,8 +2439,17 @@ class OCREngine:
         for row in table_rows:
 
 
+            # Sort by center, not left edge: a number immediately glued to
+            # the next word with no space (e.g. "1000Base-T") can get OCR'd
+            # as two overlapping boxes - a wide one for the trailing text
+            # whose left edge is drawn a bit early, and a narrow one for the
+            # leading digits nested inside it (e.g. digits box left=203,
+            # right=243 vs text box left=180, right=880). Sorting by left
+            # edge alone then puts the wide box first - splicing "1000" in
+            # after "DGS-" instead of before "Base-T" - while the digits'
+            # box center is still safely left of the wide box's center.
             row.sort(
-                key=lambda x:x["x"]
+                key=lambda x: x.get("center_x", x["x"])
             )
 
 
@@ -2535,13 +2582,25 @@ class OCREngine:
             # has real (non-unit) label text and a genuine Amount, so it
             # would otherwise pass every check above and get misfiled as a
             # purchased item worth a few paise/rupees - exclude it by name.
+            # The HSN check is column-gated (not "any 4-10 digit token
+            # anywhere in the row") for the same reason as row_has_values
+            # below: a wrapped description can itself contain a bare number
+            # that happens to be HSN-shaped - e.g. a part number OCR split
+            # across two lines as "1000" + "Base-T..." (from
+            # "1000Base-T...") lands the "1000" fragment under the
+            # Description column, not HSN, and would otherwise start a
+            # phantom new item out of a genuine continuation row.
             if (
                 serial is None
                 and value_cols
                 and not any(k in lower for k in CHARGE_KW)
                 and not re.search(r"round(?:ed)?[\s-]*off", lower)
                 and (
-                    any(is_hsn(t.replace(",", "")) for t in texts)
+                    any(
+                        is_hsn(t.replace(",", ""))
+                        and min(value_cols, key=lambda c: abs(w["x"] - value_cols[c])) == "HSN"
+                        for w, t in zip(words, texts)
+                    )
                     or row_has_amount(words)
                 )
                 and any(
@@ -2608,7 +2667,21 @@ class OCREngine:
 
                     "Rate": None,
 
-                    "Amount": None
+                    "Amount": None,
+
+                    # A freight/courier/shipping line printed WITH its own
+                    # explicit serial number (e.g. "2 | Freight Charges |
+                    # ... | 500.00") reaches here via the genuine-serial
+                    # path above, bypassing the CHARGE_KW check further up
+                    # that only guards the no-serial fallback - without
+                    # tagging it here too, it's saved as a normal "Item"
+                    # (Service First tries to match it as a real part, and
+                    # it wrongly shows up as a selectable description on
+                    # the Part Description Mapping screen).
+                    "charge": (
+                        any(k in lower for k in CHARGE_KW)
+                        and not any(k in lower for k in ("total", "tax", "output"))
+                    ),
 
                 }
                 pending_lead_in = ""
@@ -2795,11 +2868,29 @@ class OCREngine:
                     or any(_SIZE_SPEC_RE.match(w["text"].strip()) for w in words)
                 )
 
+                # "continued"/"contd" is a multi-page invoice's own page-
+                # footer marker ("continued ...", printed below the table on
+                # every page but the last), and "this is a computer
+                # generated invoice" is the standalone footer line every
+                # page of this layout prints at the very bottom - both have
+                # no leading serial and real letters, so without excluding
+                # them here they silently glue onto whichever item happened
+                # to be last on that page's table (e.g. "Hinges ... Part No
+                # : 5H50S29037 continued" / "... This is a Computer
+                # Generated Invoice").
+                # "Rounded Off" (past tense) is the actual wording several
+                # vendors print ("Dell Mouse MS116 Rounded Off", "...Less :
+                # Rounded Off (-)0.40") - "round off"/"round-off"/"roundoff"
+                # above don't substring-match it (the "ed" breaks it), so it
+                # slipped through and glued onto the previous item exactly
+                # like "continued" did.
                 EXCLUDE_KW = ("output", "igst", "cgst", "sgst", "tax amount",
                               "total", "round off", "round-off", "roundoff",
+                              "rounded off",
                               "rupees", "inr ", "grand total", "tax rate",
                               "taxable", "amount chargeable", "in words",
-                              "declaration")
+                              "declaration", "continued", "contd",
+                              "computer generated invoice")
 
                 is_charge = (has_text
                              and any(k in lower for k in CHARGE_KW)
@@ -2852,6 +2943,22 @@ class OCREngine:
                     charge_rate = (
                         float(charge_rate_match.group(1)) if charge_rate_match else None
                     )
+
+                    # A bare charge-keyword row with no number of its own,
+                    # immediately after an already-open charge line (e.g.
+                    # "Freight Charges" on one row, then a lone "Shipping"
+                    # wrapping onto the very next row with no amount/HSN of
+                    # its own) is that same charge's label wrapping onto a
+                    # second line, not a second charge - fold it into the
+                    # open charge's own Description instead of closing it
+                    # out and opening an empty duplicate charge line (which
+                    # then fails mandatory-field validation with no
+                    # Quantity/Rate of its own).
+                    if amt is None and current_item and current_item.get("charge"):
+                        current_item["Description"] = (
+                            current_item["Description"] + " " + label
+                        ).strip()
+                        continue
 
                     if current_item:
                         items.append(current_item)
@@ -2930,7 +3037,22 @@ class OCREngine:
             # (Line_No = SI * 10000).
             item["SI"] = seq
 
-
+            # A charge line (freight/courier/shipping/...) that reached
+            # "Item" creation via its OWN printed serial number (e.g. "2 |
+            # Freight Charges | 996532 | 200.00") only ever gets its flat
+            # Amount filled from the row's own columns - unlike the
+            # dedicated no-serial charge path further above, nothing here
+            # states a per-unit Rate or a Quantity, so both stay None and
+            # the line fails mandatory Quantity/Direct Unit Cost validation
+            # even though the invoice states its amount perfectly clearly.
+            # A flat charge is conceptually "1 unit costing the stated
+            # amount" - default it the same way the dedicated path already
+            # does, rather than leaving it incomplete.
+            if item.get("charge") and item.get("Amount") is not None:
+                if item.get("Quantity") is None:
+                    item["Quantity"] = 1
+                if item.get("Rate") is None:
+                    item["Rate"] = item["Amount"]
 
         return items
 

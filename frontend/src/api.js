@@ -98,6 +98,15 @@ export const setBuyerOrder = (header_id, buyer_order_no, user_id) =>
 export const getLifecycleInvoices = (stage) =>
   request(`/api/lifecycle/invoices?stage=${encodeURIComponent(stage)}`);
 
+export const getPartDescriptionUpdateItems = () =>
+  request("/api/part-description-update/items");
+
+export const savePartDescription = (part_no_map_id, description) =>
+  request("/api/part-description-update/save", {
+    method: "POST",
+    body: JSON.stringify({ part_no_map_id, description }),
+  });
+
 export const advanceLifecycle = (stage, header_ids, user_id) =>
   request("/api/lifecycle/advance", {
     method: "POST",

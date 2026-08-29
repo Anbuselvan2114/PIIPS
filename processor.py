@@ -12,6 +12,7 @@ thread-safe, so only one job runs at a time).
 
 import json
 import os
+import re
 import shutil
 import threading
 import traceback
@@ -230,6 +231,27 @@ class JobManager:
             # Process mode: assign this run's batch name and load the set of
             # invoices already saved in earlier batches (for de-duplication).
             invoice_map = {}
+            # One Start run scans every template's Input subfolder at once,
+            # so it can easily contain files for several different
+            # Templates - each gets its OWN batch (via _batch_name_for
+            # below, keyed on that file's own template key) instead of all
+            # being lumped into one shared batch just because they were
+            # processed in the same click.
+            batch_names_by_tkey = {}
+
+            def _batch_name_for(tkey):
+                """This run's batch name for template key `tkey` (""/None
+                for a file with no resolvable template) - same key always
+                reuses the same batch name within this run; a first-seen
+                key mints a new one from the run's base timestamp name."""
+                if tkey not in batch_names_by_tkey:
+                    if tkey:
+                        suffix = re.sub(r"[^A-Za-z0-9]+", "_", tkey).strip("_")
+                        batch_names_by_tkey[tkey] = f"{job.batch_name}_{suffix}"
+                    else:
+                        batch_names_by_tkey[tkey] = job.batch_name
+                return batch_names_by_tkey[tkey]
+
             if job.mode == "process":
                 job.batch_name = "PIIPS_Batch_" + datetime.now().strftime("%Y%m%d_%H%M%S")
                 try:
@@ -312,6 +334,15 @@ class JobManager:
                 # invoices' freight/charge lines without a separate lookup.
                 data["_invoice_type"] = ctx["invoice_type"]
 
+                # This file's own batch: same template key -> same batch
+                # (reused across every file for that template in this run),
+                # different key -> a distinct batch, so files uploaded under
+                # different Templates never share a batch just because they
+                # happened to be processed by the same Start click. Files
+                # with no resolvable template (tkey blank) fall back to the
+                # run's shared base batch - there's no template to split by.
+                rec_batch_name = _batch_name_for(ctx["tkey"] or "")
+
                 rec = {
                     "file": ctx["filename"],
                     # Path relative to the Input root, matching the upload
@@ -322,7 +353,7 @@ class JobManager:
                     "output": out_path,
                     "format": ctx["fmt_name"],
                     "format_status": "matched" if ctx["fmt_name"] else "unmatched",
-                    "batch": job.batch_name,
+                    "batch": rec_batch_name,
                     "data": data,
                     # Service First verdict -> per-invoice tracker status /
                     # IsActive / IsSynced, applied in _save_to_db.
@@ -454,25 +485,27 @@ class JobManager:
                             # PDF into the DUPLICATE folder the same way it
                             # does for every other status.
                             #
-                            # Exception: if that existing record is
-                            # currently Excluded, a re-upload is treated as
-                            # a deliberate correction, not a duplicate - its
-                            # Header/Tracker rows are updated in place (same
-                            # Id, not a new-looking record) and its Line/
-                            # Reservation rows are replaced with this run's
-                            # fresh data, once this group's own save
-                            # completes below (see _save_to_db's post-save
-                            # reconciliation pass, database.
-                            # reprocess_excluded_header) - so this run falls
-                            # through to normal processing here instead of
-                            # being parked as DUPLICATE.
+                            # Exception: if that existing record is currently
+                            # Excluded, Pending In SF, Data Mismatch, or New
+                            # Template (database._REPROCESSABLE_STATUSES) - it
+                            # never reached a real final outcome - a
+                            # deliberate re-upload is treated as a retry, not
+                            # a duplicate - its Header/Tracker rows are
+                            # updated in place (same Id, not a new-looking
+                            # record) and its Line/Reservation rows are
+                            # replaced with this run's fresh data, once this
+                            # group's own save completes below (see
+                            # _save_to_db's post-save reconciliation pass,
+                            # database.reprocess_reworkable_header) - so this
+                            # run falls through to normal processing here
+                            # instead of being parked as DUPLICATE.
                             match_key = (
                                 inv_no,
                                 str(data.get("buyer_order_no") or "").strip().lower(),
                             )
                             if match_key in invoice_map:
                                 existing = invoice_map[match_key]
-                                if existing.get("excluded") and existing.get("header_id"):
+                                if existing.get("reprocessable") and existing.get("header_id"):
                                     ctx["_reprocess_into_header_id"] = existing["header_id"]
                                     del invoice_map[match_key]
                                 else:
@@ -493,7 +526,7 @@ class JobManager:
                             # until the batched Service First call below.
                             if inv_no:
                                 invoice_map[match_key] = {
-                                    "batch": job.batch_name, "header_id": None, "excluded": False,
+                                    "batch": _batch_name_for(tkey or ""), "header_id": None, "reprocessable": False,
                                 }
 
                             # A PART invoice with no real "Item" line at all
@@ -681,7 +714,13 @@ class JobManager:
     @staticmethod
     def _save_to_db(job):
         """Save each sheet's rows (mapped + static) into the DB tables.
-        Best-effort: a DB/connection failure does not fail the run."""
+        Best-effort: a DB/connection failure does not fail the run. Splits
+        this run's matched invoices by their own "batch" (see
+        _finish_group, which assigns one batch per Template) and saves each
+        group separately through _save_batch_to_db, so a single Start run
+        spanning several Templates creates one batch per Template instead
+        of lumping everything into whichever batch name the run started
+        with."""
         try:
             import config_store
             if not (config_store.load_config().get("db_connection") or "").strip():
@@ -697,6 +736,22 @@ class JobManager:
             if not matched:
                 return
 
+            batch_groups = {}
+            for r in matched:
+                batch_groups.setdefault(r.get("batch") or job.batch_name, []).append(r)
+
+            for batch_name, batch_matched in batch_groups.items():
+                JobManager._save_batch_to_db(job, batch_name, batch_matched, excel_export, database)
+
+        except Exception:  # noqa: BLE001 - DB save is best-effort
+            traceback.print_exc()
+
+    @staticmethod
+    def _save_batch_to_db(job, batch_name, matched, excel_export, database):
+        """Save one batch's worth of already-matched invoices - the per-
+        batch body of _save_to_db, split out so one Start run can save
+        several batches (one per Template) instead of always exactly one."""
+        try:
             invoices = [r["data"] for r in matched]
             grouped = excel_export.build_rows_grouped(invoices)
 
@@ -780,13 +835,15 @@ class JobManager:
                 # folder the DB says it's in.
                 matched[i]["_status"] = tracker["statuses"][i]
 
-            job.db_saved = database.save_grouped(grouped, job.batch_name, tracker)
+            result = database.save_grouped(grouped, batch_name, tracker) or {}
+            for k, v in result.items():
+                job.db_saved[k] = job.db_saved.get(k, 0) + v
 
-            # Invoices that matched an Excluded record (see the main loop's
-            # duplicate check) were just inserted above as ordinary fresh
-            # rows, same as every other invoice in this batch - now merge
-            # each one back onto its existing Excluded header/tracker in
-            # place (same Id) and drop the temporary insert.
+            # Invoices that matched an Excluded/Pending In SF record (see the
+            # main loop's duplicate check) were just inserted above as
+            # ordinary fresh rows, same as every other invoice in this
+            # batch - now merge each one back onto its existing header/
+            # tracker in place (same Id) and drop the temporary insert.
             for r in matched:
                 existing_id = r.get("_reprocess_into_header_id")
                 if not existing_id:
@@ -800,12 +857,12 @@ class JobManager:
                         "SELECT TOP 1 h.Id FROM dbo.tbl_Purchase_Header h "
                         "JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = h.Id "
                         "WHERE pt.BatchName = ? AND h.InvoiceNo = ? ORDER BY h.Id DESC",
-                        job.batch_name, inv_no,
+                        batch_name, inv_no,
                     )
                     row = cur.fetchone()
                     cur.connection.close()
                     if row:
-                        database.reprocess_excluded_header(existing_id, row[0])
+                        database.reprocess_reworkable_header(existing_id, row[0])
                 except Exception:  # noqa: BLE001 - best-effort
                     traceback.print_exc()
 

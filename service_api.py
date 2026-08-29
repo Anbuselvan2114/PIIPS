@@ -36,6 +36,8 @@ _session = requests.Session()
 
 _SPARE_PATH = "/api/purchase/GetSparePurchaseItem"
 _HSN_PATH = "/api/Purchase/GetHSNDetails"
+_MISMATCH_PATH = "/api/Purchase/GetPurchaseLineSpecificationMismatchRecord"
+_UPDATE_DESC_PATH = "/api/Purchase/UpdateInvoiceDescriptionInPurchaseLine"
 
 _TIMEOUT = 60
 
@@ -111,7 +113,10 @@ def get_spare_purchase_items(order_numbers):
     grouped = {}
     for chunk in _chunked(payload, _CHUNK_SIZE):
         try:
-            resp = _session.post(base + _SPARE_PATH, json=chunk, timeout=_TIMEOUT)
+            # GetSparePurchaseItem's [HttpGet] controller still expects a
+            # JSON body (same shape as GetHSNDetails/GetPurchaseLineSpecific-
+            # ationMismatchRecord) - a POST now gets 405 (Allow: GET).
+            resp = _session.get(base + _SPARE_PATH, json=chunk, timeout=_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:  # noqa: BLE001 - backend optional
@@ -141,7 +146,9 @@ def get_hsn_details(hsn_items):
     hsn_map = {}
     for chunk in _chunked(hsn_items, _CHUNK_SIZE):
         try:
-            resp = _session.post(base + _HSN_PATH, json=chunk, timeout=_TIMEOUT)
+            # GetHSNDetails' controller is now [HttpGet] too - still expects
+            # a JSON body; a POST now gets 405 (Allow: GET).
+            resp = _session.get(base + _HSN_PATH, json=chunk, timeout=_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:  # noqa: BLE001 - backend optional
@@ -163,6 +170,66 @@ def get_hsn_details(hsn_items):
             if po and part:
                 hsn_map[(po, part)] = row
     return hsn_map
+
+
+def get_specification_mismatch_records(order_numbers):
+    """List of Service First purchase-line records (SpareRequestID,
+    PurchaseOrderNo, PartID, PartNo, PartSpecification, UnitPrice, UnitTotal,
+    Nav_Part_Description) for the given Purchase Order numbers -
+    GetPurchaseLineSpecificationMismatchRecord, for the Part Description
+    Update menu (lets a user compare Service First's own item-master
+    description against what's on the invoice). A chunk that errors is
+    skipped (logged, not raised) so the rest of a large run's chunks still
+    get their real answer.
+    Sample: get_specification_mismatch_records(['SPRPUR/2026/04/27-83650'])"""
+    base = _base_url()
+    order_numbers = [str(n).strip() for n in (order_numbers or []) if n and str(n).strip()]
+    if not base or not order_numbers:
+        return []
+
+    payload = [{"PurchaseOrderNo": n} for n in order_numbers]
+    records = []
+    for chunk in _chunked(payload, _CHUNK_SIZE):
+        try:
+            # Unlike GetSparePurchaseItem/GetHSNDetails (POST), this endpoint
+            # is a GET that still expects a JSON body - confirmed live: POST
+            # returns 405 (Allow: GET), a bodyless GET returns 415, and GET
+            # with a JSON body returns 200 with real rows.
+            resp = _session.get(base + _MISMATCH_PATH, json=chunk, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001 - backend optional
+            print(f"Specification mismatch API error (chunk of {len(chunk)}): {exc}")
+            continue
+
+        if isinstance(data, dict):
+            rows = (data.get("PartViewModelList") or data.get("Data")
+                    or data.get("Items") or data.get("result") or [])
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
+        records.extend(row for row in rows if isinstance(row, dict))
+    return records
+
+
+def update_invoice_description(part_no_map_id, nav_part_description):
+    """Push a corrected Nav_Part_Description back to Service First for one
+    part - UpdateInvoiceDescriptionInPurchaseLine, the Part Description
+    Mapping screen's Update button. A genuine POST (confirmed live), taking
+    a single PartViewModel object (not a PartViewModelCollection/list like
+    the three GET-with-a-JSON-body endpoints) and returning {"status": int}
+    rather than echoing the model back. `part_no_map_id` is
+    stores_SparePurchaseLine.PartNoMapID (a GetPurchaseLineSpecification-
+    MismatchRecord row's own "PartNoMapID" field - NOT its "PartID").
+    Sample: update_invoice_description(126823, '8GB 1Rx16 DDR4 3200 LAPTOP RAM')"""
+    base = _base_url()
+    if not base:
+        raise RuntimeError("Service First API URL is not configured")
+    payload = {"PartNoMapID": part_no_map_id, "Nav_Part_Description": nav_part_description}
+    resp = _session.post(base + _UPDATE_DESC_PATH, json=payload, timeout=_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def apply_sf_item_defaults(rows):

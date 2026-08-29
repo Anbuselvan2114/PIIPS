@@ -198,12 +198,18 @@ export default function Dashboard({ user }) {
     try {
       const r = await setInvoiceExcluded(row.header_id, exclude, user?.user_id);
       setModal((m) => m && ({
-        ...m,
+        ...m, error: null,
         rows: m.rows.map((x) => x.header_id === row.header_id
           ? { ...x, is_excluded: exclude, status: r.new_status || x.status } : x),
       }));
       loadStatusCounts(); loadBatches();
-    } catch (e) { setError(e.message); }
+    } catch (e) {
+      // This button lives inside the invoice-list modal - show the
+      // failure there (modal.error, right where the user is looking),
+      // not on the outer page's error banner, which sits behind the
+      // modal overlay and would go unnoticed.
+      setModal((m) => m && ({ ...m, error: e.message }));
+    }
   };
 
   const [includingAll, setIncludingAll] = useState(false);
@@ -215,8 +221,17 @@ export default function Dashboard({ user }) {
       const results = await Promise.allSettled(
         targets.map((r) => setInvoiceExcluded(r.header_id, false, user?.user_id)));
       const byId = new Map(targets.map((r, i) => [r.header_id, results[i]]));
+      const failed = results.filter((r) => r.status === "rejected");
+      // Shown inside this same modal (not the outer page's error banner,
+      // which sits behind the modal overlay and would go unnoticed) - the
+      // first invoice's own reason (e.g. "its batch already has an invoice
+      // Loaded...") is far more actionable than a bare failure count.
+      const failureMsg = failed.length
+        ? failed[0].reason?.message
+          + (failed.length > 1 ? ` (and ${failed.length - 1} more failed the same way)` : "")
+        : null;
       setModal((m) => m && ({
-        ...m,
+        ...m, error: failureMsg,
         rows: m.rows.map((x) => {
           const res = byId.get(x.header_id);
           return res && res.status === "fulfilled"
@@ -224,8 +239,6 @@ export default function Dashboard({ user }) {
             : x;
         }),
       }));
-      const failed = results.filter((r) => r.status === "rejected");
-      if (failed.length) setError(`${failed.length} invoice(s) could not be included.`);
       loadStatusCounts(); loadBatches();
     } finally { setIncludingAll(false); }
   };
@@ -368,6 +381,11 @@ export default function Dashboard({ user }) {
       a.href = url; a.download = filename;
       document.body.appendChild(a); a.click(); a.remove();
       URL.revokeObjectURL(url);
+      // The backend just flipped this batch's status to Downloaded (and
+      // minted Document Nos) - refresh so the table reflects that without
+      // needing a manual page reload.
+      loadBatches();
+      loadStatusCounts();
     } catch (e) { setBatchError(e.message); }
     finally { setDownloadingBatch(null); }
   };

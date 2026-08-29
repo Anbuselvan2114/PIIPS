@@ -11,6 +11,7 @@ import Mapping from "./Mapping";
 import Template from "./Template";
 import UserManagement from "./UserManagement";
 import BuyerOrderEntry from "./BuyerOrderEntry";
+import PartDescriptionUpdate from "./PartDescriptionUpdate";
 import Lifecycle from "./Lifecycle";
 import Login from "./Login";
 import ForgotPassword from "./ForgotPassword";
@@ -27,6 +28,7 @@ const MENU = [
   ["input", "File Explorer", "🗂", "Main"],
   ["manual", "Manual", "📖", "Main"],
   ["buyerorder", "Buyer Order Entry", "✎", "Review"],
+  ["partdescupdate", "Part Description Mapping", "📝", "Review"],
   ["load", "Load", "📥", "Accounts"],
   ["post", "Post", "📮", "Accounts"],
   ["complete", "Complete", "✅", "Accounts"],
@@ -49,7 +51,7 @@ const ROLE_MENUS = {
   admin: ["dashboard", "input", "manual", "buyerorder", "load", "post", "complete",
           "configuration", "apiconfig", "template", "createfield", "users"],
   // Users process invoices, fix Buyer Order Nos, and Load them.
-  user: ["dashboard", "input", "manual", "buyerorder", "load"],
+  user: ["dashboard", "input", "manual", "buyerorder", "partdescupdate", "load"],
   // Accounts run the downstream Post / Complete steps.
   accounts: ["dashboard", "input", "manual", "post", "complete"],
   // Viewer sees every page (read-only) - every mutating action is blocked
@@ -68,6 +70,7 @@ const PAGES = {
   training: Training, createfield: CreateField, mapping: Mapping,
   template: Template, users: UserManagement, dbconfig: DatabaseConfig,
   apiconfig: ApiConfiguration, buyerorder: BuyerOrderEntry,
+  partdescupdate: PartDescriptionUpdate,
   load: Load, post: Post, complete: Complete, manual: Manuals,
   publish: Publish, mailsettings: MailSettings, announcement: Announcement,
 };
@@ -113,6 +116,35 @@ export default function App() {
       .catch(() => setDbConfigured(true));
   }, []);
 
+  // Single-tab guard: a casual convenience, not real security - a private
+  // window, a different browser, or simply not supporting BroadcastChannel
+  // all sail straight past this, same caveat as the DevTools deterrent
+  // below. One tab's channel answers "ping" with "pong"; a tab that gets a
+  // pong back knows it's a duplicate and shows a blocking screen instead
+  // of the app. `retryTick` re-runs the handshake (e.g. after closing the
+  // other tab) without a full page reload.
+  // null = still running the handshake (nothing else renders meanwhile,
+  // so a genuine duplicate tab never gets a flash of real content first).
+  const [otherTabOpen, setOtherTabOpen] = useState(null);
+  const [retryTick, setRetryTick] = useState(0);
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") {
+      setOtherTabOpen(false);   // unsupported browser - fail open, never stay stuck on null
+      return undefined;
+    }
+    const channel = new BroadcastChannel("piips-single-tab");
+    let settled = false;
+    channel.onmessage = (e) => {
+      if (e.data === "ping") channel.postMessage("pong");
+      else if (e.data === "pong") { settled = true; setOtherTabOpen(true); }
+    };
+    channel.postMessage("ping");
+    const timer = setTimeout(() => {
+      if (!settled) setOtherTabOpen(false);
+    }, 300);
+    return () => { clearTimeout(timer); channel.close(); };
+  }, [retryTick]);
+
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem("piips_theme", theme);
@@ -142,6 +174,29 @@ export default function App() {
   const toggleCollapsed = () => {
     setCollapsed((c) => { localStorage.setItem("piips_collapsed", c ? "0" : "1"); return !c; });
   };
+
+  if (otherTabOpen === null) {
+    // Still running the ping/pong handshake - render nothing real yet, so
+    // a genuine duplicate tab is never briefly shown the app underneath.
+    return <div className="page"><div className="card">Loading…</div></div>;
+  }
+
+  if (otherTabOpen) {
+    return (
+      <div className="page">
+        <div className="card" style={{ maxWidth: 480, margin: "80px auto", textAlign: "center" }}>
+          <h3>PIIPS is already open</h3>
+          <p className="hint">
+            This app is already open in another tab or window. Close it there,
+            or switch to it, then try again here.
+          </p>
+          <button className="btn btn-primary" onClick={() => setRetryTick((t) => t + 1)}>
+            Try Again
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (dbConfigured === null) {
     return <div className="page"><div className="card">Loading…</div></div>;
