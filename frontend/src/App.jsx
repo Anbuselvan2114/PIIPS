@@ -27,9 +27,9 @@ const MENU = [
   ["dashboard", "Dashboard", "▤", "Main"],
   ["input", "File Explorer", "🗂", "Main"],
   ["manual", "Manual", "📖", "Main"],
-  ["buyerorder", "Buyer Order Entry", "✎", "Review"],
-  ["partdescupdate", "Part Description Mapping", "📝", "Review"],
-  ["load", "Load", "📥", "Accounts"],
+  ["buyerorder", "Buyer Order Entry", "✎", "Review & Update"],
+  ["partdescupdate", "Part Description Mapping", "📝", "Review & Update"],
+  ["load", "Load", "📥", "Review & Update"],
   ["post", "Post", "📮", "Accounts"],
   ["complete", "Complete", "✅", "Accounts"],
   ["configuration", "Folder Configuration", "⚙", "Setup"],
@@ -54,10 +54,12 @@ const ROLE_MENUS = {
   user: ["dashboard", "input", "manual", "buyerorder", "partdescupdate", "load"],
   // Accounts run the downstream Post / Complete steps.
   accounts: ["dashboard", "input", "manual", "post", "complete"],
-  // Viewer sees every page (read-only) - every mutating action is blocked
-  // server-side too (app.py's _require_not_viewer), this is just so
-  // nothing is hidden from them.
-  viewer: MENU.map(([k]) => k),
+  // Viewer sees invoice-processing data read-only (every mutating action is
+  // blocked server-side too, app.py's _require_not_viewer) but not the
+  // Setup/Mapping/Admin screens - those configure the app itself rather
+  // than show data, and aren't meant for this role.
+  viewer: ["dashboard", "input", "buyerorder", "partdescupdate",
+           "load", "post", "complete"],
 };
 
 // Load / Post / Complete are one component parameterised by stage.

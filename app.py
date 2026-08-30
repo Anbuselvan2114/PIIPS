@@ -753,6 +753,7 @@ def part_description_update_items():
 class PartDescriptionSaveModel(BaseModel):
     part_no_map_id: int
     description: str
+    user_id: Optional[int] = None
 
 
 @app.post("/api/part-description-update/save")
@@ -764,6 +765,7 @@ def part_description_update_save(payload: PartDescriptionSaveModel):
     "PartNoMapID" field) - NOT its "PartID", a different column entirely on
     the same table."""
     import service_api
+    _require_not_viewer(payload.user_id)
     try:
         result = service_api.update_invoice_description(payload.part_no_map_id, payload.description)
         return {"result": result}
@@ -1231,6 +1233,7 @@ def upload_input(subpath: str = "", user_id: Optional[int] = None,
 
     import database
 
+    _require_not_viewer(user_id)
     folder = _input_subdir(subpath)
     os.makedirs(folder, exist_ok=True)
 
@@ -1682,9 +1685,12 @@ def api_change_password(payload: ChangePasswordModel):
 
 class UserCreateModel(BaseModel):
     username: str
-    email: str
+    email: Optional[str] = None
     user_type_id: int
     created_by: Optional[int] = None
+    # Viewer accounts only: a Super Admin assigns the password directly
+    # instead of one being auto-generated and emailed - see api_create_user.
+    password: Optional[str] = None
 
 
 class UserActiveModel(BaseModel):
@@ -1723,25 +1729,52 @@ def api_list_users():
 
 @app.post("/api/users")
 def api_create_user(payload: UserCreateModel, request: Request):
-    """Create a user. The admin never chooses a password - one is always
-    auto-generated and emailed to the address given here."""
+    """Create a user. Normally the admin never chooses a password - one is
+    always auto-generated and emailed to the address given here. A Viewer
+    account is the one exception: it's set up directly by a Super Admin
+    with a password of their choosing, no email required, and no welcome
+    email sent (see the Viewer-specific rules noted inline below)."""
     import database
     import mailer
 
     _require_not_viewer(payload.created_by)
     name = (payload.username or "").strip()
     email = (payload.email or "").strip()
-    if not name or not email:
-        raise HTTPException(status_code=400, detail="Username and email are required.")
-    if "@" not in email or "." not in email.split("@")[-1]:
-        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    type_name = next(
+        (t["name"] for t in database.list_user_types() if t["id"] == payload.user_type_id), ""
+    )
+    is_viewer = type_name.strip().lower() == "viewer"
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Username is required.")
+    if is_viewer:
+        # A Viewer's password is assigned directly by the Super Admin
+        # creating it, not auto-generated and emailed - there's no welcome
+        # email to send, so no email address is required either. The usual
+        # complexity policy is skipped too: a Viewer account is commonly
+        # set up with a simple, memorable convention (e.g. the employee
+        # code as-is), and it's read-only with no email recovery path
+        # anyway, unlike a self-service account's own password.
+        if not payload.password:
+            raise HTTPException(status_code=400, detail="A password is required for a Viewer account.")
+    else:
+        if not email:
+            raise HTTPException(status_code=400, detail="Username and email are required.")
+        if "@" not in email or "." not in email.split("@")[-1]:
+            raise HTTPException(status_code=400, detail="Enter a valid email address.")
 
     try:
-        temp_password = database.create_user(name, payload.user_type_id, email, payload.created_by)
+        temp_password = database.create_user(
+            name, payload.user_type_id, email or None, payload.created_by,
+            password=payload.password if is_viewer else None,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    if is_viewer:
+        return {"ok": True, "email_sent": False, "email_error": None}
 
     created = database.get_user(name)
     user_type_name = (created or {}).get("UserTypeName", "")
@@ -1787,8 +1820,13 @@ def api_set_user_active(payload: UserActiveModel, request: Request):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
+    # A Viewer account is set up by a Super Admin directly (no email on
+    # file is even required for one - see api_create_user), so there's no
+    # activation/deactivation notice to send either.
+    is_viewer = (user or {}).get("UserTypeName", "").strip().lower() == "viewer"
+
     email_sent, email_error = False, None
-    if user and user.get("Email"):
+    if user and user.get("Email") and not is_viewer:
         html = (
             mailer.activation_email_html(user["UserName"], _base_url(request))
             if payload.is_active

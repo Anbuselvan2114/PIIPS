@@ -795,11 +795,18 @@ class JobManager:
             #     READY TO LOAD, regardless of what Service First said
             #     (PENDING IN SF / DATA MISMATCH verdicts are provisional,
             #     not final, until the data itself is checked).
-            #   - anything missing -> DATA MISMATCH, with exactly which
-            #     field(s) - excluding one whose only possible source is
-            #     an unset Template value (see excel_export._is_none_source):
-            #     nothing was ever configured to fill it, so its absence
-            #     isn't a real data problem.
+            #   - a mandatory field whose source is the PDF itself (not
+            #     Service First/System/Template) is missing -> NEW TEMPLATE,
+            #     not DATA MISMATCH: the extraction/template failed to read
+            #     something the PDF should have stated outright (e.g.
+            #     Quantity, Direct Unit Cost, Line Amount), which is a
+            #     training gap, not a one-off data problem - copied into
+            #     New_Format the same way an unrecognized format is.
+            #   - otherwise anything missing -> DATA MISMATCH, with exactly
+            #     which field(s) - excluding one whose only possible source
+            #     is an unset Template value (see excel_export._is_none_
+            #     source): nothing was ever configured to fill it, so its
+            #     absence isn't a real data problem.
             field_mapping = excel_export.load_mapping()
             for i, group in enumerate(grouped["groups"]):
                 if tracker["statuses"][i] in (
@@ -814,7 +821,25 @@ class JobManager:
                 missing = excel_export.missing_required_fields(
                     header_for_check, group["lines"], group["reservations"], field_mapping
                 )
-                if missing:
+                missing_names = sorted({m["field"] for m in missing})
+                pdf_missing = sorted({m["field"] for m in missing if m["source"] == "PDF"})
+                if pdf_missing:
+                    tracker["statuses"][i] = "NEW TEMPLATE"
+                    tracker["isactives"][i] = False
+                    matched[i]["reason"] = (
+                        "PDF-sourced field(s) missing — needs training: " + ", ".join(pdf_missing)
+                    )
+                    rel = matched[i].get("rel") or matched[i].get("file")
+                    src = (os.path.join(job.source_folder, rel.replace("/", os.sep))
+                           if rel else None)
+                    if src and job.unknown_folder:
+                        try:
+                            JobManager._copy(src, job.unknown_folder)
+                            if job.mirror_folder:
+                                JobManager._copy(src, job.mirror_folder)
+                        except Exception:  # noqa: BLE001 - best-effort
+                            traceback.print_exc()
+                elif missing:
                     tracker["statuses"][i] = "DATA MISMATCH"
                     tracker["isactives"][i] = False
                     # Keep a more specific reason Service First already gave
@@ -824,7 +849,7 @@ class JobManager:
                     # gap and is more actionable. Only fall back to the
                     # generic message when nothing more specific was set.
                     if not matched[i].get("reason"):
-                        matched[i]["reason"] = "Missing required field(s): " + ", ".join(missing)
+                        matched[i]["reason"] = "Missing required field(s): " + ", ".join(missing_names)
                 else:
                     tracker["statuses"][i] = "READY TO LOAD"
                     tracker["isactives"][i] = True

@@ -3018,15 +3018,20 @@ _MENU_PROC_DDL = [
     # (usp_SetUserActive), never physically removed.
     """
     CREATE OR ALTER PROCEDURE dbo.usp_CreateUser
-        @UserName     NVARCHAR(100),
-        @UserTypeID   INT,
-        @PasswordHash NVARCHAR(256),
-        @Email        NVARCHAR(200) = NULL,
-        @CreatedById  INT = NULL
+        @UserName          NVARCHAR(100),
+        @UserTypeID        INT,
+        @PasswordHash      NVARCHAR(256),
+        @Email             NVARCHAR(200) = NULL,
+        @CreatedById       INT = NULL,
+        @MustChangePassword BIT = 1
     AS
     BEGIN
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_CreateUser @UserName='jsmith', @UserTypeID=1, @PasswordHash='pbkdf2_sha256$100000$abcd$ef01', @Email='jsmith@precisionit.co.in', @CreatedById=7
+        -- @MustChangePassword defaults to 1 (the normal auto-generated-
+        -- and-emailed-temp-password flow) - a Viewer account, whose
+        -- password a Super Admin assigns directly as a persistent
+        -- credential rather than a temp one, passes 0.
         IF EXISTS (SELECT 1 FROM dbo.tbl_user WHERE UserName = @UserName)
         BEGIN
             SELECT -1 AS Status;   -- already exists
@@ -3034,7 +3039,7 @@ _MENU_PROC_DDL = [
         END
         INSERT INTO dbo.tbl_user
             (UserName, UserTypeID, Password, Email, MustChangePassword, IsActive, CreatedById, CreatedDatetime)
-        VALUES (@UserName, @UserTypeID, @PasswordHash, @Email, 1, 1, @CreatedById, GETDATE());
+        VALUES (@UserName, @UserTypeID, @PasswordHash, @Email, @MustChangePassword, 1, @CreatedById, GETDATE());
         SELECT 0 AS Status;
     END
     """,
@@ -4312,20 +4317,30 @@ def list_users():
         conn.close()
 
 
-def create_user(username, user_type_id, email, created_by=None):
-    """Create a user with a system-generated temporary password (raises if
-    the name exists). The admin never chooses a password - one is always
-    auto-generated here and returned so the caller can email it; it is not
-    persisted anywhere in plaintext. Sample: create_user('jsmith', 1, 'jsmith@precisionit.co.in', 7)"""
+def create_user(username, user_type_id, email, created_by=None, password=None):
+    """Create a user (raises if the name exists). Normally a system-
+    generated temporary password is used and returned so the caller can
+    email it. `password`: an admin-assigned password instead of an
+    auto-generated one - used for a Viewer account, which is set up
+    directly by a Super Admin rather than through the email-a-temp-
+    password flow (see api_create_user). Whichever password was actually
+    used is returned; it is not persisted anywhere in plaintext.
+    Sample: create_user('jsmith', 1, 'jsmith@precisionit.co.in', 7)"""
     init_user_table()
     ensure_menu_schema()
-    temp_password = generate_temp_password()
+    temp_password = password or generate_temp_password()
+    # An admin-assigned password (Viewer accounts) is meant to be the
+    # persistent credential the admin just chose, not a placeholder - don't
+    # force a change on first login the way the emailed-temp-password flow
+    # does.
+    must_change = password is None
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "EXEC dbo.usp_CreateUser ?, ?, ?, ?, ?",
+            "EXEC dbo.usp_CreateUser ?, ?, ?, ?, ?, ?",
             username, user_type_id, hash_password(temp_password), email, created_by,
+            1 if must_change else 0,
         )
         row = cur.fetchone()
         conn.commit()

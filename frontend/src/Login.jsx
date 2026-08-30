@@ -46,7 +46,9 @@ export default function Login({ onSuccess, onForgot, onDbError }) {
           <Logo size={40} />
           <div className="auth-brand">PIIPS</div>
         </div>
-        <div className="auth-sub">Precision Intelligent Invoice Processing Suite</div>
+        <div className="auth-sub">
+          Precision Intelligent Invoice Processing Suite{appVersion ? ` v${appVersion}` : ""}
+        </div>
 
         <div className="field">
           <label className="label">User Name</label>
@@ -80,8 +82,6 @@ export default function Login({ onSuccess, onForgot, onDbError }) {
 
         <div className="hint" style={{ textAlign: "center", marginTop: 20 }}>
           © 2026 Precision Techserve Madras Pvt. Ltd. All Rights Reserved.
-          <br /><br />
-          Precision Intelligent Invoice Processing Suite (PIIPS){appVersion ? ` v${appVersion}` : ""}
         </div>
       </form>
     </div>
