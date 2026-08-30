@@ -545,30 +545,49 @@ def _line_missing_fields(line, mapping=None):
 
 
 def missing_required_fields(header, lines, reservations=None, mapping=None):
-    """Names of mandatory Purchase Header/Line/Reservation Entry columns
-    that are empty/null for this invoice (the header row, every line item
-    row, and every reservation row) AND actually meant to be filled from
-    somewhere (PDF/Service First/a real configured Template value/System)
-    - a field whose only possible source is an unset Template value (see
-    _is_none_source) is expected to be blank and never counts here. An
-    empty list means the invoice is complete. `reservations` defaults to
-    none checked — invoices with no reservation rows at all (e.g. NON-GRN,
-    which never syncs with Service First) aren't penalized for having
-    none. `mapping` is the field mapping (load_mapping()'s result);
-    loaded fresh if not passed in."""
+    """{"field", "sheet", "source"} dicts, one per mandatory Purchase
+    Header/Line/Reservation Entry column that's empty/null for this
+    invoice (the header row, every line item row, and every reservation
+    row) AND actually meant to be filled from somewhere (PDF/Service
+    First/a real configured Template value/System) - a field whose only
+    possible source is an unset Template value (see _is_none_source) is
+    expected to be blank and never counts here. `sheet` disambiguates a
+    name that exists on more than one sheet (e.g. "Location Code" is both
+    a header and a line column); `source` (via field_source()) is what
+    lets a caller tell "the PDF itself should have stated this" apart from
+    "Service First failed to supply it" (see processor.py's NEW TEMPLATE
+    vs DATA MISMATCH routing - a missing PDF-sourced field means the
+    extraction/template itself likely needs work, not just a one-off data
+    gap). An empty list means the invoice is complete. `reservations`
+    defaults to none checked — invoices with no reservation rows at all
+    (e.g. NON-GRN, which never syncs with Service First) aren't penalized
+    for having none. `mapping` is the field mapping (load_mapping()'s
+    result); loaded fresh if not passed in."""
     mapping = mapping if mapping is not None else load_mapping()
-    missing = {
-        f for f in REQUIRED_HEADER_FIELDS
-        if _is_blank(header.get(f)) and not _is_none_source("Purchase Header", f, mapping)
-    }
+    found = []
+    for f in REQUIRED_HEADER_FIELDS:
+        if _is_blank(header.get(f)) and not _is_none_source("Purchase Header", f, mapping):
+            found.append({"field": f, "sheet": "Purchase Header",
+                          "source": field_source("Purchase Header", f, mapping)})
     for line in lines:
-        missing.update(_line_missing_fields(line, mapping))
+        for f in _line_missing_fields(line, mapping):
+            found.append({"field": f, "sheet": "Purchase Line",
+                          "source": field_source("Purchase Line", f, mapping)})
     for res in (reservations or []):
-        missing.update(
-            f for f in REQUIRED_RESERVATION_FIELDS
-            if _is_blank(res.get(f)) and not _is_none_source("Reservation Entry", f, mapping)
-        )
-    return sorted(missing)
+        for f in REQUIRED_RESERVATION_FIELDS:
+            if _is_blank(res.get(f)) and not _is_none_source("Reservation Entry", f, mapping):
+                found.append({"field": f, "sheet": "Reservation Entry",
+                              "source": field_source("Reservation Entry", f, mapping)})
+    seen = set()
+    result = []
+    for item in found:
+        key = (item["sheet"], item["field"])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    result.sort(key=lambda d: d["field"])
+    return result
 
 
 # ---------------------------------------------------------------------------

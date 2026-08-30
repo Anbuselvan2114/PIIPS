@@ -116,6 +116,65 @@ sub-versions.
   screen and to the bottom of every page once logged in (pinned level with
   the sidebar's Logout button).
 
+### Viewer role
+
+- Added a fully read-only "Viewer" role. It sees the same invoice-
+  processing screens as everyone else (Dashboard, File Explorer, Buyer
+  Order Entry, Part Description Mapping, Load, Post, Complete) with every
+  mutating action blocked (server-side too, not just hidden in the UI),
+  but does not see the Manual screen or any Setup/Mapping/Admin screen
+  (Folder/Database/API Configuration, Template, Create Field, Field
+  Mapping, Model Training, User Management, Mail Server Setting,
+  Announcement, Publish) - those configure the app itself, not data.
+- A Viewer account is set up differently from every other role: a Super
+  Admin assigns its username and password directly (no email required, no
+  auto-generated temp password, no forced change on first login - the
+  chosen password is meant to be the permanent one), instead of the normal
+  emailed-temp-password flow. Its password isn't held to the usual
+  complexity policy either, since it's an admin-assigned internal
+  credential (e.g. matching an employee code) rather than a self-service
+  one.
+- Activating or deactivating a Viewer account sends no email (there's
+  usually no email on file for one, and no self-service flow that would
+  need notifying); an Admin/Super-Admin-triggered password change for any
+  account, Viewer included, still emails the new credentials as before.
+- Every outbound email now shows which environment sent it ("Local
+  (test)" / "UAT" / "Live") in its footer, read from web.config's own
+  `environment` <appSettings> key (`config_store.current_environment()`,
+  defaulting to "Local (test)" when absent - the normal case for a
+  developer's own machine). `deploy.py`'s publish step now tags the
+  staged web.config it copies to `<published_root>/<environment>` with
+  the right value automatically.
+- Moved "Load" from the Accounts nav group into "Buyer Order Entry" and
+  "Part Description Mapping"'s group, which was also renamed from
+  "Review" to "Review & Update" to describe all three together.
+
+### Business rules
+
+- A mandatory field whose source is the PDF itself (not Service First,
+  System, or a Template value) being missing now routes an invoice to
+  NEW TEMPLATE instead of DATA MISMATCH, and copies it into New_Format
+  for retraining - e.g. Quantity, Direct Unit Cost, or Line Amount not
+  being read off the PDF signals the extraction/template needs work, not
+  a one-off data gap. A missing Service-First-sourced field (like `No.`,
+  when SF simply doesn't recognize the part) still correctly stays
+  DATA MISMATCH. `excel_export.missing_required_fields()` now reports
+  each missing field's sheet and source so the two cases can be told
+  apart; verified against the full trained-format set with no new false
+  positives.
+
+### Viewer role - closing the remaining write endpoints
+
+- Two mutating endpoints were reachable by a Viewer despite the role
+  being meant as fully read-only: `POST /api/input/upload` (File
+  Explorer's "Upload PDFs" button) and `POST /api/part-description-
+  update/save` (Part Description Mapping's "Update" button) had no
+  `_require_not_viewer` check. Both now block a Viewer with the same
+  403 every other write endpoint already returns. Dashboard's Start,
+  Buyer Order Entry's Save, and Load/Post/Complete's advance and reject
+  actions were already correctly blocked - only these two were missed
+  when the role was first added.
+
 ---
 
 ## 2.1 — Initial release (retrospective summary)

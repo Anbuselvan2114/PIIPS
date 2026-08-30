@@ -8,7 +8,7 @@ import { DataTable, PdfModal } from "./components";
 // - lets a user see what SF actually has on file (PartNo/PartSpecification/
 // Nav_Part_Description/pricing) for a PO's parts, side by side, without
 // leaving PIIPS.
-export default function PartDescriptionUpdate() {
+export default function PartDescriptionUpdate({ user }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -113,7 +113,7 @@ export default function PartDescriptionUpdate() {
     }
     setSaving(key); setError(null); setMsg(null);
     try {
-      await savePartDescription(row.PartNoMapID, description);
+      await savePartDescription(row.PartNoMapID, description, user?.user_id);
       lastValidRef.current[key] = description;
       setMsg(`Updated Service First's description for the part no ${row.PartNo || "this part"}.`);
     } catch (e) {

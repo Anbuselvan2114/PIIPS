@@ -66,6 +66,19 @@ def webconfig_get(key):
     return ""
 
 
+def current_environment():
+    """'Local (test)' / 'UAT' / 'Live' - which deployment this running
+    instance is, read from web.config's own <appSettings> "environment"
+    key. Every outbound email (mailer.py) shows this so a recipient can
+    tell at a glance which environment sent it - important since the same
+    codebase runs on all three. Defaults to "Local (test)" when the key is
+    absent, which is the normal case for a developer's own machine (no
+    web.config-driven IIS hosting there) - a UAT/Live web.config sets this
+    explicitly (<add key="environment" value="UAT" /> / "Live") as part of
+    that server's one-time setup."""
+    return webconfig_get("environment") or "Local (test)"
+
+
 def webconfig_set(key, value):
     """Set an <appSettings> value in web.config, preserving the rest."""
     if not os.path.exists(WEBCONFIG_FILE):
