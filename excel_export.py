@@ -271,6 +271,14 @@ def _row(inv, item, sheet, smap, cols):
     for c in cols:
         ov = _link_override(sheet, c, inv, item)
         row[c] = ov if ov is not None else _cell_value(inv, item, sheet, smap, c)
+    if sheet == "Purchase Line" and item is not None:
+        # The PDF's own raw HSN reading, kept alongside the mapped
+        # "HSN/SAC Code" (which Service First may have since blanked - see
+        # _line_missing_fields) purely so the mandatory-field gate can tell
+        # "SF failed to confirm an HSN the PDF actually had" apart from
+        # "neither the PDF nor SF ever had one" - not itself a real column,
+        # never written to the database.
+        row["_pdf_hsn"] = str(item.get("hsn") or "")
     return row
 
 
@@ -381,14 +389,16 @@ REQUIRED_LINE_FIELDS = [
     "GST Group Code", "GST Group Type", "GST Base Amount",
 ]
 
-# Purchase Line "No." (Nav Item No.) is mandatory only for an "Item" line —
-# it must resolve a Nav Item No. from Service First. A "Charge (Item)" line
-# (freight/courier — never looked up in SF) has no Nav Item No. at all, and
-# its HSN/SAC Code isn't mandatory either: many vendors simply don't print
-# one on a freight/courier line, so requiring it would block otherwise-
-# complete invoices over data that was never on the PDF to begin with.
+# Purchase Line "No." (Nav Item No.) and "HSN/SAC Code" are mandatory only
+# for an "Item" line: "No." must resolve a Nav Item No. from Service First,
+# and a genuine part always has an HSN classification (the PDF itself
+# states one). A "Charge (Item)" line (freight/courier — never looked up in
+# SF) has no Nav Item No. at all, and its HSN/SAC Code stays optional: many
+# vendors simply don't print one on a freight/courier line, so requiring it
+# would block otherwise-complete invoices over data that was never on the
+# PDF to begin with.
 _LINE_TYPE_REQUIRED_FIELD = {
-    "Item": "No.",
+    "Item": ["No.", "HSN/SAC Code"],
 }
 
 # Source Ref. No. (Reservation Entry) is deliberately NOT in this list: it's
@@ -493,13 +503,14 @@ def field_source(sheet, col, mapping=None):
 
 
 def required_fields_for_line_type(line_type):
-    """REQUIRED_LINE_FIELDS plus the Type-conditional field ("No." for an
-    Item line, "HSN/SAC Code" for a Charge (Item) line), for a given line's
-    Type value. Used by both the mandatory-field gate and the Dashboard's
-    per-invoice Fields drill-down, so they always agree on what's required.
+    """REQUIRED_LINE_FIELDS plus the Type-conditional fields ("No." and
+    "HSN/SAC Code" for an Item line; neither for a Charge (Item) line), for
+    a given line's Type value. Used by both the mandatory-field gate and
+    the Dashboard's per-invoice Fields drill-down, so they always agree on
+    what's required.
     Sample: required_fields_for_line_type('Item')"""
-    extra = _LINE_TYPE_REQUIRED_FIELD.get((line_type or "").strip())
-    return REQUIRED_LINE_FIELDS + [extra] if extra else REQUIRED_LINE_FIELDS
+    extra = _LINE_TYPE_REQUIRED_FIELD.get((line_type or "").strip(), [])
+    return REQUIRED_LINE_FIELDS + extra
 
 
 def _is_none_source(sheet, col, mapping):
@@ -515,10 +526,22 @@ def _is_none_source(sheet, col, mapping):
 
 
 def _line_missing_fields(line, mapping=None):
-    return {
-        f for f in required_fields_for_line_type(line.get("Type"))
-        if _is_blank(line.get(f)) and not _is_none_source("Purchase Line", f, mapping)
-    }
+    missing = set()
+    for f in required_fields_for_line_type(line.get("Type")):
+        if not _is_blank(line.get(f)):
+            continue
+        if _is_none_source("Purchase Line", f, mapping):
+            continue
+        # HSN/SAC Code on a part (Item) line only counts as missing when
+        # the PDF itself actually had one that Service First failed to
+        # confirm (see database.get_invoice_field_check's with_hsn_fields,
+        # which applies the identical rule to the Fields popup) - if the
+        # PDF never printed one either, there was nothing for SF to
+        # confirm in the first place, so it's not a real data problem.
+        if f == "HSN/SAC Code" and _is_blank(line.get("_pdf_hsn")):
+            continue
+        missing.add(f)
+    return missing
 
 
 def missing_required_fields(header, lines, reservations=None, mapping=None):
