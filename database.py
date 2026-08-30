@@ -1900,12 +1900,9 @@ def get_invoice_field_check(header_id):
             # against what Service First actually calls them.
             source = "Service First" if ln.get("Type") == "Item" else "PDF"
             product_no = str(ln.get("HSN/SAC Code") or "")
-            hsn_type = str(ln.get("GST Group Type") or "")
             extra = [
-                {"field": "ProductNo", "value": product_no,
+                {"field": "HSN Number", "value": product_no,
                  "missing": not product_no.strip(), "source": source},
-                {"field": "HSN_Type", "value": hsn_type,
-                 "missing": not hsn_type.strip(), "source": source},
             ]
             idx = next((i for i, f in enumerate(rows) if f["field"] == "No."), None)
             if idx is None:

@@ -50,6 +50,8 @@ async function request(path, options = {}) {
   return res.json();
 }
 
+export const getVersion = () => request("/api/version");
+
 export const getConfig = () => request("/api/config");
 
 export const saveConfig = (folderPath) =>

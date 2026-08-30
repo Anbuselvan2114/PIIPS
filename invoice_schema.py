@@ -131,7 +131,7 @@ def _normalize_date(value):
 
 # Fallback when no usable payment-terms days can be resolved from either
 # Service First or the PDF.
-DEFAULT_PAYMENT_TERMS_DAYS = 45
+DEFAULT_PAYMENT_TERMS_DAYS = 30
 
 _ADVANCE_TERMS_RE = re.compile(r"100\s*%\s*advance", re.IGNORECASE)
 _DAYS_RE = re.compile(r"(\d+)\s*days?", re.IGNORECASE)
