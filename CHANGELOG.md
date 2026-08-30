@@ -174,6 +174,18 @@ sub-versions.
   Buyer Order Entry's Save, and Load/Post/Complete's advance and reject
   actions were already correctly blocked - only these two were missed
   when the role was first added.
+- The default "PBV0030" Viewer account is now seeded automatically on
+  every app startup (`database.ensure_default_viewer()`, called
+  alongside `ensure_default_super_admin()`), the same always-available
+  way "Sadmin" already was. Publish only ever copies code - Local, UAT,
+  and Live each have their own separate database, so a user account
+  created by hand on one was never going to appear on the others; this
+  makes PBV0030 exist everywhere the same way Sadmin already did,
+  without a manual re-creation step per environment. Its seeded default
+  password is `PIIPS@2026` (was the username itself); Forgot Password
+  now works for it too, once it has an email on file to send a new
+  temporary password to (it had none before, by design, since normal
+  Viewer setup skips email entirely).
 
 ---
 

@@ -56,6 +56,7 @@ def _bootstrap_menu_storage():
             database.migrate_template_invoice_type()
             database.init_mail_settings_table()
             database.ensure_default_super_admin()
+            database.ensure_default_viewer()
     except Exception:  # noqa: BLE001 - never block startup on DB issues
         traceback.print_exc()
 
