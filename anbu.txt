@@ -1,6 +1,10 @@
 --UAT
     --Move files
+        --max 
         robocopy "D:\WorkSpace\Projects\Python\PIIPS" "\\10.0.1.210\E$\PIIPS_Application" /E /Z /R:3 /W:5 /PURGE /XD "venv" "__pycache__" ".git" "logs" ".claude" /XF "config.json"
+        --minimum
+        robocopy "D:\WorkSpace\Projects\Python\PIIPS" "\\10.0.1.210\E$\PIIPS_Application" /E /Z /R:3 /W:5 /PURGE /XD "venv" ".venv" "__pycache__" ".git" ".claude" "node_modules" "logs" "output" "New_Format" "model_backups" "old" "announcement_media" /XF "config.json" "PIIPS.sql" "*.log" "*.pyc"
+
     --- installing dependency
         Set-Location "E:\PIIPS_Application"; (Get-Content ".\requirements.txt") | ForEach-Object { if ($_ -match '^opencv-python==') { 'opencv-python==4.6.0.66' } elseif ($_ -match '^opencv-python-headless==') { $null } else { $_ } } | Set-Content ".\requirements.txt"; & ".\venv\Scripts\python.exe" -m pip install -r ".\requirements.txt"
         Get-OdbcDriver | Where-Object Name -like "*ODBC Driver 17*" 
