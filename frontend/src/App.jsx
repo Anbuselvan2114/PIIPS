@@ -314,7 +314,12 @@ export default function App() {
             </select>
           </label>
         </header>
-        <div className="content">{Active ? <Active user={user} /> : null}</div>
+        <div className="content" style={{ flex: 1 }}>{Active ? <Active user={user} /> : null}</div>
+        <div className="hint" style={{ textAlign: "center", padding: "14px 28px",
+                                        borderTop: "1px solid var(--border)", whiteSpace: "nowrap" }}>
+          © 2026 Precision Techserve Madras Pvt. Ltd. All Rights Reserved. —
+          Precision Intelligent Invoice Processing Suite (PIIPS){appVersion ? ` v${appVersion}` : ""}
+        </div>
       </div>
     </div>
   );

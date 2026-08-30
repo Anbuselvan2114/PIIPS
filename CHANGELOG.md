@@ -79,8 +79,10 @@ sub-versions.
   columns wrap to fit on one screen.
 - The Fields drill-down popup (Dashboard → DATA MISMATCH → Fields) no
   longer shows an "HSN_Type" row (redundant with the row directly above
-  it); the field previously labeled "ProductNo" is now labeled
-  "HSN Number" for clarity.
+  it); the field previously labeled "ProductNo" is now shown as
+  "HSN/SAC Code", matching the actual saved column name; and it now also
+  shows "Buyer Order No" in the Purchase Header section (previously only
+  visible elsewhere in the app, not in this popup).
 
 ### Business rules
 
@@ -88,6 +90,18 @@ sub-versions.
   itself states a usable payment-terms value, changed from 45 days to
   30 days — affects both the Payment Terms Code shown on the invoice and
   the Due Date computed from it in that fallback case.
+- HSN/SAC Code is now conditionally mandatory for an "Item" (part) line —
+  missing exactly when the PDF itself had an HSN that Service First failed
+  to confirm; if the PDF never printed one either, there was nothing for
+  SF to confirm in the first place and it's not flagged. Stays fully
+  optional for a "Charge (Item)" (freight/courier) line, since many
+  vendors never print one on those. Source of truth is unchanged for
+  either line type: a part's HSN still only ever comes from Service First
+  (left blank when SF can't confirm the part, by design), a charge's HSN
+  still comes from the PDF (SF is never queried for charges at all). Also
+  fixed a duplicate this requirement briefly introduced: "HSN/SAC Code"
+  was showing up as two separate rows in the Fields popup for the same
+  value — now shown once.
 
 ### Other
 
@@ -97,9 +111,10 @@ sub-versions.
 - The app version now shows in the sidebar, next to "Invoice Processing
   Suite" — fetched from a new `/api/version` endpoint so it can never
   drift out of sync with the backend's own version string.
-- Added a copyright footer to the Login screen: "© 2026 Precision
-  Techserve Madras Pvt. Ltd. All Rights Reserved." plus the app name and
-  version.
+- Added a copyright footer — "© 2026 Precision Techserve Madras Pvt. Ltd.
+  All Rights Reserved." plus the app name and version — to the Login
+  screen and to the bottom of every page once logged in (pinned level with
+  the sidebar's Logout button).
 
 ---
 

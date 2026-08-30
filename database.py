@@ -1816,6 +1816,18 @@ def get_invoice_field_check(header_id):
             if row:
                 header_values = dict(zip(header_cols, row))
 
+        # Buyer Order No lives on the tracker, not tbl_Purchase_Header
+        # itself (it drives matching/reprocessing, not an exported column) -
+        # shown here purely for visibility, not part of REQUIRED_HEADER_FIELDS
+        # (its own absence is handled by the separate "BUYER ORDER NO
+        # DOESN'T EXIST" status/workflow, not this mandatory-field check).
+        cur.execute(
+            "SELECT BuyerOrderNo FROM dbo.tbl_Purchase_Tracker WHERE Purchase_Header_ID = ?",
+            header_id,
+        )
+        tracker_row = cur.fetchone()
+        buyer_order_no = (tracker_row[0] if tracker_row else "") or ""
+
         # "No." and "HSN/SAC Code" are only mandatory conditionally (on the
         # line's own Type — see excel_export.required_fields_for_line_type),
         # so always fetch both and pick the right one per line below.
@@ -1840,6 +1852,13 @@ def get_invoice_field_check(header_id):
         # Description for comparison - not a mandatory field, just extra
         # context for why SF's description didn't match.
         nav_part_desc_by_desc = {}
+        # The PDF's own raw HSN reading (before Service First's GetHSNDetails
+        # match either confirms it or blanks it - see service_api._hsn_lookup_
+        # items) is never saved as a Purchase Line column, only kept in this
+        # same source JSON under "hsn" - needed below so a genuinely blank
+        # PDF HSN (nothing to confirm in the first place) isn't flagged as
+        # "missing" the same way a PDF HSN that SF failed to confirm is.
+        pdf_hsn_by_desc = {}
         cur.execute(
             "SELECT SourceJson FROM dbo.tbl_Purchase_Tracker WITH (NOLOCK) "
             "WHERE Purchase_Header_ID = ?", header_id,
@@ -1854,6 +1873,7 @@ def get_invoice_field_check(header_id):
                     key = str(item.get("Description") or "").strip().lower()
                     if key:
                         nav_part_desc_by_desc[key] = str(item.get("Nav_Part_Description") or "")
+                        pdf_hsn_by_desc[key] = str(item.get("hsn") or "")
             except (OSError, json.JSONDecodeError):
                 pass
 
@@ -1900,9 +1920,20 @@ def get_invoice_field_check(header_id):
             # against what Service First actually calls them.
             source = "Service First" if ln.get("Type") == "Item" else "PDF"
             product_no = str(ln.get("HSN/SAC Code") or "")
+            missing = not product_no.strip()
+            # For a part (Item line), a blank result only counts as
+            # "missing" when the PDF itself actually had an HSN that SF
+            # failed to confirm - if the PDF never printed one either,
+            # there was nothing for SF to confirm in the first place, so
+            # it's not a real data problem (Charge lines never touch this:
+            # their HSN already comes straight from the PDF, so a blank
+            # value there always means the PDF genuinely had none).
+            if missing and ln.get("Type") == "Item":
+                desc_key = str(ln.get("Description") or "").strip().lower()
+                missing = bool(pdf_hsn_by_desc.get(desc_key, "").strip())
             extra = [
-                {"field": "HSN Number", "value": product_no,
-                 "missing": not product_no.strip(), "source": source},
+                {"field": "HSN/SAC Code", "value": product_no,
+                 "missing": missing, "source": source},
             ]
             idx = next((i for i, f in enumerate(rows) if f["field"] == "No."), None)
             if idx is None:
@@ -1926,13 +1957,35 @@ def get_invoice_field_check(header_id):
                 if "Source Subtype" in rr:
                     rr["Source Subtype"] = "1"
 
+        header_rows_out = field_rows("Purchase Header", header_wanted, header_values)
+        buyer_order_row = {
+            "field": "Buyer Order No", "value": buyer_order_no,
+            "missing": not buyer_order_no.strip(), "source": "PDF",
+        }
+        # Shown right before InvoiceNo (REQUIRED_HEADER_FIELDS' own last
+        # entry) so the two invoice-identifying fields sit together.
+        invoiceno_idx = next(
+            (i for i, r in enumerate(header_rows_out) if r["field"] == "InvoiceNo"), None)
+        header_rows_out = (
+            header_rows_out[:invoiceno_idx] + [buyer_order_row] + header_rows_out[invoiceno_idx:]
+            if invoiceno_idx is not None else header_rows_out + [buyer_order_row]
+        )
+
         return {
-            "header": field_rows("Purchase Header", header_wanted, header_values),
+            "header": header_rows_out,
             "lines": [
                 {"label": ln.get("Description", "") or f"Line {i + 1}",
+                 # "HSN/SAC Code" is excluded here even though it's part of
+                 # required_fields_for_line_type (needed there for the
+                 # mandatory-field gate) - with_hsn_fields below already
+                 # adds this exact same column itself (with the missing-
+                 # ness rule refined for a part's PDF-vs-SF comparison), so
+                 # including it here too would show the value twice.
                  "fields": with_hsn_fields(ln, with_nav_part_description(ln, field_rows(
                      "Purchase Line",
-                     excel_export.required_fields_for_line_type(ln.get("Type")), ln)))}
+                     [f for f in excel_export.required_fields_for_line_type(ln.get("Type"))
+                      if f != "HSN/SAC Code"],
+                     ln)))}
                 for i, ln in enumerate(line_rows)
             ],
             "reservations": [
