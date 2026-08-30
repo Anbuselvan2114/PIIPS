@@ -20,7 +20,7 @@ ACCEPTED_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".web
 
 app = FastAPI(
     title="Precision Intelligent Invoice Processing Suite",
-    version="2.1"
+    version="2.2"
 )
 
 
@@ -700,6 +700,10 @@ def invoices_buyer_order_missing():
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+def _norm_desc(text):
+    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+
 @app.get("/api/part-description-update/items")
 def part_description_update_items():
     """Service First's own purchase-line records (SpareRequestID, PartNo,
@@ -709,18 +713,31 @@ def part_description_update_items():
     Each row also carries PdfInvoices (PIIPS's own InvoiceNo/FileName for
     that PO - Purchase Details column) and PdfDescriptions (the invoice's
     own Purchase Line Description text(s) for that PO - the screen's
-    autocomplete when typing a corrected SF description)."""
+    autocomplete when typing a corrected SF description).
+
+    A row is dropped when its own Nav_Part_Description already matches one
+    of the PDF's own descriptions (whitespace/case-insensitive) - this
+    screen exists to resolve a PDF/SF description MISMATCH specifically,
+    so a part whose description already lines up isn't shown just because
+    its PO's overall status happens to be DATA MISMATCH for some unrelated
+    reason (a missing field elsewhere, another part on the same PO, etc.)."""
     import database
     import service_api
     try:
         order_nos = database.buyer_order_nos_for_status("DATA MISMATCH")
         items = service_api.get_specification_mismatch_records(order_nos)
         details_by_po = database.invoice_details_by_buyer_order(order_nos, "DATA MISMATCH")
+        result = []
         for item in items:
             details = details_by_po.get(item.get("PurchaseOrderNo"), {})
+            pdf_descriptions = details.get("descriptions", [])
             item["PdfInvoices"] = details.get("invoices", [])
-            item["PdfDescriptions"] = details.get("descriptions", [])
-        return {"items": items}
+            item["PdfDescriptions"] = pdf_descriptions
+            nav_desc = _norm_desc(item.get("Nav_Part_Description"))
+            if nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
+                continue
+            result.append(item)
+        return {"items": result}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
