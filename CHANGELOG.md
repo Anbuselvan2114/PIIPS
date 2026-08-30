@@ -77,12 +77,29 @@ sub-versions.
 - The Status Breakdown popup's invoice list no longer forces horizontal
   scroll — Invoice No., File, Vendor, Invoice Type, Status, and Batch
   columns wrap to fit on one screen.
+- The Fields drill-down popup (Dashboard → DATA MISMATCH → Fields) no
+  longer shows an "HSN_Type" row (redundant with the row directly above
+  it); the field previously labeled "ProductNo" is now labeled
+  "HSN Number" for clarity.
+
+### Business rules
+
+- Default payment terms, used only when neither Service First nor the PDF
+  itself states a usable payment-terms value, changed from 45 days to
+  30 days — affects both the Payment Terms Code shown on the invoice and
+  the Due Date computed from it in that fallback case.
 
 ### Other
 
 - Added a per-tab single-tab guard: opening PIIPS in a second tab or
   window shows a blocking screen instead of running two copies at once
   (a convenience, not a security control).
+- The app version now shows in the sidebar, next to "Invoice Processing
+  Suite" — fetched from a new `/api/version` endpoint so it can never
+  drift out of sync with the backend's own version string.
+- Added a copyright footer to the Login screen: "© 2026 Precision
+  Techserve Madras Pvt. Ltd. All Rights Reserved." plus the app name and
+  version.
 
 ---
 

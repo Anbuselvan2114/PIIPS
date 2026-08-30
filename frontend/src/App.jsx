@@ -20,7 +20,7 @@ import MailSettings from "./MailSettings";
 import Announcement from "./Announcement";
 import Manuals from "./Manuals";
 import Publish from "./Publish";
-import { getConfig } from "./api";
+import { getConfig, getVersion } from "./api";
 
 // key, label, icon, nav group
 const MENU = [
@@ -114,6 +114,13 @@ export default function App() {
       // everyone regardless - fail open to the normal Login screen rather
       // than get stuck showing nothing.
       .catch(() => setDbConfigured(true));
+  }, []);
+
+  // Shown in the sidebar footer - fetched rather than hardcoded so it
+  // never drifts out of sync with app.py's own `version=`.
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    getVersion().then((v) => setAppVersion(v.version)).catch(() => {});
   }, []);
 
   // Single-tab guard: a casual convenience, not real security - a private
@@ -255,7 +262,12 @@ export default function App() {
           <span className="brand-mark"><Logo size={34} /></span>
           <div className="brand-text">
             <div className="brand-name">PIIPS</div>
-            <div className="brand-sub">Invoice Processing Suite</div>
+            <div className="brand-sub">
+              Invoice Processing Suite
+              {appVersion && (
+                <span style={{ color: "#fbbf24", fontWeight: 700 }}> · v{appVersion}</span>
+              )}
+            </div>
           </div>
         </div>
 

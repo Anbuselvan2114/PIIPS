@@ -65,6 +65,14 @@ def health():
     return {"status": "Healthy"}
 
 
+@app.get("/api/version")
+def version():
+    """The running app's version - shown in the sidebar footer so the
+    version string only ever needs to change in one place (app.py's own
+    FastAPI `version=`)."""
+    return {"version": app.version}
+
+
 # ==========================================================================
 # Configuration API
 # ==========================================================================

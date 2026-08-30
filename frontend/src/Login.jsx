@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { login } from "./api";
+import { useEffect, useState } from "react";
+import { login, getVersion } from "./api";
 import { Logo, PasswordInput } from "./components";
 
 // `onDbError` (from App.jsx) is called when login fails with a 5xx - a real
@@ -12,6 +12,10 @@ export default function Login({ onSuccess, onForgot, onDbError }) {
   const [error, setError] = useState(null);
   const [pasteBlocked, setPasteBlocked] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    getVersion().then((v) => setAppVersion(v.version)).catch(() => {});
+  }, []);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -72,6 +76,12 @@ export default function Login({ onSuccess, onForgot, onDbError }) {
 
         <div style={{ textAlign: "center", marginTop: 14 }}>
           <button type="button" className="btn-link" onClick={onForgot}>Forgot password?</button>
+        </div>
+
+        <div className="hint" style={{ textAlign: "center", marginTop: 20 }}>
+          © 2026 Precision Techserve Madras Pvt. Ltd. All Rights Reserved.
+          <br /><br />
+          Precision Intelligent Invoice Processing Suite (PIIPS){appVersion ? ` v${appVersion}` : ""}
         </div>
       </form>
     </div>
