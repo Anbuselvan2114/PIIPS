@@ -247,12 +247,19 @@ export default function Dashboard({ user }) {
   const stageLabel = job
     ? `${job.stage || "Processing"}${job.current_file ? ` — ${job.current_file}` : ""} …` : "";
 
+  // Long, unbroken values (file names, batch names, invoice/vendor text
+  // with no spaces to wrap at) would otherwise force the whole table wider
+  // than the modal, triggering .table-wrap's horizontal scroll - wrap them
+  // at any character instead so every column stays on one screen.
+  const wrapCellStyle = { whiteSpace: "normal", overflowWrap: "break-word", maxWidth: 220 };
+
   // clickable invoice-number cell (opens the PDF viewer)
   const invoiceCell = (row) => (
     row.file_name ? (
       <button className="btn-link" onClick={() => setPdfFile(row.file_name)}
               style={{ background: "none", border: "none", padding: 0, color: "var(--primary)",
-                       cursor: "pointer", textDecoration: "underline", font: "inherit" }}>
+                       cursor: "pointer", textDecoration: "underline", font: "inherit",
+                       ...wrapCellStyle }}>
         {row.invoice_no || row.file_name}
       </button>
     ) : (row.invoice_no || "—")
@@ -278,11 +285,16 @@ export default function Dashboard({ user }) {
 
   const invoiceColumns = [
     { key: "invoice_no", label: "Invoice No.", render: invoiceCell },
-    { key: "file_name", label: "File" },
-    { key: "vendor", label: "Vendor" },
-    { key: "invoice_type", label: "Invoice Type" },
-    { key: "status", label: "Status" },
-    { key: "batch", label: "Batch" },
+    { key: "file_name", label: "File",
+      render: (row) => <div style={wrapCellStyle}>{row.file_name ?? "—"}</div> },
+    { key: "vendor", label: "Vendor",
+      render: (row) => <div style={wrapCellStyle}>{row.vendor ?? "—"}</div> },
+    { key: "invoice_type", label: "Invoice Type",
+      render: (row) => <div style={wrapCellStyle}>{row.invoice_type ?? "—"}</div> },
+    { key: "status", label: "Status",
+      render: (row) => <div style={wrapCellStyle}>{row.status ?? "—"}</div> },
+    { key: "batch", label: "Batch",
+      render: (row) => <div style={wrapCellStyle}>{row.batch ?? "—"}</div> },
     { key: "_fields", label: "", sortable: false,
       render: (row) => row.header_id ? (
         <button className="btn btn-subtle btn-sm" onClick={() => openFieldCheck(row)}>
@@ -531,7 +543,7 @@ export default function Dashboard({ user }) {
       </div>
 
       {modal && (
-        <Modal title={modal.title} onClose={() => setModal(null)}>
+        <Modal title={modal.title} onClose={() => setModal(null)} width={1300}>
           {modal.error && <div className="alert alert-danger">{modal.error}</div>}
           {modal.kind === "batch" && modal.status === "EXCLUDED"
             && !modal.loading && modal.rows.some((r) => r.is_excluded) && (
