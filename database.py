@@ -4097,6 +4097,40 @@ def ensure_default_super_admin():
         conn.close()
 
 
+# The default Viewer account, seeded the same always-available way as
+# Sadmin above - so it exists on every environment (Local/UAT/Live each
+# have their own separate database; nothing about a user account travels
+# with a Publish, which only ever copies code) without a Super Admin
+# having to manually recreate it on each one.
+DEFAULT_VIEWER_USERNAME = "PBV0030"
+DEFAULT_VIEWER_PASSWORD = "PIIPS@2026"
+
+
+def ensure_default_viewer():
+    """Seed the default 'PBV0030' Viewer account if it doesn't exist yet.
+    Idempotent. Sample: ensure_default_viewer()"""
+    init_user_table()
+    init_usertype_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM tbl_user WHERE UserName = ?", DEFAULT_VIEWER_USERNAME)
+        if cur.fetchone():
+            return
+        cur.execute("SELECT UserTypeId FROM tbl_UserType WHERE UserTypeName = 'Viewer'")
+        row = cur.fetchone()
+        if not row:
+            return
+        cur.execute(
+            "INSERT INTO tbl_user (UserName, UserTypeID, Password, Email, MustChangePassword, IsActive, CreatedDatetime) "
+            "VALUES (?, ?, ?, NULL, 0, 1, GETDATE())",
+            DEFAULT_VIEWER_USERNAME, row[0], hash_password(DEFAULT_VIEWER_PASSWORD),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Announcements (Super Admin only) - site-wide notices shown to every
 # logged-in user until EndDateTime passes or a Super Admin stops one early.
