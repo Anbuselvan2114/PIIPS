@@ -11,6 +11,133 @@ sub-versions.
 
 ## 2.2 — 2026-08-30
 
+### Security fix — CORS allowed any origin with credentials
+
+- `allow_origins=["*"]` combined with `allow_credentials=True` (app.py)
+  is a spec-disallowed combination - Starlette reflects the Origin
+  header back, letting credentialed cross-site requests reach the whole
+  API. Checked how the frontend actually uses this before fixing it:
+  production is same-origin already (`api.js`'s own comment - the React
+  build is served behind the same IIS site that reverse-proxies to this
+  backend, `API_BASE` defaults to `""`), and no `fetch()` call anywhere
+  in `api.js` ever sets `credentials: "include"` (auth here is a
+  `user_id` in the request body/query, not a cookie/session) - so
+  `allow_credentials=True` was protecting nothing. Now `allow_origins`
+  is an explicit list - the two local Vite dev ports (5173, 3000), live
+  (`https://piips.precisionit.co.in:8010`), and uat
+  (`http://10.0.1.210:8080`) - and `allow_credentials` is `False`,
+  matching actual usage instead of a wildcard that served no real
+  purpose. Verified live: a preflight from each of the four real origins
+  gets a proper `Access-Control-Allow-Origin` back; one from an
+  arbitrary origin gets rejected outright (400, no CORS headers at all);
+  the `Access-Control-Allow-Credentials` header is confirmed absent from
+  every response.
+
+### Security fix — Training screen actions had no server-side authorization
+
+- `DELETE /api/formats` (wipes every trained vendor format), `POST
+  /api/train`, and `POST /api/backups/restore` (silently discards
+  everything learned since the chosen backup) had no authorization check
+  at all - reachable by anyone who could hit the API directly, even
+  though the Training screen these three actions live on is already
+  Super Admin/Developer-only in the frontend's `ROLE_MENUS`. Found during
+  a full-project review; the three unmatched endpoints were the only gap
+  left in an otherwise-covered set (every other privileged endpoint
+  already calls `_require_not_viewer` or stricter).
+  Now all three call `_require_developer` (Super Admin only - the same
+  guard `GET /api/db-config` already uses), matching what the UI already
+  implied rather than adding a new access tier. `RestoreModel` gained a
+  `user_id` field; `train_start`/`clear_formats` take it as a query
+  param, same pattern as `get_db_config`. Frontend: `Training.jsx` didn't
+  even accept the `user` prop App.jsx already passes to every page - now
+  threads `user?.user_id` through Train/Restore; `clearFormats()` has no
+  UI call site today (unused button), so only the backend guard applies
+  there for now.
+  Verified live: all three reject with 403 for an unauthenticated caller
+  and for a Viewer; a Super Admin caller passes the check (confirmed via
+  a safe not-found case on restore, without triggering the real
+  destructive operations against the live model).
+
+### Purchase Invoice No. surfaced on the Post/Complete screens; Dashboard column tweaks
+
+- `_invoice_list` (backs Buyer Order Entry, the Lifecycle pages, and the
+  Dashboard batch drill-down) now also selects `[Purchase Invoice No]`
+  as `purchase_invoice_no`. Post and Complete show it as its own column
+  right after Navision Document No.; the Batch column (not meaningful
+  once an invoice already has a real Document No.) was dropped from
+  those two stages only - Load keeps it. Verified with an isolated
+  LOADED test header: the Post-stage API correctly returns the saved
+  Purchase Invoice No.
+- Dashboard batches table: added a Purchase Invoice Pending status
+  column right after Loaded (`BATCH_STATUS_COLS` in `Dashboard.jsx` -
+  the column gets the same clickable drill-down every other status
+  column already has, no extra code needed).
+
+### New "Purchase Invoice Pending" step between Load and Loaded, and the "Purchase Invoice Mapping" menu
+
+- The Load lifecycle stage's real target status is now **PURCHASE INVOICE
+  PENDING**, not LOADED directly (`app.py`'s `_LIFECYCLE["load"]`) - an
+  invoice only reaches LOADED once its Purchase Invoice No. is mapped.
+  READY TO LOAD itself is unchanged (still the ordinary extraction-complete
+  gate); only what clicking "Mark as Loaded" leads to has changed.
+  New column `[Purchase Invoice No]` on `tbl_Purchase_Header` (user-entered
+  only - nothing else writes it). New menu, Purchase Invoice Mapping
+  (`frontend/src/PurchaseInvoiceMapping.jsx`, modelled on Buyer Order
+  Entry), lists every invoice at PURCHASE INVOICE PENDING with its
+  Navision Document No. (the header's existing `[No.]` column) alongside
+  an editable Purchase Invoice No. field; saving a non-blank value
+  promotes the invoice straight to LOADED via `advance_status` (reused
+  from the Load lifecycle stage itself), so a clashing Document No. on
+  another invoice is still caught and blocks the promotion with a 409 -
+  the Purchase Invoice No. is saved regardless, just not the promotion.
+  Backend: `database.purchase_invoice_mapping_items()` /
+  `set_purchase_invoice_no()`, `GET/POST /api/purchase-invoice-mapping/*`
+  (save blocked for Viewer via `_require_not_viewer`, same as every other
+  mutating endpoint; requires a non-blank value, matching Buyer Order
+  Entry's own validation). Menu sits between Load and Post. Visible to
+  Super Admin/Developer/Admin/User/Viewer (read-only for Viewer); not
+  Accounts, matching Buyer Order Entry's own role scoping. Purchase
+  Invoice Pending is also added to `_BATCH_LOCK_STATUSES` - an invoice
+  sitting there already went through Load, so the batch's Document No.
+  sequence may already be partly committed, same reasoning as LOADED
+  itself.
+  - Verified end-to-end with isolated test data: clicking "Mark as
+    Loaded" (`POST /api/lifecycle/advance`) correctly lands invoices at
+    PURCHASE INVOICE PENDING (not LOADED); they then appear in Purchase
+    Invoice Mapping's list; saving a Purchase Invoice No. promotes to
+    LOADED; a colliding Document No. on a second invoice correctly
+    returns 409 and blocks the promotion while still saving the value;
+    frontend production build passes with no errors.
+  - The Load screen only shows invoices that already have a Navision
+    Document No. minted (that's a pre-existing, unrelated filter -
+    `[No.]` isn't minted until a batch is actually downloaded, see
+    `fetch_batch`/`_assign_document_numbers`) - a batch that's never
+    been downloaded shows nothing on Load, same as before this change.
+
+### New `DisplayOrder` column on `tbl_status` - decouples display order from StatusId
+
+- The Dashboard's "Status breakdown" bar chart (and `usp_StatusCounts`
+  generally) ordered by raw `StatusId`, an IDENTITY permanently frozen at
+  whenever a status was first seeded on a given database - a status added
+  later (like Purchase Invoice Pending, added long after Loaded/Posted
+  already existed on this dev database) could never sort where it
+  logically belongs no matter where it sits in `STATUS_VALUES`. Added a
+  `DisplayOrder INT` column, re-synced from `STATUS_VALUES`' own list
+  order on every startup (both the live `ensure_menu_schema` DDL path and
+  the CLI-only `init_status_table`), so reordering that Python list is
+  now always enough - no StatusId renumbering, ever. `usp_StatusCounts`
+  orders by `ISNULL(DisplayOrder, StatusId)`. `/api/stats/status-counts`
+  (the Dashboard's data source) had its own bug in the same family: it
+  force-pinned INITIATED/UNSUPPORTED (synthetic, folder-based counts -
+  they have no real tracker rows) to the very front of the list
+  regardless of DisplayOrder; now re-inserted at the position they
+  already held in the DisplayOrder-sorted list instead. Verified via
+  `/api/stats/status-counts` after several live reorders (Purchase
+  Invoice Pending between Loaded and Posted; New Template, Duplicate and
+  Unsupported each repositioned ahead of Initiated) - each one landed
+  exactly where `STATUS_VALUES` placed it, including the previously-
+  pinned Initiated/Unsupported.
+
 ### New "MANUALLY UPDATED" status — stale-invoice auto-expiry
 
 - A Data Mismatch, Excluded, or New Template invoice nobody resolves

@@ -7,7 +7,13 @@ import { DataTable, PdfModal, Modal } from "./components";
 // invoices — individually or a whole batch via the batch filter — and advances
 // them to the stage's target status in one action.
 const STAGES = {
-  load:     { title: "Load",     action: "Mark as Loaded",    to: "LOADED" },
+  // Load's real target status is PURCHASE INVOICE PENDING, not LOADED
+  // directly - an invoice only reaches LOADED once its Purchase Invoice
+  // No. is mapped (Purchase Invoice Mapping menu). The button stays
+  // labelled "Mark as Loaded" since that's still what the user is doing
+  // from their own point of view; the actual next-status label the app
+  // shows after clicking comes from the API response (`r.to`), not this.
+  load:     { title: "Load",     action: "Mark as Loaded",    to: "PURCHASE INVOICE PENDING" },
   post:     { title: "Post",     action: "Mark as Posted",    to: "POSTED" },
   complete: { title: "Complete", action: "Mark as Completed", to: "COMPLETED" },
 };
@@ -127,10 +133,14 @@ export default function Lifecycle({ user, stage }) {
     }] : []),
     { key: "navision_doc_no", label: "Navision Document No.",
       render: (row) => row.navision_doc_no || "—" },
+    ...((stage === "post" || stage === "complete") ? [{
+      key: "purchase_invoice_no", label: "Purchase Invoice No",
+      render: (row) => row.purchase_invoice_no || "—",
+    }] : []),
     { key: "file_name", label: "File" },
     { key: "vendor", label: "Vendor" },
     { key: "status", label: "Status" },
-    { key: "batch", label: "Batch" },
+    ...(stage === "load" ? [{ key: "batch", label: "Batch" }] : []),
     { key: "reject_remark", label: "Reject Remark",
       render: (row) => row.reject_remark || "—" },
     ...(stage === "post" && canPostOrReject ? [{
@@ -185,7 +195,7 @@ export default function Lifecycle({ user, stage }) {
 
         {loading ? <div className="empty">Loading…</div> : (
           <DataTable columns={columns} rows={visible.map((r) => ({ ...r, _key: r.header_id }))}
-                     searchKeys={["invoice_no", "navision_doc_no", "file_name", "vendor", "batch", "status"]}
+                     searchKeys={["invoice_no", "navision_doc_no", "purchase_invoice_no", "file_name", "vendor", "batch", "status"]}
                      pageSizeOptions={[10, 20, 30, "all"]}
                      empty="No invoices are eligible for this step." />
         )}

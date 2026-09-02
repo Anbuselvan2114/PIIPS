@@ -11,6 +11,7 @@ import Mapping from "./Mapping";
 import Template from "./Template";
 import UserManagement from "./UserManagement";
 import BuyerOrderEntry from "./BuyerOrderEntry";
+import PurchaseInvoiceMapping from "./PurchaseInvoiceMapping";
 import PartDescriptionUpdate from "./PartDescriptionUpdate";
 import Lifecycle from "./Lifecycle";
 import Login from "./Login";
@@ -30,6 +31,7 @@ const MENU = [
   ["buyerorder", "Buyer Order Entry", "✎", "Review & Update"],
   ["partdescupdate", "Part Description Mapping", "📝", "Review & Update"],
   ["load", "Load", "📥", "Review & Update"],
+  ["purchaseinvoicemapping", "Purchase Invoice Mapping", "🧾", "Review & Update"],
   ["post", "Post", "📮", "Accounts"],
   ["complete", "Complete", "✅", "Accounts"],
   ["configuration", "Folder Configuration", "⚙", "Setup"],
@@ -48,10 +50,14 @@ const MENU = [
 const ROLE_MENUS = {
   "super admin": MENU.map(([k]) => k),
   developer: MENU.map(([k]) => k),   // legacy alias (pre-rename sessions)
-  admin: ["dashboard", "input", "manual", "buyerorder", "load", "post", "complete",
+  admin: ["dashboard", "input", "manual", "buyerorder", "purchaseinvoicemapping",
+          "load", "post", "complete",
           "configuration", "apiconfig", "template", "createfield", "users"],
-  // Users process invoices, fix Buyer Order Nos, and Load them.
-  user: ["dashboard", "input", "manual", "buyerorder", "partdescupdate", "load"],
+  // Users process invoices, fix Buyer Order Nos, Load them (which parks
+  // each at Purchase Invoice Pending), then map Purchase Invoice Nos to
+  // finish moving them to Loaded.
+  user: ["dashboard", "input", "manual", "buyerorder", "partdescupdate",
+         "purchaseinvoicemapping", "load"],
   // Accounts run the downstream Post / Complete steps.
   accounts: ["dashboard", "input", "manual", "post", "complete"],
   // Viewer sees invoice-processing data read-only (every mutating action is
@@ -59,7 +65,7 @@ const ROLE_MENUS = {
   // Setup/Mapping/Admin screens - those configure the app itself rather
   // than show data, and aren't meant for this role.
   viewer: ["dashboard", "input", "buyerorder", "partdescupdate",
-           "load", "post", "complete"],
+           "purchaseinvoicemapping", "load", "post", "complete"],
 };
 
 // Load / Post / Complete are one component parameterised by stage.
@@ -72,6 +78,7 @@ const PAGES = {
   training: Training, createfield: CreateField, mapping: Mapping,
   template: Template, users: UserManagement, dbconfig: DatabaseConfig,
   apiconfig: ApiConfiguration, buyerorder: BuyerOrderEntry,
+  purchaseinvoicemapping: PurchaseInvoiceMapping,
   partdescupdate: PartDescriptionUpdate,
   load: Load, post: Post, complete: Complete, manual: Manuals,
   publish: Publish, mailsettings: MailSettings, announcement: Announcement,

@@ -103,6 +103,15 @@ export const setBuyerOrder = (header_id, buyer_order_no, user_id) =>
     body: JSON.stringify({ header_id, buyer_order_no, user_id }),
   });
 
+export const getPurchaseInvoiceMappingItems = () =>
+  request("/api/purchase-invoice-mapping/items");
+
+export const setPurchaseInvoiceNo = (header_id, purchase_invoice_no, user_id) =>
+  request("/api/purchase-invoice-mapping/save", {
+    method: "POST",
+    body: JSON.stringify({ header_id, purchase_invoice_no, user_id }),
+  });
+
 export const getLifecycleInvoices = (stage) =>
   request(`/api/lifecycle/invoices?stage=${encodeURIComponent(stage)}`);
 
@@ -142,8 +151,8 @@ export const startProcessing = (user_id) =>
     body: JSON.stringify({ user_id }),
   });
 
-export const startTraining = () =>
-  request("/api/train", { method: "POST" });
+export const startTraining = (user_id) =>
+  request(`/api/train${user_id != null ? `?user_id=${user_id}` : ""}`, { method: "POST" });
 
 export const getTrainFiles = () => request("/api/train/files");
 
@@ -311,8 +320,8 @@ export const stopAnnouncement = (announcement_id, user_id) =>
 
 export const announcementImageUrl = (path) => `${API_BASE}/announcement_media/${encodeURIComponent(path)}`;
 
-export const clearFormats = () =>
-  request("/api/formats", { method: "DELETE" });
+export const clearFormats = (user_id) =>
+  request(`/api/formats${user_id != null ? `?user_id=${user_id}` : ""}`, { method: "DELETE" });
 
 const sub = (subpath) =>
   subpath ? `?subpath=${encodeURIComponent(subpath)}` : "";
@@ -371,8 +380,8 @@ export const publishDeploy = (environment, user_id) =>
 
 export const getBackups = () => request("/api/backups");
 
-export const restoreBackup = (name) =>
+export const restoreBackup = (name, user_id) =>
   request("/api/backups/restore", {
     method: "POST",
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, user_id }),
   });

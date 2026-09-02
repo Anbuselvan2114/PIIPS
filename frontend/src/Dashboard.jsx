@@ -350,6 +350,7 @@ export default function Dashboard({ user }) {
     { status: "NEW TEMPLATE", label: "New Template" },
     { status: "READY TO LOAD", label: "Ready to Load" },
     { status: "LOADED", label: "Loaded" },
+    { status: "PURCHASE INVOICE PENDING", label: "Purchase Invoice Pending" },
     { status: "POSTED", label: "Posted" },
     { status: "COMPLETED", label: "Completed" },
   ];

@@ -32,17 +32,23 @@ STALE_STATUS_EXPIRY_DAYS = 10
 
 # Ordered status values for tbl_status.
 STATUS_VALUES = [
-    "INITIATED",
-    "UNSUPPORTED",
+    "NEW TEMPLATE",       # unrecognized-format PDFs, previously untracked entirely
     "DUPLICATE",
+    "UNSUPPORTED",
+    "INITIATED",
     "EXTRACTED",
     "BUYER ORDER NO DOESN'T EXIST",
     "SF PROCESSED",
     "PENDING IN SF",
     "DATA MISMATCH",      # renamed from "INCOMPLETE DATA" - see migration below
-    "NEW TEMPLATE",       # unrecognized-format PDFs, previously untracked entirely
     "READY TO LOAD",
     "LOADED",
+    "PURCHASE INVOICE PENDING",  # the Load lifecycle stage's real target
+                                  # now (see app.py's _LIFECYCLE["load"]) -
+                                  # a Purchase Invoice No. isn't mapped yet.
+                                  # See purchase_invoice_mapping_items/
+                                  # set_purchase_invoice_no, which promotes
+                                  # this to LOADED once one is entered.
     "POSTED",
     "COMPLETED",
     "EXCLUDED",
@@ -66,6 +72,14 @@ INVOICE_TYPE_VALUES = ["PART", "SERVICE"]
 # VALUES(...) list for seeding tbl_status (single quotes escaped).
 _STATUS_SEED_VALUES = ", ".join(
     "('" + v.replace("'", "''") + "')" for v in STATUS_VALUES
+)
+
+# (StatusName, position) pairs for syncing tbl_status.DisplayOrder to
+# STATUS_VALUES' own order on every startup - see the DisplayOrder DDL
+# step below (decouples display order from StatusId, an IDENTITY frozen
+# at whenever a status was first seeded on a given database).
+_STATUS_DISPLAY_ORDER_VALUES = ", ".join(
+    "('" + v.replace("'", "''") + f"', {i})" for i, v in enumerate(STATUS_VALUES)
 )
 
 # VALUES(...) list for seeding tbl_InvoiceType (single quotes escaped).
@@ -783,10 +797,15 @@ def reprocess_reworkable_header(existing_header_id, new_header_id):
 # Any invoice reaching one of these means the batch's Document No.
 # sequence may already be partly committed (Loaded into Navision, or
 # deliberately dropped) - see _batch_status_and_lock/batch_is_locked.
+# Purchase Invoice Pending is included here too - the Load lifecycle
+# button's real target status now (see app.py's _LIFECYCLE["load"]), so
+# an invoice sitting there already went through Load; it just isn't
+# LOADED yet because its Purchase Invoice No. hasn't been mapped.
 # Excluded is deliberately NOT here: it's ignored entirely (see
 # _BATCH_IGNORED_STATUSES) and never locks the batch on its own - the
 # batch's lock state is always driven by its currently-included invoices.
-_BATCH_LOCK_STATUSES = ("LOADED", "POSTED", "COMPLETED", "REJECTED BY ACCOUNTS")
+_BATCH_LOCK_STATUSES = ("LOADED", "PURCHASE INVOICE PENDING", "POSTED",
+                         "COMPLETED", "REJECTED BY ACCOUNTS")
 
 
 # Statuses ignored entirely when deciding whether a batch is "cleared" (see
@@ -1635,6 +1654,7 @@ def _invoice_list(where_sql, params):
         gst = "h.[Vendor GST Reg. No.]" if _hdr_col(cur, "Vendor GST Reg. No.") else "CAST(NULL AS NVARCHAR(50))"
         ddate = "h.[Document Date]" if _hdr_col(cur, "Document Date") else "CAST(NULL AS NVARCHAR(50))"
         docno = "h.[No.]" if _hdr_col(cur, "No.") else "CAST(NULL AS NVARCHAR(50))"
+        pino = "h.[Purchase Invoice No]" if _hdr_col(cur, "Purchase Invoice No") else "CAST(NULL AS NVARCHAR(200))"
         # NOLOCK: pure display (Dashboard pop-ups, Lifecycle page listings) -
         # never gates a write decision itself (advance_status/lifecycle_advance
         # re-check fresh data at submit time), so a dirty/stale read here is
@@ -1642,7 +1662,7 @@ def _invoice_list(where_sql, params):
         sql = (
             "SELECT h.Id, h.InvoiceNo, pt.BatchName, pt.FileName, pt.TemplateFormat, "
             "s.StatusName, pt.IsActive, pt.IsSynced, ISNULL(pt.IsExcluded, 0), "
-            f"{vendor}, {gst}, {ddate}, pt.Id, pt.SourceJson, {docno}, pt.RejectRemark "
+            f"{vendor}, {gst}, {ddate}, pt.Id, pt.SourceJson, {docno}, pt.RejectRemark, {pino} "
             "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
             "JOIN dbo.tbl_Purchase_Header h WITH (NOLOCK) ON h.Id = pt.Purchase_Header_ID "
             "LEFT JOIN dbo.tbl_status s WITH (NOLOCK) ON s.StatusId = pt.StatusID "
@@ -1663,6 +1683,7 @@ def _invoice_list(where_sql, params):
                 "invoice_type": _invoice_type_from_source_json(r[13]),
                 "navision_doc_no": r[14] or "",
                 "reject_remark": r[15] or "",
+                "purchase_invoice_no": r[16] or "",
             })
         return out
     finally:
@@ -1707,6 +1728,74 @@ def invoices_by_statuses(status_names, active_only=False):
     if active_only:
         where += " AND pt.IsActive = 1"
     return _invoice_list(where, names)
+
+
+def purchase_invoice_mapping_items():
+    """header_id, Navision Document No. (h.[No.]) and Purchase Invoice No.
+    (h.[Purchase Invoice No]) for every invoice currently at PURCHASE
+    INVOICE PENDING - Purchase Invoice Mapping menu, where a user manually
+    maps the vendor's real Purchase Invoice No. onto each Navision
+    Document No. An invoice lands here from the Load lifecycle stage (see
+    app.py's _LIFECYCLE["load"]) and is promoted on to LOADED by
+    set_purchase_invoice_no once mapped.
+    Sample: purchase_invoice_mapping_items()"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        if not _table_exists(cur, "tbl_Purchase_Tracker"):
+            return []
+        docno = "h.[No.]" if _hdr_col(cur, "No.") else "CAST(NULL AS NVARCHAR(50))"
+        cur.execute(
+            f"SELECT h.Id, {docno}, h.[Purchase Invoice No] "
+            "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
+            "JOIN dbo.tbl_Purchase_Header h WITH (NOLOCK) ON h.Id = pt.Purchase_Header_ID "
+            "JOIN dbo.tbl_status s WITH (NOLOCK) ON s.StatusId = pt.StatusID "
+            "WHERE s.StatusName = 'PURCHASE INVOICE PENDING' AND ISNULL(pt.IsExcluded, 0) = 0 "
+            "ORDER BY h.Id"
+        )
+        return [
+            {"header_id": r[0], "navision_doc_no": r[1] or "", "purchase_invoice_no": r[2] or ""}
+            for r in cur.fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def set_purchase_invoice_no(header_id, purchase_invoice_no, user_id=None):
+    """Save the vendor's Purchase Invoice No. onto one header and promote
+    it straight from PURCHASE INVOICE PENDING to LOADED - Purchase Invoice
+    Mapping menu's Save button. Reuses advance_status so a clashing
+    Document No. is still caught and the invoice blocked exactly as the
+    normal Load lifecycle stage would (see advance_status's own
+    docstring) - the Purchase Invoice No. itself is still saved even when
+    blocked. Returns {"updated", "new_status", "file_name", "duplicate_no"}
+    - "new_status" is None (and "duplicate_no" True) when blocked.
+    Sample: set_purchase_invoice_no(42, 'PI-2026-001', user_id=7)"""
+    ensure_menu_schema()
+    value = (purchase_invoice_no or "").strip()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE dbo.tbl_Purchase_Header SET [Purchase Invoice No] = ? WHERE Id = ?",
+            value or None, header_id,
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    finally:
+        conn.close()
+
+    if not updated or not value:
+        return {"updated": updated, "new_status": None, "file_name": "", "duplicate_no": False}
+
+    res = advance_status([header_id], ["PURCHASE INVOICE PENDING"], "LOADED", user_id)
+    if res["header_ids"]:
+        return {"updated": True, "new_status": "LOADED",
+                "file_name": res["files"][0] if res["files"] else "",
+                "duplicate_no": False}
+    return {"updated": True, "new_status": None, "file_name": "",
+            "duplicate_no": bool(res["duplicate_no"])}
 
 
 def buyer_order_nos_for_status(status_name):
@@ -2466,6 +2555,22 @@ _MENU_TABLE_DDL = [
     # Status names are always upper case (normalise any legacy mixed-case row).
     "UPDATE dbo.tbl_status SET StatusName = UPPER(StatusName) "
     "WHERE StatusName COLLATE Latin1_General_BIN <> UPPER(StatusName)",
+    # DisplayOrder decouples the Dashboard's "Status breakdown" bar order
+    # (and anywhere else that wants a logical, not historical, order) from
+    # StatusId - StatusId is an IDENTITY, permanently fixed to whenever a
+    # status was first seeded on THIS database, so a status added later
+    # (e.g. Purchase Invoice Pending, added long after Loaded/Posted
+    # already existed) can never sort between them by StatusId alone, no
+    # matter where it sits in STATUS_VALUES. Re-synced from STATUS_VALUES'
+    # own order on every startup, so re-ordering that Python list is
+    # always enough going forward - no StatusId renumbering, ever.
+    "IF COL_LENGTH('dbo.tbl_status', 'DisplayOrder') IS NULL "
+    "ALTER TABLE dbo.tbl_status ADD DisplayOrder INT NULL",
+    f"""
+    UPDATE s SET s.DisplayOrder = v.ord
+    FROM dbo.tbl_status s
+    JOIN (VALUES {_STATUS_DISPLAY_ORDER_VALUES}) v(name, ord) ON v.name = s.StatusName
+    """,
     # ---- Invoice type (PART / SERVICE) — needed for the tracker FK --------
     """
     IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'tbl_InvoiceType')
@@ -2496,6 +2601,12 @@ _MENU_TABLE_DDL = [
     # save_grouped/_ensure_table).
     "IF COL_LENGTH('dbo.tbl_Purchase_Header','InvoiceNo') IS NULL "
     "ALTER TABLE dbo.tbl_Purchase_Header ADD InvoiceNo NVARCHAR(200) NULL",
+    # User-entered mapping from a header's own Navision Document No.
+    # ([No.]) to the vendor's real Purchase Invoice No. - see
+    # purchase_invoice_mapping_items/set_purchase_invoice_no (Purchase
+    # Invoice Mapping menu). Nothing else in the app writes this column.
+    "IF COL_LENGTH('dbo.tbl_Purchase_Header','Purchase Invoice No') IS NULL "
+    "ALTER TABLE dbo.tbl_Purchase_Header ADD [Purchase Invoice No] NVARCHAR(200) NULL",
     # ---- Retire the old table names (were empty; renamed) ----------------
     "IF OBJECT_ID('dbo.tbl_purchaseTracker') IS NOT NULL DROP TABLE dbo.tbl_purchaseTracker",
     "IF OBJECT_ID('dbo.tbl_inputFileLog') IS NOT NULL DROP TABLE dbo.tbl_inputFileLog",
@@ -3128,12 +3239,17 @@ _MENU_PROC_DDL = [
             RETURN;
         END
         -- Every status appears, even with a 0 count (for the bar chart).
+        -- Ordered by DisplayOrder (a logical order re-synced from
+        -- STATUS_VALUES on every startup - see its own DDL comment), not
+        -- StatusId (an IDENTITY frozen at whenever each status was first
+        -- seeded, so a status added later can never sort where it
+        -- logically belongs by StatusId alone).
         -- NOLOCK: pure display (Dashboard tiles), never gates a write decision.
         SELECT s.StatusId, s.StatusName, COUNT(pt.Id) AS Cnt
         FROM dbo.tbl_status s WITH (NOLOCK)
         LEFT JOIN dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) ON pt.StatusID = s.StatusId
-        GROUP BY s.StatusId, s.StatusName
-        ORDER BY s.StatusId;
+        GROUP BY s.StatusId, s.StatusName, s.DisplayOrder
+        ORDER BY ISNULL(s.DisplayOrder, s.StatusId);
     END
     """,
     # ---- User Management -------------------------------------------------
@@ -4062,7 +4178,28 @@ def init_status_table():
             )
         conn.commit()
 
-        cur.execute("SELECT StatusId, StatusName FROM tbl_status ORDER BY StatusId")
+        # DisplayOrder decouples the Dashboard's "Status breakdown" bar
+        # order (and anywhere else that wants a logical, not historical,
+        # order) from StatusId - StatusId is an IDENTITY, permanently
+        # fixed to whenever a status was first seeded on THIS database, so
+        # a status added later (e.g. Purchase Invoice Pending, added long
+        # after Loaded/Posted already existed) can never sort between them
+        # by StatusId alone, no matter where it sits in STATUS_VALUES.
+        # Re-synced from STATUS_VALUES' own order on every startup, so
+        # re-ordering that Python list is always enough going forward.
+        cur.execute(
+            "IF COL_LENGTH('dbo.tbl_status', 'DisplayOrder') IS NULL "
+            "ALTER TABLE dbo.tbl_status ADD DisplayOrder INT NULL"
+        )
+        conn.commit()
+        for i, name in enumerate(STATUS_VALUES):
+            cur.execute(
+                "UPDATE tbl_status SET DisplayOrder = ? WHERE StatusName = ?",
+                i, name,
+            )
+        conn.commit()
+
+        cur.execute("SELECT StatusId, StatusName FROM tbl_status ORDER BY DisplayOrder")
         return [(r[0], r[1]) for r in cur.fetchall()]
     finally:
         conn.close()

@@ -24,11 +24,22 @@ app = FastAPI(
 )
 
 
-# Allow the React frontend (dev server / other origin) to call the API.
+# Explicit origin allow-list: the local Vite dev server, plus the real
+# live (piips.precisionit.co.in:8010) and uat (10.0.1.210:8080)
+# deployments. allow_credentials is deliberately False: nothing in
+# api.js's fetch() calls ever sends credentials cross-origin (no
+# `credentials: "include"` anywhere - auth here is just a user_id in the
+# request body/query, not a cookie/session), so allow_origins=["*"] +
+# allow_credentials=True was a spec-disallowed combination protecting
+# nothing.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:5173", "http://localhost:3000",
+        "https://piips.precisionit.co.in:8010",
+        "http://10.0.1.210:8080",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -592,8 +603,17 @@ def status_counts():
             n = len(files())
             if n:
                 sid = database.status_id(name) or 1
+                # Re-inserted at the SAME position it already held in
+                # `counts` (database.status_counts() lists every status,
+                # even a real-tracker-row count of 0 - see
+                # usp_StatusCounts, ordered by DisplayOrder) rather than
+                # forced to the front, so this synthetic folder-based
+                # count still respects DisplayOrder/STATUS_VALUES' order
+                # like every other status.
+                idx = next((i for i, c in enumerate(counts)
+                            if (c.get("status") or "").upper() == name), 0)
                 counts = [c for c in counts if (c.get("status") or "").upper() != name]
-                counts.insert(0, {"status_id": sid, "status": name, "count": n})
+                counts.insert(idx, {"status_id": sid, "status": name, "count": n})
         except Exception:  # noqa: BLE001 - synthetic count is best-effort
             import traceback
             traceback.print_exc()
@@ -826,10 +846,66 @@ def invoices_set_buyer_order(payload: BuyerOrderModel):
             "moved_to": moved}
 
 
+@app.get("/api/purchase-invoice-mapping/items")
+def purchase_invoice_mapping_items():
+    """Navision Document No. / Purchase Invoice No. pairs for every invoice
+    currently at READY TO LOAD - Purchase Invoice Mapping menu."""
+    import database
+    try:
+        return {"items": database.purchase_invoice_mapping_items()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+class PurchaseInvoiceNoModel(BaseModel):
+    header_id: int
+    purchase_invoice_no: str
+    user_id: Optional[int] = None
+
+
+@app.post("/api/purchase-invoice-mapping/save")
+def purchase_invoice_mapping_save(payload: PurchaseInvoiceNoModel):
+    """Save a user-entered Purchase Invoice No. onto one header and promote
+    it from PURCHASE INVOICE PENDING to LOADED - Purchase Invoice Mapping
+    menu's Save button. A clashing Navision Document No. on another
+    invoice still saves the Purchase Invoice No. but blocks the LOADED
+    promotion (see database.set_purchase_invoice_no / advance_status)."""
+    import database
+    _require_not_viewer(payload.user_id)
+    value = (payload.purchase_invoice_no or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="Purchase Invoice No is required")
+    try:
+        res = database.set_purchase_invoice_no(
+            payload.header_id, value, payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not res.get("updated"):
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    moved = ""
+    if res.get("file_name") and res.get("new_status"):
+        try:
+            moved = config_store.move_pdf_to_status(res["file_name"], res["new_status"])
+        except Exception:  # noqa: BLE001 - file move is best-effort
+            import traceback
+            traceback.print_exc()
+    if res.get("duplicate_no"):
+        raise HTTPException(
+            status_code=409,
+            detail="Purchase Invoice No saved, but this invoice's Navision Document No. "
+                   "already exists on another invoice - it was NOT moved to Loaded. "
+                   "Resolve the duplicate (re-download with a fresh number) first.")
+    return {"ok": True, "new_status": res.get("new_status"), "moved_to": moved}
+
+
 # Load / Post / Complete lifecycle. Each stage lists invoices at its source
 # status(es) and advances the selected ones to its target status.
+# Load's real target is now PURCHASE INVOICE PENDING, not LOADED directly -
+# an invoice only reaches LOADED once its Purchase Invoice No. is mapped
+# (see database.set_purchase_invoice_no / the Purchase Invoice Mapping menu,
+# app.py's purchase_invoice_mapping_save).
 _LIFECYCLE = {
-    "load":     {"from": ["READY TO LOAD", "REJECTED BY ACCOUNTS"], "to": "LOADED"},
+    "load":     {"from": ["READY TO LOAD", "REJECTED BY ACCOUNTS"], "to": "PURCHASE INVOICE PENDING"},
     "post":     {"from": ["LOADED"],  "to": "POSTED"},
     "complete": {"from": ["POSTED"],  "to": "COMPLETED"},
 }
@@ -1317,9 +1393,11 @@ def upload_input(subpath: str = "", user_id: Optional[int] = None,
 # ==========================================================================
 
 @app.post("/api/train")
-def train_start():
-    """Learn (merge) invoice formats from PDFs in the server New_Format folder."""
-
+def train_start(user_id: Optional[int] = None):
+    """Learn (merge) invoice formats from PDFs in the server New_Format folder.
+    Super Admin only - the Training screen this action lives on is already
+    restricted to Super Admin/Developer in ROLE_MENUS."""
+    _require_developer(user_id)
     folders = _require_folders()
 
     # Back up the current model before training so a failed/partial run
@@ -1395,9 +1473,11 @@ def list_formats():
 
 
 @app.delete("/api/formats")
-def clear_formats():
-    """Forget all trained formats (start clean)."""
-
+def clear_formats(user_id: Optional[int] = None):
+    """Forget all trained formats (start clean). Super Admin only - wipes
+    every vendor's learned format at once, and the Training screen this
+    lives on is already Super Admin/Developer-only in ROLE_MENUS."""
+    _require_developer(user_id)
     model = FormatModel()
     model.clear()
     return {"formats": [], "message": "All trained formats cleared"}
@@ -1405,6 +1485,7 @@ def clear_formats():
 
 class RestoreModel(BaseModel):
     name: str
+    user_id: Optional[int] = None
 
 
 @app.get("/api/backups")
@@ -1426,8 +1507,9 @@ def list_backups():
 
 @app.post("/api/backups/restore")
 def restore_backup(payload: RestoreModel):
-    """Restore a chosen model backup."""
-
+    """Restore a chosen model backup. Super Admin only - can silently
+    discard every format learned since the chosen backup."""
+    _require_developer(payload.user_id)
     model = FormatModel()
     try:
         model.restore(payload.name)
