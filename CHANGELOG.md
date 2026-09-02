@@ -11,6 +11,73 @@ sub-versions.
 
 ## 2.2 — 2026-08-30
 
+### New "MANUALLY UPDATED" status — stale-invoice auto-expiry
+
+- A Data Mismatch, Excluded, or New Template invoice nobody resolves
+  (re-uploads/fixes, re-includes, retrains) within 10 days
+  (`database.STALE_STATUS_EXPIRY_DAYS`) now auto-parks as a new
+  **MANUALLY UPDATED** status - permanently: it's deliberately never added
+  to `_REPROCESSABLE_STATUSES`, so a later re-upload of that same invoice
+  falls through to DUPLICATE instead of merging back in place, and it's
+  added to `_BATCH_IGNORED_STATUSES` so it never holds up its batch's
+  status label (same treatment Data Mismatch/New Template/Pending In SF
+  already got). An Excluded invoice keeps its IsExcluded/PriorStatusID
+  columns as-is when this fires - the frontend only offers Include/
+  re-inclusion while the tracker's CURRENT status is literally "EXCLUDED",
+  so once StatusID moves off of it that option is already gone. Runs
+  automatically at the end of every Process/Start job
+  (`processor.py`'s `_expire_stale_unresolved`, alongside the existing
+  Pending In SF resync) via a new stored procedure,
+  `usp_ExpireStaleUnresolved` - like the Pending In SF resync, this only
+  ever fires as a side effect of someone clicking Start; there's no
+  background scheduler in this codebase, so a batch nobody revisits
+  won't auto-expire on its own.
+  - Age is measured off `LastModifiedDatetime`, COALESCEd onto
+    `CreatedDatetime` as a safety net for older rows. This surfaced a
+    real pre-existing gap: `usp_SaveInvoiceBatch`'s tracker INSERT never
+    stamped `LastModifiedDatetime` at all (only `CreatedDatetime`), so
+    it sat NULL forever for any row nobody manually touched afterward -
+    silently defeating any age check keyed off it. Now stamped at
+    insert, same as `CreatedDatetime`.
+  - **Unsupported is handled separately** - it never gets a
+    Purchase_Header/Tracker row at all (a pure exception + file move, no
+    database presence to age off), so it's swept by filesystem modified
+    time instead: a new `config_store.expire_stale_files(status_name,
+    days, target_status)` moves any PDF sitting in a status folder longer
+    than the same 10-day window, called for UNSUPPORTED specifically
+    from the same `_expire_stale_unresolved` step.
+  - The DB-only status flip doesn't move the file on its own (these are
+    older records from a past run, not part of the current job's own
+    result list - see `_move_by_status`), so
+    `expire_stale_unresolved()` also returns each expired row's FileName
+    and the caller moves that PDF into the Manually Updated folder to
+    match.
+  - Verified directly: a stale row of each of the three DB-tracked
+    statuses (11 days since last touch) expires, a fresh Data Mismatch
+    row (2 days) doesn't; a stale Unsupported file (11-day-old mtime)
+    moves via the filesystem sweep while a fresh one stays put;
+    batch-status computation confirmed to ignore Manually Updated rows
+    entirely (a batch with some Loaded and some Manually Updated still
+    shows as LOADED, not stuck IN PROGRESS).
+
+### Batch membership for auto-resynced Pending In SF records
+
+- A record promoted out of PENDING IN SF by `_resync_pending` (runs
+  automatically at the end of every Process/Start job, re-attempting
+  Service First for anything still pending - see processor.py) stayed
+  in whichever batch it was originally saved under, even though the
+  equivalent case for a re-uploaded Data Mismatch/New Template/Excluded
+  invoice already moves it into the batch of the run that cleared it
+  (`reprocess_reworkable_header`). `usp_ReplaceReservation` now takes an
+  optional `@BatchName` and `resync_pending()`/`_resync_pending` pass the
+  current job's batch name through, so a Pending In SF record that
+  clears during a Start now moves into THAT run's batch the same way,
+  by updating its existing tracker row in place - no new row inserted.
+  `@BatchName` defaults to NULL and is left unpassed by
+  `apply_manual_buyer_order` (the Buyer Order Entry menu action, not a
+  Start run), so that caller's behaviour - leave the record in its
+  existing batch - is unchanged.
+
 ### Invoice extraction fixes (surfaced during GST e-invoice training)
 
 - **Seller GSTIN regex boundary** — stripping spaces before matching could
@@ -187,7 +254,118 @@ sub-versions.
   temporary password to (it had none before, by design, since normal
   Viewer setup skips email entirely).
 
----
+### Scanned/photocopied PDF support (PART and Service)
+
+- An invoice with no embedded text layer (a scan or photocopy) used to
+  be rejected outright, moved to UNSUPPORTED, every time, regardless of
+  type. A new Super Admin-only toggle in Folder Configuration ("Allow
+  scanned/photocopied invoices to be processed") switches this to OCR-
+  extracting it instead, using the same PaddleOCR path already used for
+  plain image files (.png/.jpg) — this infrastructure already existed,
+  it just wasn't reachable for a scanned PDF page before. Off by default
+  (unchanged behavior); a genuine handheld photo is still rejected
+  either way, since OCR off an actual photo (vs. a flat scan) stays
+  unreliable regardless of the setting. Applies to normal processing
+  only, not Train, which still expects a clean file. Verified end-to-
+  end for both invoice types: with the toggle on, previously-rejected
+  scans of both PART and Service invoices now correctly extract and
+  match their trained formats; with it off, the exact same files are
+  rejected to UNSUPPORTED exactly as before.
+- Fixed a routing bug this same feature exposed: a scanned invoice whose
+  format DID match an already-trained one, but whose OCR misread its own
+  Quantity/Rate/Amount table, was landing at NEW TEMPLATE ("needs
+  training") - misleading, since retraining an already-recognized
+  format doesn't fix one document's own OCR noise. `ocr_engine.read_pdf`
+  now reports `IsScanned`; the mandatory-field gate only routes a
+  missing PDF-sourced field to NEW TEMPLATE for a born-digital page -
+  the same gap on a scanned one now correctly stays DATA MISMATCH
+  instead. Verified against the exact case that surfaced it (a scanned
+  "IDEAL SYSTEMS" invoice matching its already-trained format11).
+- Train now also honors the toggle (originally normal processing only) -
+  a scanned file sitting in New_Format is OCR'd and learned/merged like
+  any other instead of being stuck there as permanently unsupported.
+  This closed out the last of this session's genuinely-unrecoverable
+  scans: all 11 remaining scanned files in New_Format (including
+  scan1-3.pdf, unsupported since the very start of this session) trained
+  successfully in one run - 9 merged into already-known formats, 2
+  learned as new ones.
+- Fixed a second, earlier routing bug in the same family: a scanned
+  invoice whose format DID match an already-trained one, but whose
+  Vendor Invoice No. itself couldn't be OCR'd off the page, was still
+  landing at NEW TEMPLATE ("needs training") - same problem as the
+  Quantity/Rate/Amount case above, just caught earlier in the pipeline
+  where the format match hadn't been checked yet. Since the template is
+  already known, retraining it fixes nothing; this is this one scan's
+  own OCR noise, the same class of problem as any other unreadable
+  file. Now routed to UNSUPPORTED instead (the same file-move, no-DB-row
+  path every other unreadable file already takes) whenever the format
+  matched, the invoice number is missing, and the page was scanned - an
+  unrecognized format or a PART invoice with no item lines still route
+  to NEW TEMPLATE as before. Verified against invoice 169.pdf (matched
+  format53, PaddleOCR misread "Invoice No." as "Involce No." on a poor-
+  quality scan) - now lands in UNSUPPORTED with no tracker row created.
+
+### Item-table detection fix (born-digital PDFs)
+
+- `find_table` (the scan that locates where an invoice's item table starts)
+  scored keyword matches one row at a time. A layout whose column header
+  wraps onto two stacked lines (e.g. "Sl. No Description Unit Qty Net Tax
+  Tax Tax Total" / "Price Amount Rate Type Amount Amount") never reached
+  the match threshold on either line alone, so the table was invisible to
+  the pipeline end to end - a PART invoice (an Amazon marketplace invoice,
+  IN-8362.pdf) landed at NEW TEMPLATE with "No item line found", even
+  though every other part of its layout was already recognised (format40).
+  `find_table` now also tries combining a row with the next one when
+  neither alone reaches the threshold - but only when the next row
+  doesn't already qualify by itself, so a genuine single-row header
+  sitting just above an unrelated short label line (e.g. a "SN | CGST |
+  SGST" sub-heading) isn't backdated a row early and dragged into the
+  table, which as first written this fix would have quietly done for one
+  sample file (`NMBK - 43.pdf`) - caught by re-running the full 290-file
+  sample set before and after and diffing file-by-file, not just
+  comparing aggregate counts. Note: this only fixes *detecting* the
+  table for this layout - IN-8362.pdf's own item row still has its
+  Quantity/Rate/Amount figures glued into one text block by a separate,
+  unrelated tolerance setting in `_pdf_text_boxes` (tuned for how every
+  other supported layout's phrase-level OCR-style boxes behave); fixing
+  that safely needs its own careful pass, so that file still needs a
+  human to complete it, it just no longer wrongly claims to need
+  retraining.
+- A related attempt - loosening the item-table cleaner's bare
+  "igst"/"cgst"/"sgst" row filter so a real item row that happens to
+  name its own tax type inline wouldn't be discarded - was tried and
+  **reverted**. The first version gated on row length; that let through
+  a tax sub-table's own multi-word column-header row (no real item, just
+  verbose labels), corrupting item parsing for 4 other sample files. A
+  second version gated on "does the row contain any digit" instead;
+  that made things *worse* system-wide, since a genuine standalone tax
+  line almost always contains a rate or amount (a digit) - it now kept
+  rows the original code correctly dropped, spiking NEW TEMPLATE across
+  57 sample files in one run. Getting this right needs the table's
+  column positions (to check whether the row actually has a value under
+  the Description column), which the cleaner doesn't have access to at
+  the point it currently runs - left as still-open work rather than
+  shipped as an unsafe heuristic. Caught before merging by rerunning the
+  full 290-file sample set after every change and diffing the file-level
+  result, not just trusting the aggregate pass/fail counts.
+- Buyer state (`buyer_state` / the "State", "GST Order Address State",
+  "Ship-to Address" Purchase Header columns) now falls back to Tamil
+  Nadu when a vendor's layout prints no Buyer GSTIN and no labelled
+  Buyer State field at all - this app only ever processes Precision
+  Techserve's own inbound invoices, and Precision Techserve's own
+  registered address never moves, so a blank buyer-side state here only
+  ever means the vendor didn't print one, never that the buyer was
+  actually somewhere else. A parallel idea - guessing the *seller's*
+  state from free text in its (often small/unregistered vendor) address
+  block when no GSTIN is printed either - was tried and **reverted**:
+  for one sample vendor (SHWETMANI ENTERPRISES) the "Seller Address"
+  field itself was already mis-anchored (it had captured unrelated
+  invoice-body text, not the real address), and the text-search matched
+  "GOA" inside "5. CAPRI, GOA, Break-Fix..." - silently writing the
+  wrong state (Goa) instead of the vendor's real Maharashtra. A wrong
+  GST state code is worse than a correctly-flagged NEW TEMPLATE, so this
+  stays an open gap for small/unregistered vendors rather than a risky
+  guess.
 
 ## 2.1 — Initial release (retrospective summary)
 

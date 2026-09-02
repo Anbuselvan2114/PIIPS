@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import time
 import traceback
 import xml.etree.ElementTree as ET
 
@@ -42,6 +43,17 @@ DEFAULT_CONFIG = {
     # {"uat"|"live": {"at": iso-str, "by": username, "status": "Success"|"Failed"}}
     # - last Publish outcome per environment, shown on the Publish page.
     "publish_status": {},
+    # Off by default (the original, conservative behaviour): an invoice
+    # (PART or SERVICE) with no embedded text layer (a scan/photocopy) is
+    # rejected outright rather than OCR-extracted, since a first-time
+    # vendor's unknown layout read purely off a scanned image is
+    # unreliable. Toggled on, a scanned invoice of either type is OCR'd
+    # instead - safe specifically for a vendor whose born-digital layout
+    # PIIPS already knows, since it'll simply match (or fail to match) the
+    # same trained format as always. Super Admin only (see app.py's
+    # /api/config/scanned-pdfs). A genuine handheld-photo page is still
+    # rejected either way (see ocr_engine._looks_like_photo_page).
+    "allow_scanned_pdfs": False,
 }
 
 # Legacy keys that used to hold folder paths; migrated into folder_path.
@@ -354,6 +366,36 @@ def move_pdf_to_status(filename, status_name, src_path=None):
     except OSError:
         return ""
     return dest
+
+
+def expire_stale_files(status_name, days, target_status):
+    """Move any PDF sitting in `status_name`'s folder for more than `days`
+    (by filesystem modified time) into `target_status`'s folder. Used for
+    a status that never gets a database row at all - UNSUPPORTED, a pure
+    exception + file move (see processor.py) - so filesystem age is the
+    only "how long has this sat unresolved" signal available; a status
+    with real tracker rows (Data Mismatch/Excluded/New Template) is aged
+    off LastModifiedDatetime instead - see database.expire_stale_unresolved.
+    Returns the list of filenames moved.
+
+    Sample: expire_stale_files('UNSUPPORTED', 10, 'MANUALLY UPDATED')"""
+    src_folder = status_folder(status_name, create=False)
+    if not src_folder or not os.path.isdir(src_folder):
+        return []
+    cutoff = time.time() - days * 86400
+    moved = []
+    for fname in os.listdir(src_folder):
+        src = os.path.join(src_folder, fname)
+        if not os.path.isfile(src):
+            continue
+        try:
+            if os.path.getmtime(src) > cutoff:
+                continue
+        except OSError:
+            continue
+        if move_pdf_to_status(fname, target_status, src_path=src):
+            moved.append(fname)
+    return moved
 
 
 def copy_pdf_to_all_invoices(src_path, dest_filename):

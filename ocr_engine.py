@@ -1000,18 +1000,28 @@ class OCREngine:
 
     def read_pdf(
         self,
-        pdf_path
+        pdf_path,
+        allow_scanned=False,
     ):
 
         page_inputs = self._page_inputs(pdf_path)
 
-        # This version only processes born-digital PDFs (a real embedded
+        # By default this only processes born-digital PDFs (a real embedded
         # text layer). A page with no text layer (image is not None) had to
         # be rasterised for OCR, which means the source is a scan or a
         # photocopy (or a handheld photo) rather than an original digital
         # document — reject the whole file rather than OCR-extracting from
         # it, so it gets moved to UNSUPPORTED upstream instead of silently
         # producing lower-confidence data.
+        #
+        # `allow_scanned=True` (config_store's "allow_scanned_pdfs" toggle,
+        # PART and SERVICE alike - see processor.py) skips that rejection:
+        # `boxes` stays None for a rasterised page, so
+        # process_page's own OCR path below runs PaddleOCR on it exactly
+        # the way an image file (.png/.jpg) already always has. A genuine
+        # handheld photo is still rejected either way - OCR quality on an
+        # actual photo (as opposed to a flat scan/photocopy) is unreliable
+        # regardless of this setting.
         rasterised = [image for _boxes, image in page_inputs if image is not None]
         if rasterised:
             photo_count = sum(1 for image in rasterised if _looks_like_photo_page(image))
@@ -1021,10 +1031,11 @@ class OCREngine:
                     "(uneven lighting/background or non-paper aspect ratio) — "
                     "unsupported."
                 )
-            raise ValueError(
-                "Document is a scanned or photocopied PDF, not an original "
-                "born-digital PDF (no embedded text layer) — unsupported."
-            )
+            if not allow_scanned:
+                raise ValueError(
+                    "Document is a scanned or photocopied PDF, not an original "
+                    "born-digital PDF (no embedded text layer) — unsupported."
+                )
 
         result = {
 
@@ -1040,7 +1051,17 @@ class OCREngine:
 
             "Items": [],
 
-            "TaxSummary": []
+            "TaxSummary": [],
+
+            # True when at least one page had no embedded text layer and
+            # had to be OCR'd (allow_scanned let it through instead of
+            # being rejected above) - processor.py uses this to avoid
+            # treating a missing PDF-sourced field as "the template needs
+            # training" the way it would for a born-digital page: a
+            # scanned page's OCR misreading one document's own numbers is
+            # image-quality noise on that document, not a template gap
+            # retraining could ever fix.
+            "IsScanned": bool(rasterised),
 
         }
 
@@ -2031,19 +2052,44 @@ class OCREngine:
 
             )
 
-            score = 0
+            matched = {
+                keyword for keyword in TABLE_WORDS if keyword in text
+            }
 
-            for keyword in TABLE_WORDS:
-
-                if keyword in text:
-
-                    score += 1
-
-            if score >= 3:
+            if len(matched) >= 3:
 
                 table_start = index
 
                 break
+
+            # Some layouts wrap the header onto two stacked lines (e.g.
+            # "Unit" above "Price", "Net" above "Amount") - neither line
+            # alone reaches the keyword threshold, but together they
+            # clearly are the table header (the same multi-row header
+            # detect_table_columns already merges further down). Only
+            # tried once this row has already matched something, so two
+            # unrelated lines elsewhere can't coincidentally combine -
+            # and only when the NEXT row doesn't already qualify on its
+            # own, so a genuine single-row header (e.g. a "SN | CGST |
+            # SGST" sub-heading sitting just above the real, already-
+            # sufficient header row) isn't backdated a row early, pulling
+            # that extra line into the table and throwing off column
+            # detection.
+            if matched and index + 1 < len(rows):
+
+                next_text = " ".join(
+                    word["text"].lower() for word in rows[index + 1]
+                )
+
+                next_matched = {
+                    keyword for keyword in TABLE_WORDS if keyword in next_text
+                }
+
+                if len(next_matched) < 3 and len(matched | next_matched) >= 3:
+
+                    table_start = index
+
+                    break
 
         # -------------------------------
         # Find Table End

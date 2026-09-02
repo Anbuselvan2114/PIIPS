@@ -22,6 +22,13 @@ import secret_store
 
 ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 
+# A Data Mismatch/Excluded/New Template invoice left unresolved this long
+# auto-parks as Manually Updated (see usp_ExpireStaleUnresolved /
+# expire_stale_unresolved) - permanently, never reprocessable again.
+# Unsupported gets the same treatment by filesystem age instead, since it
+# never gets a database row at all (see config_store.expire_stale_files).
+STALE_STATUS_EXPIRY_DAYS = 10
+
 
 # Ordered status values for tbl_status.
 STATUS_VALUES = [
@@ -40,6 +47,9 @@ STATUS_VALUES = [
     "COMPLETED",
     "EXCLUDED",
     "REJECTED BY ACCOUNTS",
+    "MANUALLY UPDATED",   # a Data Mismatch left unresolved past the retry
+                           # window (see usp_ExpireStaleUnresolved) -
+                           # permanently parked, never reprocessable again
 ]
 
 # User type values for tbl_UserType. "Accounts" runs the Load/Post/Complete
@@ -305,15 +315,20 @@ def save_grouped(data, batch_name=None, tracker=None):
     return counts
 
 
-def resync_pending():
+def resync_pending(batch_name=None):
     """
     Re-attempt Service First for records still "pending in SF" (status 5).
     Reloads each record's extracted JSON, re-calls the API, and — when the
     part is now available — rebuilds that header's reservation rows and
     promotes the tracker (Ready to Load / sf processed) with a fresh
-    SyncedDatetime. Returns {"promoted": n, "errors": [reason, ...]}.
+    SyncedDatetime. `batch_name`, when given, also moves each promoted
+    record into that batch (same as reprocess_reworkable_header does for a
+    re-uploaded Data Mismatch/New Template/Excluded file - a record that
+    finally clears here belongs to the run that cleared it, not left
+    behind in whatever batch it was originally saved under). Returns
+    {"promoted": n, "errors": [reason, ...]}.
 
-    Sample: resync_pending()
+    Sample: resync_pending(batch_name='PIIPS_Batch_20260902_120000')
     """
     ensure_menu_schema()
 
@@ -360,9 +375,9 @@ def resync_pending():
         try:
             cur = conn.cursor()
             cur.execute(
-                "EXEC dbo.usp_ReplaceReservation ?, ?, ?, ?, ?, ?",
+                "EXEC dbo.usp_ReplaceReservation ?, ?, ?, ?, ?, ?, ?",
                 header_id, json.dumps(re_cols), json.dumps(group["reservations"]),
-                verdict["status"], 1 if verdict["is_active"] else 0, 1,
+                verdict["status"], 1 if verdict["is_active"] else 0, 1, batch_name,
             )
             conn.commit()
         finally:
@@ -372,6 +387,33 @@ def resync_pending():
         errors.extend(verdict["errors"])
 
     return {"promoted": promoted, "errors": errors}
+
+
+def expire_stale_unresolved(days=None):
+    """Park every Data Mismatch/Excluded/New Template invoice that's sat
+    unresolved for more than `days` (default STALE_STATUS_EXPIRY_DAYS) as
+    Manually Updated - permanently: it drops out of batch status entirely
+    (_BATCH_IGNORED_STATUSES) and, since Manually Updated is deliberately
+    never in _REPROCESSABLE_STATUSES, a later re-upload of the same invoice
+    falls through to DUPLICATE instead of merging in place. Unsupported is
+    NOT covered here - see config_store.expire_stale_files for that (it
+    never gets a database row at all). Returns the FileName of every row
+    expired (the caller - processor.py's _expire_stale_unresolved - moves
+    each PDF into the Manually Updated folder to match; this function only
+    ever touches the DB).
+
+    Sample: expire_stale_unresolved()"""
+    ensure_menu_schema()
+    days = STALE_STATUS_EXPIRY_DAYS if days is None else days
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("EXEC dbo.usp_ExpireStaleUnresolved ?", days)
+        filenames = [r[0] for r in cur.fetchall() if r[0]]
+        conn.commit()
+        return filenames
+    finally:
+        conn.close()
 
 
 def apply_manual_buyer_order(header_id, order_no, user_id=None):
@@ -617,6 +659,12 @@ def get_processed_invoices():
 # deliberately re-uploads that exact file and starts a run - nothing here
 # pulls a file back in on its own (see processor.py's main loop, which is
 # the only caller, driven by whatever the user just uploaded).
+# MANUALLY UPDATED is deliberately NOT in this list - it's what Data
+# Mismatch/Excluded/New Template becomes once usp_ExpireStaleUnresolved
+# parks it as permanently unresolved (Pending In SF is NOT swept by that
+# expiry - a re-upload can still merge into it as before); unlike the
+# four statuses below, a re-upload of a Manually Updated invoice must
+# fall through to DUPLICATE, never merge back in.
 # KEEP IN SYNC with usp_GetProcessedInvoices' own copy of this list.
 _REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "DATA MISMATCH", "NEW TEMPLATE")
 
@@ -747,11 +795,16 @@ _BATCH_LOCK_STATUSES = ("LOADED", "POSTED", "COMPLETED", "REJECTED BY ACCOUNTS")
 # need further action - a duplicate is already handled under a different
 # header) or off on its own separate resolution path (New Template needs
 # retraining, Data Mismatch needs a data fix, Pending In SF needs Service
-# First to catch up) that shouldn't hold up this batch's own status label,
-# or any batch behind it, indefinitely - e.g. 9 real invoices Loaded plus 1
-# still Pending In SF must show the batch as LOADED, not stuck looking
-# unresolved forever waiting on a part SF may take days to receive.
-_BATCH_IGNORED_STATUSES = ("EXCLUDED", "NEW TEMPLATE", "DUPLICATE", "DATA MISMATCH", "PENDING IN SF")
+# First to catch up, Manually Updated is permanently parked and will never
+# move again - see usp_ExpireStaleUnresolved) that shouldn't hold up this
+# batch's own status label, or any batch behind it, indefinitely - e.g. 9
+# real invoices Loaded plus 1 still Pending In SF must show the batch as
+# LOADED, not stuck looking unresolved forever waiting on a part SF may
+# take days to receive.
+_BATCH_IGNORED_STATUSES = (
+    "EXCLUDED", "NEW TEMPLATE", "DUPLICATE", "DATA MISMATCH", "PENDING IN SF",
+    "MANUALLY UPDATED",
+)
 
 
 def _batch_is_cleared(counts):
@@ -2808,6 +2861,11 @@ _MENU_PROC_DDL = [
         -- from each header's source file; the status name and IsActive are
         -- per-invoice (carried in the JSON as _StatusName / _IsActive) so the
         -- Service First outcome can flag each invoice independently.
+        -- LastModifiedDatetime is stamped here too (same as CreatedDatetime)
+        -- rather than left NULL until some later action touches the row -
+        -- usp_ExpireStaleUnresolved measures "how long has this sat
+        -- unresolved" off it, and a row nobody has ever touched needs a
+        -- real starting timestamp to age from.
         IF OBJECT_ID('dbo.tbl_Purchase_Tracker') IS NOT NULL
         BEGIN
             INSERT INTO dbo.tbl_Purchase_Tracker
@@ -2815,7 +2873,7 @@ _MENU_PROC_DDL = [
                  StartedByID, StartedDatetime, BatchName, StatusID, IsActive,
                  SyncedByID, SyncedDatetime, IsSynced, FileName, TemplateFormat,
                  InvoiceTypeID, BuyerOrderNo, SourceJson,
-                 CreatedById, CreatedDatetime)
+                 CreatedById, CreatedDatetime, LastModifiedById, LastModifiedDatetime)
             SELECT m.HeaderId, s._InitById, s._InitAt,
                    @StartedByID, @StartedDatetime, s._BatchName,
                    st.StatusId, ISNULL(s._IsActive, 1),
@@ -2824,7 +2882,7 @@ _MENU_PROC_DDL = [
                    ISNULL(s._Synced, 0),
                    s._FileName, s._Format,
                    it.InvoiceTypeId, s._BuyerOrderNo, s._SourceJson,
-                   @StartedByID, GETDATE()
+                   @StartedByID, GETDATE(), @StartedByID, GETDATE()
             FROM OPENJSON(@Headers)
                  WITH ([_gid] INT '$._gid',
                        [_InitById] INT '$._InitById',
@@ -2918,6 +2976,65 @@ _MENU_PROC_DDL = [
         DROP TABLE #hmap;
     END
     """,
+    # ---- Expire stale unresolved rows (each Start) -------------------------
+    # A Data Mismatch/Excluded/New Template invoice nobody has resolved
+    # (re-uploaded/fixed, re-included, retrained) within STALE_STATUS_
+    # EXPIRY_DAYS is parked permanently as Manually Updated - it stops
+    # counting toward batch status (_BATCH_IGNORED_STATUSES) and, since
+    # Manually Updated is deliberately never added to
+    # _REPROCESSABLE_STATUSES, a later re-upload of the same invoice now
+    # falls through to DUPLICATE instead of merging in place (Excluded's
+    # own IsExcluded/PriorStatusID columns are left as-is when this fires -
+    # the frontend only offers Include/re-inclusion while the tracker's
+    # CURRENT status is literally "EXCLUDED", so once StatusID moves off
+    # of it that option is already gone). Age is measured off
+    # LastModifiedDatetime (stamped at insert - see usp_SaveInvoiceBatch -
+    # and refreshed by any later touch, e.g. reprocess_reworkable_header or
+    # set_excluded), COALESCEd onto CreatedDatetime only as a safety net
+    # for rows saved before that stamp-at-insert fix shipped. Unsupported
+    # is NOT handled here - it never gets a Purchase_Header/Tracker row at
+    # all (a pure exception + file move - see processor.py), so it's swept
+    # separately by filesystem age instead (config_store.expire_stale_files).
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_ExpireStaleUnresolved
+        @Days INT
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_ExpireStaleUnresolved @Days=10
+        IF OBJECT_ID('dbo.tbl_Purchase_Tracker') IS NULL OR OBJECT_ID('dbo.tbl_status') IS NULL
+        BEGIN
+            SELECT CAST(NULL AS NVARCHAR(400)) AS FileName WHERE 1 = 0;
+            RETURN;
+        END
+        DECLARE @StaleIds TABLE (StatusId INT);
+        INSERT INTO @StaleIds
+        SELECT StatusId FROM dbo.tbl_status
+         WHERE StatusName IN ('DATA MISMATCH', 'EXCLUDED', 'NEW TEMPLATE');
+        DECLARE @ManuallyUpdatedId INT = (SELECT StatusId FROM dbo.tbl_status WHERE StatusName = 'MANUALLY UPDATED');
+        IF NOT EXISTS (SELECT 1 FROM @StaleIds) OR @ManuallyUpdatedId IS NULL
+        BEGIN
+            SELECT CAST(NULL AS NVARCHAR(400)) AS FileName WHERE 1 = 0;
+            RETURN;
+        END
+
+        -- FileName of every row this expires, so the caller can also move
+        -- each PDF into the Manually Updated folder (this UPDATE only ever
+        -- touches the DB row - a PDF from an EARLIER run isn't part of the
+        -- current job's file list, so nothing else would move it).
+        DECLARE @Expired TABLE (FileName NVARCHAR(400));
+
+        UPDATE dbo.tbl_Purchase_Tracker
+           SET StatusID = @ManuallyUpdatedId,
+               IsActive = 0,
+               LastModifiedDatetime = GETDATE()
+        OUTPUT inserted.FileName INTO @Expired
+         WHERE StatusID IN (SELECT StatusId FROM @StaleIds)
+           AND COALESCE(LastModifiedDatetime, CreatedDatetime) <= DATEADD(day, -@Days, GETDATE());
+
+        SELECT FileName FROM @Expired;
+    END
+    """,
     # ---- Re-sync pending reservations (each Start) -----------------------
     # Records still "pending in SF" (no reservation received yet) that should
     # be re-attempted against the API on the next Start.
@@ -2949,11 +3066,17 @@ _MENU_PROC_DDL = [
         @Rows       NVARCHAR(MAX),   -- JSON array of {col: value}
         @StatusName NVARCHAR(150),
         @IsActive   BIT,
-        @SyncedById INT
+        @SyncedById INT,
+        @BatchName  NVARCHAR(300) = NULL   -- pass the CURRENT run's batch to
+                                            -- move a promoted record into it
+                                            -- (resync_pending); NULL (the
+                                            -- default) leaves BatchName as-is
+                                            -- for callers outside a Start run
+                                            -- (e.g. apply_manual_buyer_order)
     AS
     BEGIN
         SET NOCOUNT ON;
-        -- Sample: EXEC dbo.usp_ReplaceReservation @HeaderId=42, @Cols='["Serial No.","Nav_Item_No"]', @Rows='[{"Serial No.":"SN123","Nav_Item_No":"ITM-1001"}]', @StatusName='READY TO LOAD', @IsActive=1, @SyncedById=1
+        -- Sample: EXEC dbo.usp_ReplaceReservation @HeaderId=42, @Cols='["Serial No.","Nav_Item_No"]', @Rows='[{"Serial No.":"SN123","Nav_Item_No":"ITM-1001"}]', @StatusName='READY TO LOAD', @IsActive=1, @SyncedById=1, @BatchName='PIIPS_Batch_20260902_120000'
 
         IF OBJECT_ID('dbo.tbl_Reservation_Entry') IS NOT NULL
             DELETE FROM dbo.tbl_Reservation_Entry WHERE Purchase_Header_ID = @HeaderId;
@@ -2985,7 +3108,8 @@ _MENU_PROC_DDL = [
                SyncedByID = @SyncedById,
                SyncedDatetime = GETDATE(),
                LastModifiedById = @SyncedById,
-               LastModifiedDatetime = GETDATE()
+               LastModifiedDatetime = GETDATE(),
+               BatchName = ISNULL(@BatchName, BatchName)
          WHERE Purchase_Header_ID = @HeaderId;
     END
     """,

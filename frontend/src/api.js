@@ -60,6 +60,12 @@ export const saveConfig = (folderPath) =>
     body: JSON.stringify({ folder_path: folderPath }),
   });
 
+export const setScannedPdfsEnabled = (enabled, user_id) =>
+  request("/api/config/scanned-pdfs", {
+    method: "POST",
+    body: JSON.stringify({ enabled, user_id }),
+  });
+
 export const getApiConfig = () => request("/api/api-config");
 
 export const saveApiConfig = (sfApiUrl) =>
@@ -236,10 +242,10 @@ export const changePassword = (user_id, current_password, new_password) =>
 
 export const getUsers = () => request("/api/users");
 
-export const createUser = (username, email, user_type_id, created_by) =>
+export const createUser = (username, email, user_type_id, created_by, password) =>
   request("/api/users", {
     method: "POST",
-    body: JSON.stringify({ username, email, user_type_id, created_by }),
+    body: JSON.stringify({ username, email, user_type_id, created_by, password }),
   });
 
 export const setUserActive = (user_id, is_active, modified_by) =>

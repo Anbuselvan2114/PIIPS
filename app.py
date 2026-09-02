@@ -96,6 +96,22 @@ def get_config():
     return _public_config(config_store.load_config())
 
 
+class ScannedPdfsModel(BaseModel):
+    enabled: bool
+    user_id: Optional[int] = None
+
+
+@app.post("/api/config/scanned-pdfs")
+def set_scanned_pdfs(payload: ScannedPdfsModel):
+    """Super Admin toggle: whether a scanned/photocopied invoice (PART or
+    SERVICE, no embedded text layer) gets OCR-extracted instead of
+    rejected outright. See config_store.DEFAULT_CONFIG's own comment for
+    the full rationale."""
+    _require_developer(payload.user_id)
+    config_store.save_config({"allow_scanned_pdfs": bool(payload.enabled)})
+    return {"ok": True, "allow_scanned_pdfs": bool(payload.enabled)}
+
+
 def _writable(path):
     """Probe real write access by creating and removing a temp file."""
     probe = os.path.join(path, f".piips_write_test_{os.getpid()}.tmp")
