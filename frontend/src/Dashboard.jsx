@@ -377,6 +377,7 @@ export default function Dashboard({ user }) {
   // Downloaded/In Progress at a time - see app.py's download_batch.
   const canDownload = (row) => (row.exportable ?? 1) > 0 && (row["st:READY TO LOAD"] ?? 0) > 0
     && !row.locked && !(row.blocked_by || []).length
+    && !(row["st:BUYER ORDER NO DOESN'T EXIST"] ?? 0)
     && !batches.some((b) => b.batch !== row.batch
       && (b.batch_status === "DOWNLOADED" || b.batch_status === "IN PROGRESS"));
 
@@ -448,6 +449,8 @@ export default function Dashboard({ user }) {
                 ? "This batch has an invoice already Loaded, Excluded, Posted, Completed, or Rejected — it can no longer be downloaded or renumbered."
                 : (row.blocked_by || []).length
                 ? `Waiting on earlier batch(es) to be Loaded, Posted, or Completed first: ${row.blocked_by.join(", ")}`
+                : (row["st:BUYER ORDER NO DOESN'T EXIST"] ?? 0)
+                ? "Kindly fill in the Buyer Order No for every invoice in this batch before downloading."
                 : "No active / included invoices to export, or every invoice in this batch has already moved past Ready to Load"}>—</span>
       )) },
   ];

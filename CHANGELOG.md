@@ -9,7 +9,57 @@ before 2.2 is grouped under **2.1** below as a retrospective summary (by
 theme, not a literal commit-by-commit log) rather than a series of real
 sub-versions.
 
-## 2.2 — 2026-08-30
+## 2.2.1 — 2026-09-03
+
+Purchase Invoice Mapping — a new step between Load and Loaded requiring the
+vendor's real Purchase Invoice No. before an invoice is truly Loaded — is
+the headline feature of this release; everything else below is work that
+either supports it directly or was found while building it.
+
+### Block a batch's download while it has a missing Buyer Order No.
+
+- `GET /api/batches/download` now refuses to export a batch that has any
+  invoice still parked at BUYER ORDER NO DOESN'T EXIST - there's nothing
+  usable for Navision on that invoice yet, and minting it a Document No.
+  now would just need redoing once the PO is filled in. Returns a clear
+  400 telling the user how many invoices are missing a PO and to fill it
+  in first. `Dashboard.jsx`'s `canDownload`/Download-button tooltip gets
+  the same check client-side, for a proactive disabled state instead of
+  only failing after the click - matches the existing pattern already
+  used for locked/blocked_by batches.
+  Verified live: a batch with 2 Ready To Load invoices + 1 Buyer Order
+  No Doesn't Exist invoice is correctly refused (400, exact invoice
+  count in the message); fixing that one invoice's PO immediately
+  unblocks the download, which then succeeds and produces a real .xlsx.
+
+### Allow excluding a not-yet-advanced invoice from an In Progress batch
+
+- `set_excluded` previously gated BOTH exclude and re-include purely on
+  the batch's own status (Created/Downloaded only) - meaning once any
+  ONE invoice in a batch reached Loaded/Purchase Invoice Pending/etc.,
+  every OTHER invoice in that same batch got permanently stuck if it
+  itself never advanced (e.g. was parked at Buyer Order No Doesn't
+  Exist when the batch was downloaded, then only became Ready To Load
+  afterward - too late for that download's Document No. minting, and
+  its batch was already locked by the time it was fixed). That invoice
+  could never get a Document No., never appear on the Load screen, and
+  - since a batch only "clears" once every non-ignored invoice reaches
+  the same terminal stage - permanently blocked every later batch from
+  ever being downloaded too.
+  Excluding now has one extra allowance: permitted while the batch is
+  In Progress, as long as THIS invoice's own current status hasn't
+  itself advanced past Ready To Load (checked against
+  `_BATCH_LOCK_STATUSES`) - the batch-level lock exists because some
+  OTHER invoice may already be committed downstream, which says nothing
+  about whether pulling this still-unadvanced one out is safe.
+  Re-including is deliberately NOT relaxed - it stays Created/Downloaded
+  only, unchanged.
+  Verified live with an isolated 20-invoice batch (19 at Purchase
+  Invoice Pending, 1 stuck at Ready To Load): excluding the stuck one
+  now succeeds; excluding one of the 19 already-advanced invoices still
+  correctly fails with the (updated) error message; re-including the
+  freshly-excluded invoice while the batch is still In Progress still
+  correctly fails, unchanged.
 
 ### Security fix — CORS allowed any origin with credentials
 
@@ -137,6 +187,8 @@ sub-versions.
   Unsupported each repositioned ahead of Initiated) - each one landed
   exactly where `STATUS_VALUES` placed it, including the previously-
   pinned Initiated/Unsupported.
+
+## 2.2 — 2026-08-30
 
 ### New "MANUALLY UPDATED" status — stale-invoice auto-expiry
 

@@ -2353,35 +2353,53 @@ def set_excluded(header_id, exclude, user_id=None):
     'Excluded' (remembering the prior status), flags IsExcluded and stamps
     ExcludedByID / ExcludedDatetime; including restores the prior status.
     Returns {file_name, new_status} so the caller can relocate the PDF.
-    Both directions are gated purely on this invoice's OWN batch's current
+
+    Re-including is gated purely on this invoice's OWN batch's current
     status (see _current_batch_status) - allowed while it's CREATED or
     DOWNLOADED, refused with a ValueError otherwise (IN PROGRESS/LOADED/
-    POSTED/COMPLETED/EXCLUDED). No OTHER batch's status is ever considered.
-    Once a batch has real progress, its Document Nos./Reservation data may
-    already be committed downstream (Navision), so pulling an invoice out
-    of or back into it at that point could change the batch after the fact.
+    POSTED/COMPLETED/EXCLUDED). Excluding gets one extra allowance: it's
+    also permitted while the batch is IN PROGRESS, as long as THIS
+    invoice's own current status hasn't itself advanced past READY TO
+    LOAD (i.e. isn't in _BATCH_LOCK_STATUSES) - the batch-level lock
+    exists because some OTHER invoice in it may already be committed
+    downstream (Navision), which says nothing about whether pulling
+    THIS still-unadvanced one out is safe. No OTHER batch's status is
+    ever considered either way.
     Sample: set_excluded(42, True, 7)"""
     ensure_menu_schema()
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT StatusID, PriorStatusID, FileName, BatchName FROM dbo.tbl_Purchase_Tracker "
-            "WHERE Purchase_Header_ID = ?", header_id)
+            "SELECT pt.StatusID, pt.PriorStatusID, pt.FileName, pt.BatchName, s.StatusName "
+            "FROM dbo.tbl_Purchase_Tracker pt "
+            "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+            "WHERE pt.Purchase_Header_ID = ?", header_id)
         row = cur.fetchone()
         if not row:
             return None
         file_name = row[2]
         batch_name = row[3]
+        own_status = (row[4] or "").upper()
 
         if batch_name:
             status = _current_batch_status(cur, batch_name)
-            if status not in ("CREATED", "DOWNLOADED"):
-                action = "re-include" if not exclude else "exclude"
+            allowed = status in ("CREATED", "DOWNLOADED") or (
+                exclude and own_status not in _BATCH_LOCK_STATUSES
+            )
+            if not allowed:
+                if exclude:
+                    detail = (
+                        "This is only allowed while a batch is still Created or "
+                        "Downloaded, or - for excluding only - while this "
+                        "invoice's own status hasn't advanced past Ready To Load."
+                    )
+                else:
+                    detail = "This is only allowed while a batch is still Created or Downloaded."
+                action = "exclude" if exclude else "re-include"
                 raise ValueError(
                     f"Can't {action} this invoice — its batch '{batch_name}' "
-                    f"is already {status}. This is only allowed while a "
-                    "batch is still Created or Downloaded."
+                    f"is already {status}. {detail}"
                 )
 
         if exclude:

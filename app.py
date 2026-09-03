@@ -20,7 +20,7 @@ ACCEPTED_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".web
 
 app = FastAPI(
     title="Precision Intelligent Invoice Processing Suite",
-    version="2.2"
+    version="2.2.1"
 )
 
 
@@ -1073,6 +1073,22 @@ def download_batch(batch: str, doc_no: Optional[str] = None, entry_no: Optional[
         )
 
     all_batches = database.list_batches()
+
+    # An invoice still parked at Buyer Order No Doesn't Exist has nothing
+    # usable for Navision yet - block the whole batch's download rather
+    # than silently exporting it without a PO, or worse, minting it a
+    # Document No. now that it'll need redone once the PO is fixed later.
+    this_batch = next((b for b in all_batches if b.get("batch") == name), None)
+    missing_po = (this_batch or {}).get("counts", {}).get("BUYER ORDER NO DOESN'T EXIST", 0)
+    if missing_po:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch '{name}' has {missing_po} invoice(s) with no Buyer "
+                "Order No. — kindly fill in the Buyer Order No before "
+                "downloading this batch."
+            ),
+        )
 
     # Batches must clear in creation order: an earlier batch not yet fully
     # Loaded/Posted/Completed (ignoring its excluded invoices) blocks any
