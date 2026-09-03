@@ -189,10 +189,14 @@ def _looks_like_hash_fragment(text):
     """A line that's a bare hex-hash fragment — e.g. a GST e-Invoice IRN
     (a 64-char hex hash) wrapped across two text-layer/OCR lines, whose
     second half carries no "IRN"/"Ack No." label of its own — never real
-    name/address content. Requires the whole trimmed line (a line-wrap
-    hyphen stripped) to be a long run of hex characters with both digits
-    and letters, so a genuine short code/word isn't mistaken for one."""
-    t = text.strip().rstrip("-")
+    name/address content. Requires the whole line, with ALL whitespace
+    removed (not just leading/trailing) and a line-wrap hyphen stripped,
+    to be a long run of hex characters with both digits and letters, so a
+    genuine short code/word isn't mistaken for one. Internal whitespace is
+    stripped too because some PDF generators render a hex hash as two+
+    separate OCR/text-layer words on the same row (split at an odd offset,
+    sometimes even out of numeric order) rather than one glued token."""
+    t = re.sub(r"\s+", "", text).rstrip("-")
     if not _HASH_FRAGMENT_RE.match(t):
         return False
     return any(c.isdigit() for c in t) and any(c.isalpha() for c in t)
@@ -253,6 +257,18 @@ def _value_right_or_below(rows, ri, anchor_word, offset):
         if nxt is not None and nxt["text"].strip() == ":":
             break
         if _is_label(w["text"]):
+            # This word may be a genuine value glued to the NEXT field's
+            # label with no gap wide enough to land in its own box (e.g.
+            # "1424 Dated:" - value "1424" immediately followed by the
+            # next label, merged into one token upstream) - keep whatever
+            # precedes the label match rather than discarding the value
+            # along with it. A label sitting at the very start (offset 0,
+            # e.g. a bare "Dated:" token) still has nothing to keep here.
+            span = _label_span(w["text"])
+            if span is not None and span[0] > 0:
+                lead = w["text"][:span[0]].strip()
+                if lead:
+                    collected.append(lead)
             break
         collected.append(w["text"])
     right_text = _clean_value(" ".join(collected))
@@ -686,10 +702,31 @@ def extract(header_rows, footer_rows, page_width):
                 # GSTIN on this line -> party gstin (see _gstin_from_text
                 # for why the original, un-stripped text is tried first)
                 val = _gstin_from_text(text)
-                if "gstin" in low or "uin" in low or val:
+                if val:
+                    out.setdefault(f"{section} GSTIN/UIN", val)
+                gstin_pos = min(
+                    (p for p in (low.find("gstin"), low.find("uin")) if p != -1),
+                    default=-1,
+                )
+                if gstin_pos == -1:
                     if val:
-                        out.setdefault(f"{section} GSTIN/UIN", val)
-                    continue
+                        continue
+                else:
+                    # A "GSTIN"/"UIN" label (with or without its own value on
+                    # this same row - the value can instead wrap onto the
+                    # NEXT row, e.g. "...Road,T.Nagar,Chennai,TamilNadu,
+                    # 600017,GSTIN:" / "33AABCP8005C2ZZ") never itself
+                    # belongs to name/address content, but genuine address
+                    # text can precede it on the same row - keep that
+                    # lead-in instead of discarding the whole row (which
+                    # would silently drop the city/state/PIN it carries),
+                    # same as the generic label-trim pass below does for
+                    # other labels found partway through a row.
+                    lead = text[:gstin_pos].strip(" :,-.")
+                    if not lead:
+                        continue
+                    text = lead
+                    low = text.lower()
 
                 # State. Matches "state name"/"state code" (Tally-style), a bare
                 # "State" label (word-bounded — \b so "Estate" in an address line

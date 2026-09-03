@@ -413,9 +413,6 @@ class OCREngine:
             )
             rows = self.merge_table_header_rows(rows)
 
-            rows = self.split_serial_description(
-                rows
-            )
             # -----------------------------------------
             # Detect Table
             # -----------------------------------------
@@ -442,10 +439,18 @@ class OCREngine:
                     :table_start
                 ]
 
-
-                table_rows = rows[
-                    table_start:table_end
-                ]
+                # Only the item-table body can contain a serial number
+                # glued straight onto its description ("1Adaptor") - a
+                # header/footer metadata row that merely happens to look
+                # like "<digits> <Capitalized word>" (e.g. "1424 Dated:",
+                # an invoice no. immediately followed by the next label)
+                # would otherwise be mis-split too, landing a fake
+                # description box at the table's hardcoded DESCRIPTION_START
+                # x - which then gets misread as a LEFT-column word and can
+                # wrongly claim/consume the whole header row it came from.
+                table_rows = self.split_serial_description(
+                    rows[table_start:table_end]
+                )
 
 
                 footer_rows = rows[
