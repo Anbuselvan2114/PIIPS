@@ -112,6 +112,14 @@ export const setPurchaseInvoiceNo = (header_id, purchase_invoice_no, user_id) =>
     body: JSON.stringify({ header_id, purchase_invoice_no, user_id }),
   });
 
+export const getRoleMenus = () => request("/api/role-menus");
+
+export const saveRoleMenus = (mapping, user_id) =>
+  request("/api/role-menus", {
+    method: "POST",
+    body: JSON.stringify({ mapping, user_id }),
+  });
+
 export const getLifecycleInvoices = (stage) =>
   request(`/api/lifecycle/invoices?stage=${encodeURIComponent(stage)}`);
 

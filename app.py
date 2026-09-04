@@ -898,6 +898,39 @@ def purchase_invoice_mapping_save(payload: PurchaseInvoiceNoModel):
     return {"ok": True, "new_status": res.get("new_status"), "moved_to": moved}
 
 
+@app.get("/api/role-menus")
+def get_role_menus():
+    """Which menu keys each configurable role (admin/user/accounts/viewer)
+    can see - read by every logged-in client to build its own sidebar, so
+    no auth gate here beyond being reachable at all (same as /api/config).
+    Super Admin/Developer always see every menu, unconfigurable, and are
+    never part of this mapping - see database.get_role_menus."""
+    import database
+    try:
+        return {"mapping": database.get_role_menus()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+class RoleMenusModel(BaseModel):
+    mapping: dict
+    user_id: Optional[int] = None
+
+
+@app.post("/api/role-menus")
+def save_role_menus(payload: RoleMenusModel):
+    """Replace the whole role->menu mapping - Screen Access menu's Save
+    button. Super Admin only: this controls who can reach every other
+    screen (including this one), so a lower-privileged role must never be
+    able to grant itself more access."""
+    import database
+    _require_developer(payload.user_id)
+    try:
+        return {"mapping": database.save_role_menus(payload.mapping, payload.user_id)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 # Load / Post / Complete lifecycle. Each stage lists invoices at its source
 # status(es) and advances the selected ones to its target status.
 # Load's real target is now PURCHASE INVOICE PENDING, not LOADED directly -

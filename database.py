@@ -1798,6 +1798,80 @@ def set_purchase_invoice_no(header_id, purchase_invoice_no, user_id=None):
             "duplicate_no": bool(res["duplicate_no"])}
 
 
+# The menu keys each role can see BEFORE a Super Admin has ever saved the
+# "Screen Access" menu - i.e. what every existing deployment already
+# behaves like today. Used only to seed tbl_RoleMenu the first time it's
+# empty (see get_role_menus), so nothing changes for anyone until a Super
+# Admin actually visits that menu and saves something. Keep in sync with
+# frontend/src/App.jsx's MENU list if a menu key is ever renamed - this is
+# a one-time seed, not read on every request, so a stale key here only
+# matters for a brand new deployment's first run.
+_ROLE_MENU_DEFAULTS = {
+    "admin": ["dashboard", "input", "manual", "buyerorder", "partdescupdate",
+              "purchaseinvoicemapping", "load", "post", "complete",
+              "configuration", "apiconfig", "template", "createfield", "users"],
+    "user": ["dashboard", "input", "manual", "buyerorder", "partdescupdate",
+             "purchaseinvoicemapping", "load"],
+    "accounts": ["dashboard", "input", "manual", "post", "complete"],
+    "viewer": ["dashboard", "input", "buyerorder", "partdescupdate",
+               "purchaseinvoicemapping", "load", "post", "complete"],
+}
+
+
+def get_role_menus():
+    """{role_name: [menu_key, ...]} for every configurable role (never
+    'super admin'/'developer' - see tbl_RoleMenu's own comment). Seeds the
+    table from _ROLE_MENU_DEFAULTS the first time it's empty.
+    Sample: get_role_menus()"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM dbo.tbl_RoleMenu")
+        if cur.fetchone()[0] == 0:
+            for role, keys in _ROLE_MENU_DEFAULTS.items():
+                for key in keys:
+                    cur.execute(
+                        "INSERT INTO dbo.tbl_RoleMenu (RoleName, MenuKey) VALUES (?, ?)",
+                        role, key)
+            conn.commit()
+        cur.execute("SELECT RoleName, MenuKey FROM dbo.tbl_RoleMenu ORDER BY RoleName, Id")
+        out = {}
+        for role, key in cur.fetchall():
+            out.setdefault(role, []).append(key)
+        return out
+    finally:
+        conn.close()
+
+
+def save_role_menus(mapping, user_id=None):
+    """Replace the whole role -> menu-keys mapping (Screen Access menu's
+    Save button). `mapping` is {role_name: [menu_key, ...]}; a 'super
+    admin'/'developer' entry, if present, is silently dropped - that role
+    always sees every menu and is never stored. Returns the mapping as
+    actually saved (via get_role_menus).
+    Sample: save_role_menus({'admin': ['dashboard', 'input']}, user_id=7)"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM dbo.tbl_RoleMenu")
+        for role, keys in (mapping or {}).items():
+            role = (role or "").strip().lower()
+            if not role or role in ("super admin", "developer"):
+                continue
+            for key in keys or []:
+                key = (key or "").strip()
+                if key:
+                    cur.execute(
+                        "INSERT INTO dbo.tbl_RoleMenu (RoleName, MenuKey) VALUES (?, ?)",
+                        role, key)
+        conn.commit()
+    finally:
+        conn.close()
+    return get_role_menus()
+
+
 def buyer_order_nos_for_status(status_name):
     """Distinct, non-blank Buyer's Order Nos for invoices currently at
     `status_name` - feeds the Service First GetPurchaseLineSpecification-
@@ -2757,6 +2831,21 @@ _MENU_TABLE_DDL = [
     CREATE TABLE tbl_BatchReIncluded (
         BatchName  NVARCHAR(200) NOT NULL PRIMARY KEY,
         MarkedAt   DATETIME NOT NULL
+    )
+    """,
+    # ---- Which menu keys each (non-Super-Admin) role can see - the "Screen
+    # Access" menu's own storage. Presence of a (RoleName, MenuKey) row means
+    # that role can see that menu; Super Admin/Developer are never rows here
+    # - they always see every menu, unconfigurable, so a Super Admin editing
+    # this table can never lock everyone (including themselves) out. Seeded
+    # from _ROLE_MENU_DEFAULTS the first time it's empty - see get_role_menus.
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'tbl_RoleMenu')
+    CREATE TABLE tbl_RoleMenu (
+        Id       INT IDENTITY(1,1) PRIMARY KEY,
+        RoleName NVARCHAR(50) NOT NULL,
+        MenuKey  NVARCHAR(50) NOT NULL,
+        CONSTRAINT UQ_RoleMenu UNIQUE (RoleName, MenuKey)
     )
     """,
 ]
