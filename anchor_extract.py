@@ -70,7 +70,13 @@ LABEL_WORDS = [
     # combined invoice/dispatch document) - a document-type label, not a
     # company name, wherever it prints as the page's own top line.
     "delivery challan",
-    "original copy", "duplicate", "triplicate", "contect person",
+    # GST goods invoices print 3 copies captioned "Original"/"Duplicate"/
+    # "Triplicate" (for Recipient/Transporter/Supplier respectively) - all
+    # 3 are document-copy markers, never company name/address content,
+    # wherever they print as the page's own top line. "duplicate" and
+    # "triplicate" alone were already here; "original" (not just the
+    # "original copy" phrase) was the missing third.
+    "original", "original copy", "duplicate", "triplicate", "contect person",
     "contact person", "shipping addres", "shipping address", "address",
     "party details", "consignee", "bill to", "ship to", "s.n.", "sl.no",
     "e-mail", "email", "tel", "phone", "msme", "bank", "ifsc", "terms",
