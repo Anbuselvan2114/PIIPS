@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getInputFiles, uploadInputFiles, getTemplates } from "./api";
-import { DataTable } from "./components";
+import { DataTable, SearchableSelect } from "./components";
 
 export default function InputFiles({ user }) {
   const [templates, setTemplates] = useState([]);
@@ -72,10 +72,12 @@ export default function InputFiles({ user }) {
 
         <div className="field" style={{ maxWidth: 420 }}>
           <label className="label">Template</label>
-          <select value={tpl} onChange={(e) => { setTpl(e.target.value); setError(null); setNotice(null); }}>
-            <option value="">— select a template —</option>
-            {templates.map((k) => <option key={k} value={k}>{k}</option>)}
-          </select>
+          <SearchableSelect
+            value={tpl}
+            onChange={(v) => { setTpl(v); setError(null); setNotice(null); }}
+            options={templates}
+            placeholder="Type to search a template…"
+            emptyLabel="No matching template." />
           {templates.length === 0 && <div className="hint" style={{ marginTop: 6 }}>No templates yet — create one under the Template menu.</div>}
         </div>
 

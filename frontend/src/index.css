@@ -226,6 +226,11 @@ textarea { height: auto; min-height: 80px; padding: 10px 12px; }
 
 input:disabled, select:disabled { background: var(--surface-2); color: var(--muted); cursor: not-allowed; }
 
+/* type-and-search dropdown (SearchableSelect) - a <select> replacement
+   for a long/growing option list, e.g. File Explorer's Template picker */
+.searchable-select-option { padding: 7px 12px; cursor: pointer; font-size: 14px; }
+.searchable-select-option:hover, .searchable-select-option.active { background: var(--surface-2); }
+
 /* generic input with a leading icon */
 .input-group {
   display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 40px;
