@@ -69,7 +69,7 @@ LABEL_WORDS = [
     # Other generic GST document-type titles besides "Tax Invoice" (e.g. a
     # combined invoice/dispatch document) - a document-type label, not a
     # company name, wherever it prints as the page's own top line.
-    "delivery challan",
+    "commercial invoice", "delivery challan",
     # GST goods invoices print 3 copies captioned "Original"/"Duplicate"/
     # "Triplicate" (for Recipient/Transporter/Supplier respectively) - all
     # 3 are document-copy markers, never company name/address content,
