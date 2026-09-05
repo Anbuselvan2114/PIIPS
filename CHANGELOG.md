@@ -9,12 +9,115 @@ before 2.2 is grouped under **2.1** below as a retrospective summary (by
 theme, not a literal commit-by-commit log) rather than a series of real
 sub-versions.
 
-## 2.2.1 — 2026-09-03
+## 2.2.1 — 2026-09-05
 
-Purchase Invoice Mapping — a new step between Load and Loaded requiring the
-vendor's real Purchase Invoice No. before an invoice is truly Loaded — is
-the headline feature of this release; everything else below is work that
-either supports it directly or was found while building it.
+### Read-only Viewer role
+
+- A new "Viewer" user type sees Dashboard, File Explorer, Buyer Order
+  Entry, Part Description Mapping, Load, Post, and Complete with every
+  mutating action blocked server-side; no Manual or Setup/Mapping/Admin
+  screen. Created directly by a Super Admin with a chosen
+  username/password (no email, no forced first-login change). A PBV0030
+  Viewer account is seeded on every startup, same as the built-in Sadmin
+  account.
+- A mandatory field sourced from the PDF itself (Quantity, Direct Unit
+  Cost, Line Amount, …) being missing now routes the invoice to NEW
+  TEMPLATE and copies it to `New_Format` for retraining, instead of the
+  less actionable DATA MISMATCH; a gap in Service First's own data still
+  correctly stays DATA MISMATCH.
+- Outbound emails now show which environment sent them (Local/UAT/Live).
+
+### Manually Updated status with stale-invoice auto-expiry; item-table fixes
+
+- A Data Mismatch/Excluded/New Template invoice left unresolved for 10+
+  days now auto-parks at a new MANUALLY UPDATED status (never
+  reprocessed again, ignored for batch status); Unsupported invoices
+  (no DB row at all) are swept by filesystem age the same way.
+- `find_table` now detects an item-table header wrapped across two
+  stacked lines (previously invisible end to end on some invoices); a
+  scanned invoice whose format is trained but whose Vendor Invoice No.
+  can't be read now routes to UNSUPPORTED instead of the misleading NEW
+  TEMPLATE; Buyer state falls back to Tamil Nadu when a vendor prints no
+  Buyer GSTIN/state at all.
+
+### HSN/SAC, Buyer Order No., payment terms, and UI polish
+
+- HSN/SAC Code is required for an Item line only when the PDF's own raw
+  reading actually had one — flags "Service First failed to confirm an
+  HSN the PDF had", not "neither side ever had one". The Fields popup
+  applies the same rule and now also shows Buyer Order No.
+- Default payment-terms fallback lowered from 45 to 30 days (used only
+  when neither Service First nor the PDF states a usable value).
+- The UI now shows the running app version (`GET /api/version`) and a
+  copyright footer instead of hardcoding a separate copy of either.
+
+### Screen Access — Super Admin-configurable per-role menu visibility
+
+- Which screens Admin/User/Accounts/Viewer can see is now stored in a
+  `tbl_RoleMenu` table instead of hardcoded in `App.jsx`, editable from
+  a new "Screen Access" menu (Super Admin/Developer only — they always
+  see every screen, unconfigurable by design). Self-seeds from the
+  previous hardcoded defaults, so no deployment's menu visibility
+  changes until a Super Admin actually edits and saves something.
+
+### Template rename
+
+- The Template Edit screen's "Template name" field is editable for an
+  existing template, not just at creation. Saving a changed name
+  renames the row in place (its saved static values carry over) and
+  moves its Input folder to match; renaming to a name already in use is
+  blocked with a clear error.
+
+### File Explorer's Template dropdown gains type-and-search
+
+- Replaces the plain `<select>` with a searchable, filter-as-you-type
+  dropdown (arrow-key/Enter navigation) — a native `<select>` got
+  tedious to scan as the template list grew.
+
+### Purchase Invoice Mapping — built, then reverted before release
+
+- A "Purchase Invoice Pending" step between Load and Loaded (requiring
+  the vendor's real Purchase Invoice No. before an invoice reached
+  LOADED), plus its own "Purchase Invoice Mapping" menu, was built,
+  tested, and then fully removed within this same release cycle at the
+  user's request — it never shipped. The lifecycle is unchanged from
+  2.2: Load leads directly to LOADED. The original design (schema,
+  endpoints, role visibility) is archived for a possible future
+  re-implementation.
+
+### Extraction accuracy fixes
+
+Nine `anchor_extract.py` bugs found and fixed this cycle, each verified
+against the full trained-format PDF corpus (209-211 files) with zero
+unintended regressions:
+
+- A GST e-Invoice IRN hash wrapped across two OCR words on the same row
+  slipped past hash-fragment detection and got picked up as the Seller
+  Name.
+- A serial/description split meant only for item-table rows also ran on
+  header metadata shaped like "1424 Dated:", corrupting row
+  classification and losing the seller name on that invoice.
+- A "GSTIN"/"UIN" label found anywhere in a row, even wrapped onto the
+  next row's value, dropped the whole row and silently lost real
+  address/city text that preceded the label on the same line.
+- "ORIGINAL FOR RECIPIENT" and "COMMERCIAL INVOICE" title banners were
+  no longer being recognized as non-name text and were picked up as the
+  Seller Name on some invoices.
+- A seller's own name sharing a row with an unrelated "e-Invoice" badge
+  no longer gets discarded as a false title banner; the 3-column
+  Bill-To/Ship-To header path now applies the same left/right divider
+  slice and claimed-row exclusion every other row already gets.
+- A vendor's own name is no longer wrongly duplicated as the first line
+  of its own address when two separate extraction passes processed the
+  same row.
+- Non-standard "SELLER DETAILS"/"BUYER DETAILS" section captions are
+  now recognized, including when the marker shares a row with unrelated
+  left-side content (e.g. the seller's own GSTIN).
+- A stray punctuation-only first line (e.g. a lone ".") no longer wins
+  the Seller Name outright.
+- Amazon-style marketplace invoices captioning the seller block
+  "Sold By :" (instead of a name/address label) are now recognized, so
+  that phrase isn't mistaken for the Seller Name itself.
 
 ### Block a batch's download while it has a missing Buyer Order No.
 
@@ -108,85 +211,27 @@ either supports it directly or was found while building it.
   a safe not-found case on restore, without triggering the real
   destructive operations against the live model).
 
-### Purchase Invoice No. surfaced on the Post/Complete screens; Dashboard column tweaks
-
-- `_invoice_list` (backs Buyer Order Entry, the Lifecycle pages, and the
-  Dashboard batch drill-down) now also selects `[Purchase Invoice No]`
-  as `purchase_invoice_no`. Post and Complete show it as its own column
-  right after Navision Document No.; the Batch column (not meaningful
-  once an invoice already has a real Document No.) was dropped from
-  those two stages only - Load keeps it. Verified with an isolated
-  LOADED test header: the Post-stage API correctly returns the saved
-  Purchase Invoice No.
-- Dashboard batches table: added a Purchase Invoice Pending status
-  column right after Loaded (`BATCH_STATUS_COLS` in `Dashboard.jsx` -
-  the column gets the same clickable drill-down every other status
-  column already has, no extra code needed).
-
-### New "Purchase Invoice Pending" step between Load and Loaded, and the "Purchase Invoice Mapping" menu
-
-- The Load lifecycle stage's real target status is now **PURCHASE INVOICE
-  PENDING**, not LOADED directly (`app.py`'s `_LIFECYCLE["load"]`) - an
-  invoice only reaches LOADED once its Purchase Invoice No. is mapped.
-  READY TO LOAD itself is unchanged (still the ordinary extraction-complete
-  gate); only what clicking "Mark as Loaded" leads to has changed.
-  New column `[Purchase Invoice No]` on `tbl_Purchase_Header` (user-entered
-  only - nothing else writes it). New menu, Purchase Invoice Mapping
-  (`frontend/src/PurchaseInvoiceMapping.jsx`, modelled on Buyer Order
-  Entry), lists every invoice at PURCHASE INVOICE PENDING with its
-  Navision Document No. (the header's existing `[No.]` column) alongside
-  an editable Purchase Invoice No. field; saving a non-blank value
-  promotes the invoice straight to LOADED via `advance_status` (reused
-  from the Load lifecycle stage itself), so a clashing Document No. on
-  another invoice is still caught and blocks the promotion with a 409 -
-  the Purchase Invoice No. is saved regardless, just not the promotion.
-  Backend: `database.purchase_invoice_mapping_items()` /
-  `set_purchase_invoice_no()`, `GET/POST /api/purchase-invoice-mapping/*`
-  (save blocked for Viewer via `_require_not_viewer`, same as every other
-  mutating endpoint; requires a non-blank value, matching Buyer Order
-  Entry's own validation). Menu sits between Load and Post. Visible to
-  Super Admin/Developer/Admin/User/Viewer (read-only for Viewer); not
-  Accounts, matching Buyer Order Entry's own role scoping. Purchase
-  Invoice Pending is also added to `_BATCH_LOCK_STATUSES` - an invoice
-  sitting there already went through Load, so the batch's Document No.
-  sequence may already be partly committed, same reasoning as LOADED
-  itself.
-  - Verified end-to-end with isolated test data: clicking "Mark as
-    Loaded" (`POST /api/lifecycle/advance`) correctly lands invoices at
-    PURCHASE INVOICE PENDING (not LOADED); they then appear in Purchase
-    Invoice Mapping's list; saving a Purchase Invoice No. promotes to
-    LOADED; a colliding Document No. on a second invoice correctly
-    returns 409 and blocks the promotion while still saving the value;
-    frontend production build passes with no errors.
-  - The Load screen only shows invoices that already have a Navision
-    Document No. minted (that's a pre-existing, unrelated filter -
-    `[No.]` isn't minted until a batch is actually downloaded, see
-    `fetch_batch`/`_assign_document_numbers`) - a batch that's never
-    been downloaded shows nothing on Load, same as before this change.
-
 ### New `DisplayOrder` column on `tbl_status` - decouples display order from StatusId
 
 - The Dashboard's "Status breakdown" bar chart (and `usp_StatusCounts`
   generally) ordered by raw `StatusId`, an IDENTITY permanently frozen at
   whenever a status was first seeded on a given database - a status added
-  later (like Purchase Invoice Pending, added long after Loaded/Posted
-  already existed on this dev database) could never sort where it
-  logically belongs no matter where it sits in `STATUS_VALUES`. Added a
-  `DisplayOrder INT` column, re-synced from `STATUS_VALUES`' own list
-  order on every startup (both the live `ensure_menu_schema` DDL path and
-  the CLI-only `init_status_table`), so reordering that Python list is
-  now always enough - no StatusId renumbering, ever. `usp_StatusCounts`
-  orders by `ISNULL(DisplayOrder, StatusId)`. `/api/stats/status-counts`
-  (the Dashboard's data source) had its own bug in the same family: it
+  later could never sort where it logically belongs no matter where it
+  sits in `STATUS_VALUES`. Added a `DisplayOrder INT` column, re-synced
+  from `STATUS_VALUES`' own list order on every startup (both the live
+  `ensure_menu_schema` DDL path and the CLI-only `init_status_table`), so
+  reordering that Python list is now always enough - no StatusId
+  renumbering, ever. `usp_StatusCounts` orders by
+  `ISNULL(DisplayOrder, StatusId)`. `/api/stats/status-counts` (the
+  Dashboard's data source) had its own bug in the same family: it
   force-pinned INITIATED/UNSUPPORTED (synthetic, folder-based counts -
   they have no real tracker rows) to the very front of the list
   regardless of DisplayOrder; now re-inserted at the position they
   already held in the DisplayOrder-sorted list instead. Verified via
-  `/api/stats/status-counts` after several live reorders (Purchase
-  Invoice Pending between Loaded and Posted; New Template, Duplicate and
-  Unsupported each repositioned ahead of Initiated) - each one landed
-  exactly where `STATUS_VALUES` placed it, including the previously-
-  pinned Initiated/Unsupported.
+  `/api/stats/status-counts` after several live reorders (New Template,
+  Duplicate and Unsupported each repositioned ahead of Initiated) - each
+  one landed exactly where `STATUS_VALUES` placed it, including the
+  previously-pinned Initiated/Unsupported.
 
 ## 2.2 — 2026-08-30
 

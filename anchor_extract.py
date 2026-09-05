@@ -101,6 +101,11 @@ LABEL_WORDS = [
     # a vendor's own template prints one) - without this, "SELLER
     # DETAILS" itself becomes the Seller Name.
     "seller details",
+    # Amazon-style marketplace invoices caption the seller block "Sold
+    # By :" instead of a name/address label at all - same category as
+    # "Seller Details" above (recognized as a label so it isn't taken as
+    # the Seller Name itself), just different vendor-template wording.
+    "sold by",
     "party details", "consignee", "bill to", "ship to", "s.n.", "sl.no",
     "e-mail", "email", "tel", "phone", "msme", "bank", "ifsc", "terms",
     "declaration", "authorised", "authorized", "signatory", "grand total",
