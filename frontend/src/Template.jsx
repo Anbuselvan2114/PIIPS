@@ -79,6 +79,11 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
   const [addedFields, setAddedFields] = useState({});
   const [pendingField, setPendingField] = useState({});
   const [message, setMessage] = useState(null);
+  // The key this row is CURRENTLY saved under - starts at editKey, but
+  // updates after a successful rename so a second Save (without leaving
+  // this screen first) renames again in place instead of looking up a
+  // key that no longer exists and creating a duplicate row.
+  const [currentKey, setCurrentKey] = useState(editKey || null);
 
   const unmapped = (sheet) => (columns[sheet] || []).filter((c) => !(mapping[sheet] && mapping[sheet][c]));
   const setVal = (sheet, col, val) => setValues((v) => ({ ...v, [sheet]: { ...v[sheet], [col]: val } }));
@@ -101,8 +106,14 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
       staticObj[s] = {};
       unmapped(s).forEach((c) => { const val = (values[s] || {})[c]; if (val) staticObj[s][c] = val; });
     });
-    try { const r = await saveTemplate({ entity, invoice_type: invoiceType, name, po_format: poFormat, static: staticObj, user_id: user?.user_id }); setMessage({ ok: true, text: `Saved "${r.key}"` }); }
-    catch (e) { setMessage({ ok: false, text: e.message }); }
+    try {
+      const r = await saveTemplate({
+        entity, invoice_type: invoiceType, name, po_format: poFormat, static: staticObj,
+        user_id: user?.user_id, original_key: currentKey || undefined,
+      });
+      setMessage({ ok: true, text: currentKey && currentKey !== r.key ? `Renamed to "${r.key}".` : `Saved "${r.key}".` });
+      setCurrentKey(r.key);
+    } catch (e) { setMessage({ ok: false, text: e.message }); }
   };
 
   return (
@@ -110,7 +121,7 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
       <div className="card">
         <div className="card-title-row">
           <button className="btn btn-subtle" onClick={onBack}>← Back</button>
-          <h3 style={{ margin: 0 }}>{editKey ? `Edit: ${editKey}` : "New Template"}</h3>
+          <h3 style={{ margin: 0 }}>{editKey ? `Edit: ${currentKey}` : "New Template"}</h3>
         </div>
 
         <div className="row">
@@ -128,7 +139,8 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
           </div>
           <div className="field">
             <label className="label">Template name</label>
-            <input value={name} disabled={!!editKey} onChange={(e) => setName(e.target.value)} placeholder="Services_Chennai  or  trichy/service" />
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Services_Chennai  or  trichy/service" />
+            {editKey && <div className="hint" style={{ marginTop: 4 }}>Changing this renames the template (and moves its Input folder) — its saved static values carry over.</div>}
           </div>
           <div className="field">
             <label className="label">PO Number Format</label>

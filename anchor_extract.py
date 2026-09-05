@@ -21,11 +21,13 @@ RIGHT_FIELDS = {
         "invoice no", "invoice number", "invoice #", "inv no", "bill no",
         "invioce no",  # genuine vendor-template typo seen on a real invoice, not an OCR artifact
         "invoice :",  # some vendors label it bare "Invoice :" with no "No."/"No" at all
+        "invoice#",  # a vendor template with no space before the "#" - "invoice #" above doesn't substring-match this
     ],
     "Dated": ["dated", "invoice date", "date"],
     "Buyer's Order No.": [
         "p.o. no", "p.o no", "po no", "buyer's order no",
         "buyer's order", "order no", "purchase order",
+        "p.o.#",  # same no-space-before-"#" vendor template as "invoice#" above
     ],
     "Place of Supply": ["place of supply"],
     "Reference No. & Date.": ["reference no", "other references"],
@@ -42,6 +44,20 @@ SECTION_MARKERS = [
     ("Consignee", ["consignee", "ship to", "shipped to", "shipping addres"]),
     ("Buyer", ["party details", "customer detail", "details of receiver",
                "bill to", "billed to", "buyer (bill to)", "buyer"]),
+]
+
+# Stricter subset of SECTION_MARKERS, used ONLY for the right-half-of-a-
+# shared-row check further down (e.g. "BUYER DETAILS" landing a few
+# columns right of the seller's own trailing GSTIN on one row). Bare
+# "buyer" is deliberately dropped here - on the LEFT it's safely scoped to
+# the party-block column, but checked against arbitrary RIGHT-side text it
+# also matches inside "Buyer's Order No.", an entirely ordinary Tally
+# invoice-metadata label that legitimately sits to the right of many
+# ordinary Seller-block rows, and would false-trigger the switch on them.
+_RIGHT_SIDE_SECTION_MARKERS = [
+    ("Consignee", ["consignee", "ship to", "shipped to", "shipping addres"]),
+    ("Buyer", ["party details", "customer detail", "details of receiver",
+               "buyer details", "bill to", "billed to", "buyer (bill to)"]),
 ]
 
 # Markers only recognized as a WHOLE line (after stripping trailing
@@ -78,6 +94,13 @@ LABEL_WORDS = [
     # "original copy" phrase) was the missing third.
     "original", "original copy", "duplicate", "triplicate", "contect person",
     "contact person", "shipping addres", "shipping address", "address",
+    # A "Seller Details" section caption (a "Buyer Details"/"Bill To"
+    # counterpart with no dedicated marker of its own, since Seller is
+    # already the default starting section - nothing switches INTO it,
+    # but it still needs to be recognized as a label, not content, when
+    # a vendor's own template prints one) - without this, "SELLER
+    # DETAILS" itself becomes the Seller Name.
+    "seller details",
     "party details", "consignee", "bill to", "ship to", "s.n.", "sl.no",
     "e-mail", "email", "tel", "phone", "msme", "bank", "ifsc", "terms",
     "declaration", "authorised", "authorized", "signatory", "grand total",
@@ -88,11 +111,18 @@ LABEL_WORDS = [
     "despatch", "dispatch", "despatched", "dispatched", "document no",
     "delivery note", "supplier's ref", "supplier ref", "e-way", "eway",
     "other reference", "reference no",
-    # GST e-Invoice QR-code block (IRN/Ack No./Ack Date/"e-Invoice" caption)
-    # sits above the seller's letterhead on this layout — without these,
-    # "IRN : <64-char hash>" becomes the very first unclaimed left-column
-    # line and gets captured as the Seller Name/Address instead.
-    "irn", "ack no", "ack date", "e-invoice",
+    # GST e-Invoice QR-code block (IRN/Ack No./Ack Date caption) sits above
+    # the seller's letterhead on this layout — without these, "IRN : <64-
+    # char hash>" becomes the very first unclaimed left-column line and
+    # gets captured as the Seller Name/Address instead. "e-invoice" itself
+    # is deliberately NOT here (only in the explicit low.startswith(...)
+    # checks below, which already cover its real job of skipping a row
+    # that STARTS with it) - as a generic substring match here, it also
+    # matched a seller's own letterhead row that merely shares its line
+    # with an unrelated "e-Invoice" badge elsewhere on the same row (e.g.
+    # "Zaco Computers Pvt Ltd" ... "e-Invoice"), wrongly disqualifying the
+    # whole row as a title banner and losing the real company name.
+    "irn", "ack no", "ack date",
 ]
 
 GSTIN_RE = re.compile(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9])\b")
@@ -595,7 +625,13 @@ def extract(header_rows, footer_rows, page_width):
                 and not _looks_like_phone_line(first_text)
                 and not _looks_like_url_line(first_text)
                 and len(first_text.split()) <= 4
-                and not any(c.isdigit() for c in first_text)):
+                and not any(c.isdigit() for c in first_text)
+                # A genuine company name always has at least one letter -
+                # without this, a stray punctuation-only artifact sitting
+                # above the real letterhead (e.g. a lone "." rendered as
+                # the page's very first line) passes every other check
+                # here and wins the Seller Name outright.
+                and any(c.isalpha() for c in first_text)):
             fields.setdefault("Seller Name", first_text)
 
     # ------------------------------------------------------------------
@@ -621,11 +657,22 @@ def extract(header_rows, footer_rows, page_width):
         # becomes its Address, not a second (silently dropped) Name.
         named = {p: bool(out.get(f"{p} Name")) for p in ("Seller", "Buyer", "Consignee")}
         any_switch = False
+        # A section marker seen on the RIGHT half of some row (see below) -
+        # applied at the START of the NEXT row's processing, not this row's
+        # own, since this row's LEFT half may still genuinely belong to the
+        # OLD section (e.g. the seller's own trailing GSTIN sharing a row
+        # with a "BUYER DETAILS" caption a few columns further right).
+        pending_switch = None
 
         scan_rows = rows_override if rows_override is not None else rows
         for ri, row in enumerate(scan_rows):
                 if rows_override is None and ri in claimed_rows:
                     continue
+
+                if pending_switch:
+                    section = pending_switch
+                    any_switch = True
+                    pending_switch = None
 
                 # A page-wide document-title row (e.g. "Invoice Cum Delivery
                 # Challan (ORIGINAL FOR RECIPIENT)") can straddle the left/
@@ -641,9 +688,22 @@ def extract(header_rows, footer_rows, page_width):
                 # metadata labels ("Invoice No." / "Dated") on the SAME
                 # row in the common Tally layout, which would otherwise
                 # false-positive as a title too.
-                if ri == 0 and section == "Seller" and not named["Seller"]:
+                if ri == 0 and section == "Seller":
                     whole = _row_text(row)
-                    if whole and _is_label(whole):
+                    if not named["Seller"]:
+                        if whole and _is_label(whole):
+                            continue
+                    elif whole and out.get("Seller Name") == whole:
+                        # The "Seller Name fallback" above already consumed
+                        # this exact row (its own unsliced text became
+                        # Seller Name before this pass even started) -
+                        # falling through below would treat it as
+                        # unclaimed content and duplicate the name as the
+                        # first Address line too. A Seller Name already
+                        # set for some OTHER reason (e.g. a "Vendor Name:"
+                        # anchor claimed elsewhere) means row 0 is still
+                        # genuine, unclaimed content - let it fall through
+                        # normally in that case.
                         continue
 
                 # A rows_override row is already narrowed to one column's
@@ -678,6 +738,26 @@ def extract(header_rows, footer_rows, page_width):
                 if switched:
                     any_switch = True
                     continue
+
+                # A section marker on the RIGHT half of this SAME row (past
+                # the divider) - e.g. "BUYER DETAILS" landing a few columns
+                # right of the seller's own trailing GSTIN on one shared
+                # row. The left-only check above never sees it, and without
+                # this every later row stays wrongly stuck in the OLD
+                # section forever (the real buyer's own name/address/GSTIN
+                # all get misfiled as more Seller content). Deferred to the
+                # NEXT row (applied at the top of the loop) rather than
+                # switched here, so THIS row's own left-side text - which
+                # may still genuinely belong to the OLD section - keeps its
+                # normal classification below.
+                if rows_override is None:
+                    right_only = [w for w in row if w["x"] >= divider]
+                    if right_only:
+                        right_low = " ".join(w["text"].strip() for w in right_only).strip().lower()
+                        for name, marks in _RIGHT_SIDE_SECTION_MARKERS:
+                            if any(m in right_low for m in marks):
+                                pending_switch = name
+                                break
 
                 # Structural fallback for a missing section-header row: some
                 # PDFs' born-digital text layer omits "Billed to"/"Shipped
@@ -798,6 +878,16 @@ def extract(header_rows, footer_rows, page_width):
 
                 # First non-label line = party name; rest = address
                 if not named[section]:
+                    if not any(c.isalpha() for c in text):
+                        # Not a real name candidate (e.g. a stray "."
+                        # rendering artifact sitting above the real
+                        # letterhead, with no label/GSTIN/etc. of its own
+                        # to otherwise catch it) - a genuine company/person
+                        # name always has at least one letter. Skip it
+                        # entirely rather than consuming the "first content
+                        # line" slot, so the next genuine line still
+                        # becomes the Name instead of Address.
+                        continue
                     out.setdefault(f"{section} Name", text)
                     named[section] = True
                 else:
@@ -808,8 +898,25 @@ def extract(header_rows, footer_rows, page_width):
 
     if three_col is not None:
         marker_row_src = header_rows[marker_ri]
+        # The prefix (everything before the Bill To/Ship To marker row) is
+        # the ordinary, unsliced Seller letterhead block - unlike bill_rows/
+        # ship_rows below (each already narrowed to just one column's
+        # words), it was never column-split. But every row fed into
+        # rows_override is treated as "already narrowed, don't re-slice" by
+        # _party_pass's own left-computation below, so a prefix row sharing
+        # its line with unrelated right-side content (e.g. "Zaco Computers
+        # Pvt Ltd" ... "e-Invoice") would keep that content glued on, and a
+        # row already claimed by the anchor pass above (e.g. "IRN : <hash>")
+        # would leak back in as Address text. Apply the same left-of-divider
+        # slice and claimed_rows exclusion the ordinary (non-3-column) path
+        # already gets, so only genuine Seller-block content survives.
+        prefix_rows = [
+            [w for w in row if w["x"] < divider]
+            for ri, row in enumerate(header_rows[:marker_ri])
+            if ri not in claimed_rows
+        ]
         side_by_side_rows = (
-            header_rows[:marker_ri]
+            prefix_rows
             + [_marker_row("Bill to", bill_x, marker_row_src)] + bill_rows
             + [_marker_row("Ship to", ship_x, marker_row_src)] + ship_rows
         )

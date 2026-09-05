@@ -103,15 +103,6 @@ export const setBuyerOrder = (header_id, buyer_order_no, user_id) =>
     body: JSON.stringify({ header_id, buyer_order_no, user_id }),
   });
 
-export const getPurchaseInvoiceMappingItems = () =>
-  request("/api/purchase-invoice-mapping/items");
-
-export const setPurchaseInvoiceNo = (header_id, purchase_invoice_no, user_id) =>
-  request("/api/purchase-invoice-mapping/save", {
-    method: "POST",
-    body: JSON.stringify({ header_id, purchase_invoice_no, user_id }),
-  });
-
 export const getRoleMenus = () => request("/api/role-menus");
 
 export const saveRoleMenus = (mapping, user_id) =>

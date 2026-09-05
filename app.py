@@ -846,58 +846,6 @@ def invoices_set_buyer_order(payload: BuyerOrderModel):
             "moved_to": moved}
 
 
-@app.get("/api/purchase-invoice-mapping/items")
-def purchase_invoice_mapping_items():
-    """Navision Document No. / Purchase Invoice No. pairs for every invoice
-    currently at READY TO LOAD - Purchase Invoice Mapping menu."""
-    import database
-    try:
-        return {"items": database.purchase_invoice_mapping_items()}
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-
-
-class PurchaseInvoiceNoModel(BaseModel):
-    header_id: int
-    purchase_invoice_no: str
-    user_id: Optional[int] = None
-
-
-@app.post("/api/purchase-invoice-mapping/save")
-def purchase_invoice_mapping_save(payload: PurchaseInvoiceNoModel):
-    """Save a user-entered Purchase Invoice No. onto one header and promote
-    it from PURCHASE INVOICE PENDING to LOADED - Purchase Invoice Mapping
-    menu's Save button. A clashing Navision Document No. on another
-    invoice still saves the Purchase Invoice No. but blocks the LOADED
-    promotion (see database.set_purchase_invoice_no / advance_status)."""
-    import database
-    _require_not_viewer(payload.user_id)
-    value = (payload.purchase_invoice_no or "").strip()
-    if not value:
-        raise HTTPException(status_code=400, detail="Purchase Invoice No is required")
-    try:
-        res = database.set_purchase_invoice_no(
-            payload.header_id, value, payload.user_id)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    if not res.get("updated"):
-        raise HTTPException(status_code=404, detail="Invoice not found")
-    moved = ""
-    if res.get("file_name") and res.get("new_status"):
-        try:
-            moved = config_store.move_pdf_to_status(res["file_name"], res["new_status"])
-        except Exception:  # noqa: BLE001 - file move is best-effort
-            import traceback
-            traceback.print_exc()
-    if res.get("duplicate_no"):
-        raise HTTPException(
-            status_code=409,
-            detail="Purchase Invoice No saved, but this invoice's Navision Document No. "
-                   "already exists on another invoice - it was NOT moved to Loaded. "
-                   "Resolve the duplicate (re-download with a fresh number) first.")
-    return {"ok": True, "new_status": res.get("new_status"), "moved_to": moved}
-
-
 @app.get("/api/role-menus")
 def get_role_menus():
     """Which menu keys each configurable role (admin/user/accounts/viewer)
@@ -933,12 +881,8 @@ def save_role_menus(payload: RoleMenusModel):
 
 # Load / Post / Complete lifecycle. Each stage lists invoices at its source
 # status(es) and advances the selected ones to its target status.
-# Load's real target is now PURCHASE INVOICE PENDING, not LOADED directly -
-# an invoice only reaches LOADED once its Purchase Invoice No. is mapped
-# (see database.set_purchase_invoice_no / the Purchase Invoice Mapping menu,
-# app.py's purchase_invoice_mapping_save).
 _LIFECYCLE = {
-    "load":     {"from": ["READY TO LOAD", "REJECTED BY ACCOUNTS"], "to": "PURCHASE INVOICE PENDING"},
+    "load":     {"from": ["READY TO LOAD", "REJECTED BY ACCOUNTS"], "to": "LOADED"},
     "post":     {"from": ["LOADED"],  "to": "POSTED"},
     "complete": {"from": ["POSTED"],  "to": "COMPLETED"},
 }
@@ -1662,6 +1606,9 @@ class TemplateModel(BaseModel):
     po_format: Optional[str] = ""
     static: dict = {}
     user_id: Optional[int] = None
+    # Set only when renaming an existing template (Template Edit screen's
+    # Template name field) - the key it's being renamed FROM.
+    original_key: Optional[str] = None
 
 
 class TemplateKeyModel(BaseModel):
@@ -1698,7 +1645,7 @@ def save_template(payload: TemplateModel):
     try:
         key, folder = template_store.save_template(
             payload.entity, payload.invoice_type, payload.name, payload.po_format,
-            payload.static, payload.user_id,
+            payload.static, payload.user_id, original_key=payload.original_key,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

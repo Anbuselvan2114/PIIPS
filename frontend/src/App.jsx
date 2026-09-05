@@ -11,7 +11,6 @@ import Mapping from "./Mapping";
 import Template from "./Template";
 import UserManagement from "./UserManagement";
 import BuyerOrderEntry from "./BuyerOrderEntry";
-import PurchaseInvoiceMapping from "./PurchaseInvoiceMapping";
 import PartDescriptionUpdate from "./PartDescriptionUpdate";
 import RoleMenuAccess from "./RoleMenuAccess";
 import Lifecycle from "./Lifecycle";
@@ -33,21 +32,17 @@ import { MENU } from "./menuConfig";
 // Access menu's own table might ever contain.
 const DEFAULT_ROLE_MENUS = {
   admin: ["dashboard", "input", "manual", "buyerorder", "partdescupdate",
-          "purchaseinvoicemapping", "load", "post", "complete",
+          "load", "post", "complete",
           "configuration", "apiconfig", "template", "createfield", "users"],
-  // Users process invoices, fix Buyer Order Nos, Load them (which parks
-  // each at Purchase Invoice Pending), then map Purchase Invoice Nos to
-  // finish moving them to Loaded.
-  user: ["dashboard", "input", "manual", "buyerorder", "partdescupdate",
-         "purchaseinvoicemapping", "load"],
+  // Users process invoices, fix Buyer Order Nos, and Load them.
+  user: ["dashboard", "input", "manual", "buyerorder", "partdescupdate", "load"],
   // Accounts run the downstream Post / Complete steps.
   accounts: ["dashboard", "input", "manual", "post", "complete"],
   // Viewer sees invoice-processing data read-only (every mutating action is
   // blocked server-side too, app.py's _require_not_viewer) but not the
   // Setup/Mapping/Admin screens - those configure the app itself rather
   // than show data, and aren't meant for this role.
-  viewer: ["dashboard", "input", "buyerorder", "partdescupdate",
-           "purchaseinvoicemapping", "load", "post", "complete"],
+  viewer: ["dashboard", "input", "buyerorder", "partdescupdate", "load", "post", "complete"],
 };
 
 // Load / Post / Complete are one component parameterised by stage.
@@ -60,7 +55,6 @@ const PAGES = {
   training: Training, createfield: CreateField, mapping: Mapping,
   template: Template, users: UserManagement, dbconfig: DatabaseConfig,
   apiconfig: ApiConfiguration, buyerorder: BuyerOrderEntry,
-  purchaseinvoicemapping: PurchaseInvoiceMapping,
   partdescupdate: PartDescriptionUpdate,
   load: Load, post: Post, complete: Complete, manual: Manuals,
   publish: Publish, mailsettings: MailSettings, announcement: Announcement,

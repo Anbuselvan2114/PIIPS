@@ -10,7 +10,6 @@ export const MENU = [
   ["buyerorder", "Buyer Order Entry", "✎", "Review & Update"],
   ["partdescupdate", "Part Description Mapping", "📝", "Review & Update"],
   ["load", "Load", "📥", "Review & Update"],
-  ["purchaseinvoicemapping", "Purchase Invoice Mapping", "🧾", "Review & Update"],
   ["post", "Post", "📮", "Accounts"],
   ["complete", "Complete", "✅", "Accounts"],
   ["configuration", "Folder Configuration", "⚙", "Setup"],
