@@ -117,10 +117,10 @@ export const getLifecycleInvoices = (stage) =>
 export const getPartDescriptionUpdateItems = () =>
   request("/api/part-description-update/items");
 
-export const savePartDescription = (part_no_map_id, description, user_id) =>
+export const savePartDescription = (part_no_map_id, description, purchase_order_no, user_id) =>
   request("/api/part-description-update/save", {
     method: "POST",
-    body: JSON.stringify({ part_no_map_id, description, user_id }),
+    body: JSON.stringify({ part_no_map_id, description, purchase_order_no, user_id }),
   });
 
 export const advanceLifecycle = (stage, header_ids, user_id) =>

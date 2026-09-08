@@ -765,23 +765,77 @@ def part_description_update_items():
     screen exists to resolve a PDF/SF description MISMATCH specifically,
     so a part whose description already lines up isn't shown just because
     its PO's overall status happens to be DATA MISMATCH for some unrelated
-    reason (a missing field elsewhere, another part on the same PO, etc.)."""
+    reason (a missing field elsewhere, another part on the same PO, etc.) -
+    UNLESS that same description is also claimed by another, different
+    part on the same PO (see DuplicateDescription below), in which case
+    both are always kept regardless: two distinct parts sharing one
+    description means the "match" is ambiguous, not resolved - e.g. an
+    invoice's own line reads "DELL3560-BEZEL" and Service First has BOTH
+    that part AND an unrelated part "0RHGDM" saved under the identical
+    description (someone updated two different parts to the same text) -
+    without this override, whichever part actually corresponds to the PDF
+    line would look "already matched" and silently drop out of view,
+    hiding the fact that a second, wrongly-duplicated part is sitting
+    right behind it, unresolved."""
     import database
     import service_api
     try:
         order_nos = database.buyer_order_nos_for_status("DATA MISMATCH")
         items = service_api.get_specification_mismatch_records(order_nos)
         details_by_po = database.invoice_details_by_buyer_order(order_nos, "DATA MISMATCH")
-        result = []
+
+        # A (PurchaseOrderNo, normalized description) claimed by more than
+        # one distinct PartNoMapID is a real data conflict - flag every
+        # item in the group so the frontend can call it out, and so the
+        # "already matches a PDF description" drop below never applies to
+        # any of them.
+        ids_by_key = {}
+        for item in items:
+            nd = _norm_desc(item.get("Nav_Part_Description"))
+            if not nd:
+                continue
+            key = (item.get("PurchaseOrderNo"), nd)
+            ids_by_key.setdefault(key, set()).add(item.get("PartNoMapID"))
+        dup_keys = {k for k, ids in ids_by_key.items() if len(ids) > 1}
+
+        # First pass: which items are already resolved (dropped below) vs.
+        # kept for review - tracking each PO's resolved descriptions so the
+        # second pass can keep them out of OTHER lines' suggestion list on
+        # the same PO (see kept_items loop below for why).
+        kept_items = []
+        resolved_descs_by_po = {}
         for item in items:
             details = details_by_po.get(item.get("PurchaseOrderNo"), {})
             pdf_descriptions = details.get("descriptions", [])
             item["PdfInvoices"] = details.get("invoices", [])
             item["PdfDescriptions"] = pdf_descriptions
             nav_desc = _norm_desc(item.get("Nav_Part_Description"))
-            if nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
+            key = (item.get("PurchaseOrderNo"), nav_desc)
+            if key in dup_keys:
+                item["DuplicateDescription"] = True
+                kept_items.append(item)
                 continue
+            if nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
+                resolved_descs_by_po.setdefault(item.get("PurchaseOrderNo"), set()).add(nav_desc)
+                continue
+            kept_items.append(item)
+
+        result = []
+        for item in kept_items:
+            po = item.get("PurchaseOrderNo")
+            resolved = resolved_descs_by_po.get(po) or set()
+            # A PO's dropdown offered every one of its PDF's item
+            # descriptions, including ones that already correctly belong to
+            # a DIFFERENT, already-resolved part on the same PO (not shown
+            # here at all) - picking one of those would just recreate the
+            # exact duplicate-description conflict flagged above. Only the
+            # descriptions genuinely still up for grabs (not already
+            # confirmed elsewhere on this PO) are offered.
+            item["PdfDescriptions"] = [
+                d for d in item["PdfDescriptions"] if _norm_desc(d) not in resolved
+            ]
             result.append(item)
+
         return {"items": result}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
@@ -790,6 +844,7 @@ def part_description_update_items():
 class PartDescriptionSaveModel(BaseModel):
     part_no_map_id: int
     description: str
+    purchase_order_no: Optional[str] = None
     user_id: Optional[int] = None
 
 
@@ -800,9 +855,37 @@ def part_description_update_save(payload: PartDescriptionSaveModel):
     InPurchaseLine). part_no_map_id is stores_SparePurchaseLine.PartNoMapID
     (from a GetPurchaseLineSpecificationMismatchRecord row's own
     "PartNoMapID" field) - NOT its "PartID", a different column entirely on
-    the same table."""
+    the same table.
+
+    The same description must map to exactly one part per PO - the
+    frontend already blocks this client-side (PartDescriptionUpdate.jsx's
+    descriptionUsedElsewhereInPo), but that's trivially bypassed (a stale
+    build, a direct API call), and this exact conflict has already
+    happened in practice (two different real parts, e.g. "DELL3560-BEZEL"
+    and "0RHGDM", ended up saved under the identical description) - so it
+    is re-checked here too, against Service First's own current data,
+    before ever pushing the update through. Requires purchase_order_no
+    (the frontend already has it from the row being edited) - the check
+    is skipped, not blocked, when it's not supplied, so this stays
+    backward compatible with any older caller that doesn't send it yet."""
     import service_api
     _require_not_viewer(payload.user_id)
+    desc = (payload.description or "").strip()
+    if payload.purchase_order_no and desc:
+        norm = _norm_desc(desc)
+        try:
+            existing = service_api.get_specification_mismatch_records([payload.purchase_order_no])
+        except Exception:  # noqa: BLE001 - a lookup failure must not silently allow a bad save through
+            raise HTTPException(status_code=502, detail="Could not verify this description against "
+                                                          "Service First's current data - try again.")
+        for item in existing:
+            if (item.get("PartNoMapID") != payload.part_no_map_id
+                    and _norm_desc(item.get("Nav_Part_Description")) == norm):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"\"{desc}\" is already assigned to part {item.get('PartNo') or 'another part'} "
+                           f"on PO {payload.purchase_order_no} - each description can only map to one part.",
+                )
     try:
         result = service_api.update_invoice_description(payload.part_no_map_id, payload.description)
         return {"result": result}

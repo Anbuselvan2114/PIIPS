@@ -419,12 +419,21 @@ export function AnnouncementBell() {
       <button onClick={openPopup} title="Announcements"
               style={{ position: "relative", background: "none", border: "none", cursor: "pointer",
                        fontSize: 19, lineHeight: 1, padding: 6, color: "var(--text)" }}>
-        🔔
+        <span style={{
+          display: "inline-block", transformOrigin: "50% 0%",
+          animation: unread.length > 0 ? "piips-bell-ring 2.4s ease-in-out infinite" : "none",
+        }}>
+          🔔
+        </span>
         {unread.length > 0 && (
           <span style={{
-            position: "absolute", top: 2, right: 2, width: 9, height: 9, borderRadius: "50%",
-            background: "var(--danger)", border: "2px solid var(--surface)",
-          }} />
+            position: "absolute", top: 0, right: 0, minWidth: 15, height: 15, padding: "0 3px",
+            borderRadius: 8, background: "var(--danger)", border: "2px solid var(--surface)",
+            color: "#fff", fontSize: 10, fontWeight: 700, lineHeight: "11px", textAlign: "center",
+            animation: "piips-badge-pulse 1.6s ease-in-out infinite",
+          }}>
+            {unread.length > 9 ? "9+" : unread.length}
+          </span>
         )}
       </button>
 

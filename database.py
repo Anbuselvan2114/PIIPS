@@ -657,24 +657,26 @@ def get_processed_invoices():
 
 # Statuses an existing header may be re-processed FROM (in place, same
 # header/batch/No.) instead of the re-upload being parked as a DUPLICATE -
-# see reprocess_reworkable_header. All four represent an invoice that never
+# see reprocess_reworkable_header. All five represent an invoice that never
 # reached a real, final outcome the first time - Excluded is a deliberate
 # drop (a real re-inclusion - see _mark_batch_reincluded); Pending In SF
 # just means the part hadn't reached Service First yet; Data Mismatch and
-# New Template mean the data/format wasn't usable last time - in every
-# case, a fresh upload deserves a fresh look rather than being told it's a
-# duplicate of itself. This re-processing only ever happens when a USER
-# deliberately re-uploads that exact file and starts a run - nothing here
-# pulls a file back in on its own (see processor.py's main loop, which is
-# the only caller, driven by whatever the user just uploaded).
+# New Template mean the data/format wasn't usable last time; Unsupported
+# means the format matched but something essential (e.g. the Vendor
+# Invoice No.) couldn't be read - in every case, a fresh upload deserves a
+# fresh look rather than being told it's a duplicate of itself. This
+# re-processing only ever happens when a USER deliberately re-uploads that
+# exact file and starts a run - nothing here pulls a file back in on its
+# own (see processor.py's main loop, which is the only caller, driven by
+# whatever the user just uploaded).
 # MANUALLY UPDATED is deliberately NOT in this list - it's what Data
 # Mismatch/Excluded/New Template becomes once usp_ExpireStaleUnresolved
 # parks it as permanently unresolved (Pending In SF is NOT swept by that
 # expiry - a re-upload can still merge into it as before); unlike the
-# four statuses below, a re-upload of a Manually Updated invoice must
+# five statuses below, a re-upload of a Manually Updated invoice must
 # fall through to DUPLICATE, never merge back in.
 # KEEP IN SYNC with usp_GetProcessedInvoices' own copy of this list.
-_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "DATA MISMATCH", "NEW TEMPLATE")
+_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "DATA MISMATCH", "NEW TEMPLATE", "UNSUPPORTED")
 
 
 def reprocess_reworkable_header(existing_header_id, new_header_id):
@@ -1865,6 +1867,7 @@ def invoice_details_by_buyer_order(order_nos, status_name=None):
         conn.close()
 
 
+
 def _existing_cols(cur, table, wanted):
     """Subset of `wanted` that actually exist as columns on `table` (case-
     insensitive), preserving `wanted`'s order."""
@@ -1961,6 +1964,16 @@ def get_invoice_field_check(header_id):
         tracker_row = cur.fetchone()
         buyer_order_no = (tracker_row[0] if tracker_row else "") or ""
 
+        def _num_sort_key(v):
+            # Sorts numerically when possible (Line No./Entry No. are
+            # plain integers-as-strings), blanks/non-numeric values last,
+            # in their original relative order.
+            s = str(v or "").strip()
+            try:
+                return (0, float(s))
+            except ValueError:
+                return (1, s)
+
         # "No." and "HSN/SAC Code" are only mandatory conditionally (on the
         # line's own Type — see excel_export.required_fields_for_line_type),
         # so always fetch both and pick the right one per line below.
@@ -1974,6 +1987,10 @@ def get_invoice_field_check(header_id):
                 header_id,
             )
             line_rows = [dict(zip(line_cols, r)) for r in cur.fetchall()]
+            # Sort by Line No. (the PO's own item sequence) so the Fields
+            # popup lists lines in invoice order rather than whatever order
+            # SQL happened to return them in.
+            line_rows.sort(key=lambda ln: _num_sort_key(ln.get("Line No.")))
 
         # Nav_Part_Description (Service First's GetHSNDetails item-master
         # description) isn't a saved tbl_Purchase_Line column - it only ever
@@ -2054,16 +2071,23 @@ def get_invoice_field_check(header_id):
             source = "Service First" if ln.get("Type") == "Item" else "PDF"
             product_no = str(ln.get("HSN/SAC Code") or "")
             missing = not product_no.strip()
-            # For a part (Item line), a blank result only counts as
-            # "missing" when the PDF itself actually had an HSN that SF
-            # failed to confirm - if the PDF never printed one either,
-            # there was nothing for SF to confirm in the first place, so
-            # it's not a real data problem (Charge lines never touch this:
-            # their HSN already comes straight from the PDF, so a blank
-            # value there always means the PDF genuinely had none).
-            if missing and ln.get("Type") == "Item":
-                desc_key = str(ln.get("Description") or "").strip().lower()
-                missing = bool(pdf_hsn_by_desc.get(desc_key, "").strip())
+            if ln.get("Type") == "Item":
+                # A blank result only counts as "missing" when the PDF
+                # itself actually had an HSN that SF failed to confirm - if
+                # the PDF never printed one either, there was nothing for SF
+                # to confirm in the first place, so it's not a real data
+                # problem.
+                if missing:
+                    desc_key = str(ln.get("Description") or "").strip().lower()
+                    missing = bool(pdf_hsn_by_desc.get(desc_key, "").strip())
+            else:
+                # HSN/SAC Code is optional on a Charge (Item) line (freight/
+                # courier/postage): many vendors never print one, and
+                # excel_export.required_fields_for_line_type never requires
+                # it for this Type either - a blank value here is never a
+                # real data problem, just show whatever the PDF had (if
+                # anything) without flagging it.
+                missing = False
             extra = [
                 {"field": "HSN/SAC Code", "value": product_no,
                  "missing": missing, "source": source},
@@ -2075,7 +2099,12 @@ def get_invoice_field_check(header_id):
                            len(rows) - 1)
             return rows[:idx + 1] + extra + rows[idx + 1:]
 
-        res_cols = _existing_cols(cur, "tbl_Reservation_Entry", excel_export.REQUIRED_RESERVATION_FIELDS)
+        # "Source Ref. No." (= the Purchase Line's own Line No. - see
+        # excel_export._link_override) and "Entry No." are fetched purely
+        # to sort by below, alongside REQUIRED_RESERVATION_FIELDS' own
+        # displayed columns - neither is added to the popup's field list.
+        res_wanted = excel_export.REQUIRED_RESERVATION_FIELDS + ["Source Ref. No.", "Entry No."]
+        res_cols = _existing_cols(cur, "tbl_Reservation_Entry", res_wanted)
         res_rows = []
         if res_cols:
             cur.execute(
@@ -2089,6 +2118,12 @@ def get_invoice_field_check(header_id):
             for rr in res_rows:
                 if "Source Subtype" in rr:
                     rr["Source Subtype"] = "1"
+            # Sort by (Line No., Entry No.) to match line_rows' own Line
+            # No. sort above - groups each reservation under its Purchase
+            # Line, multiple rows for the same line (Quantity > 1) ordered
+            # by Entry No. next.
+            res_rows.sort(key=lambda rs: (_num_sort_key(rs.get("Source Ref. No.")),
+                                           _num_sort_key(rs.get("Entry No."))))
 
         header_rows_out = field_rows("Purchase Header", header_wanted, header_values)
         buyer_order_row = {
@@ -2123,7 +2158,16 @@ def get_invoice_field_check(header_id):
             ],
             "reservations": [
                 {"label": rs.get("Item No.", "") or f"Reservation {i + 1}",
-                 "fields": field_rows("Reservation Entry", excel_export.REQUIRED_RESERVATION_FIELDS, rs)}
+                 # Purchase Line No. (= Source Ref. No., the same value the
+                 # rows are already sorted by above) - display-only, not a
+                 # real mandatory-field check, so it's added straight onto
+                 # the rendered list rather than through
+                 # REQUIRED_RESERVATION_FIELDS: it just lets a user see at a
+                 # glance which Purchase Line this reservation belongs to.
+                 "fields": [
+                     {"field": "Purchase Line No.", "value": rs.get("Source Ref. No.", ""),
+                      "missing": False, "source": "System"},
+                 ] + field_rows("Reservation Entry", excel_export.REQUIRED_RESERVATION_FIELDS, rs)}
                 for i, rs in enumerate(res_rows)
             ],
         }
@@ -3494,17 +3538,17 @@ _MENU_PROC_DDL = [
         -- be uploaded again by anyone, so it is NOT treated as a duplicate.
         -- Same for a file whose linked invoice is currently in any of
         -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/New
-        -- Template) - KEEP THIS LIST IN SYNC with database._REPROCESSABLE_
-        -- STATUSES. Re-uploading one of these is a deliberate correction
-        -- (see processor.py/reprocess_reworkable_header), not a duplicate,
-        -- so it must reach processing rather than being silently skipped
-        -- here before it ever gets that far.
+        -- Template/Unsupported) - KEEP THIS LIST IN SYNC with database.
+        -- _REPROCESSABLE_STATUSES. Re-uploading one of these is a deliberate
+        -- correction (see processor.py/reprocess_reworkable_header), not a
+        -- duplicate, so it must reach processing rather than being silently
+        -- skipped here before it ever gets that far.
         SELECT r.RelPath, r.FileName, r.InitiatedByID, u.UserName AS InitiatedByName,
                r.InitiatedDatetime
         FROM ranked r
         LEFT JOIN dbo.tbl_user u ON u.UserId = r.InitiatedByID
         WHERE r.rn = 1 AND ISNULL(r.StatusID, -1) <> 0
-          AND ISNULL(r.StatusName, '') NOT IN ('EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE');
+          AND ISNULL(r.StatusName, '') NOT IN ('EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE', 'UNSUPPORTED');
     END
     """,
     # ---- Reset input-file log entries (moved to New_Format) --------------
@@ -3713,9 +3757,9 @@ _MENU_PROC_DDL = [
         -- HeaderId/IsReprocessable let the caller re-process an invoice
         -- whose only existing record is in one of database.
         -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/
-        -- New Template), instead of flagging it as a duplicate (see
-        -- database.get_processed_invoices/reprocess_reworkable_header) -
-        -- KEEP THIS LIST IN SYNC with _REPROCESSABLE_STATUSES. Picks one
+        -- New Template/Unsupported), instead of flagging it as a duplicate
+        -- (see database.get_processed_invoices/reprocess_reworkable_header)
+        -- - KEEP THIS LIST IN SYNC with _REPROCESSABLE_STATUSES. Picks one
         -- representative header per invoice no. (MIN Id) since an invoice
         -- no. is expected to map to a single real header in practice.
         -- BuyerOrderNo comes from the tracker (a fixed schema column,
@@ -3725,7 +3769,7 @@ _MENU_PROC_DDL = [
         SELECT h.InvoiceNo, MIN(pt.BatchName) AS BatchName,
                MIN(h.Id) AS HeaderId,
                MAX(CASE WHEN s.StatusName IN (
-                       'EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE'
+                       'EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE', 'UNSUPPORTED'
                    ) THEN 1 ELSE 0 END) AS IsReprocessable,
                MIN(pt.BuyerOrderNo) AS BuyerOrderNo
         FROM dbo.tbl_Purchase_Header h
