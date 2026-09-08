@@ -209,7 +209,16 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
     else { setSortKey(key); setSortDir("asc"); }
   };
 
-  useEffect(() => { setPage(0); }, [query, rows, size]);
+  // Reset to page 1 on a new search or page-size change - NOT on every
+  // `rows` prop change. A caller typically rebuilds that array fresh on
+  // every render (e.g. Dashboard's batchRows = batches.map(...)), so an
+  // unrelated re-render elsewhere on the page (typing into a Doc No./
+  // Entry No. input, say) was giving `rows` a new reference each
+  // keystroke and silently bouncing the table back to page 1 even though
+  // nothing about its own data changed. If the row count genuinely
+  // shrinks out from under the current page, `cur` below already clamps
+  // to the last valid page instead of crashing - no separate reset needed.
+  useEffect(() => { setPage(0); }, [query, size]);
 
   const searchRow = (
     <div style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
