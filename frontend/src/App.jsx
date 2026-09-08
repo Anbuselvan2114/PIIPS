@@ -12,6 +12,7 @@ import Template from "./Template";
 import UserManagement from "./UserManagement";
 import BuyerOrderEntry from "./BuyerOrderEntry";
 import PartDescriptionUpdate from "./PartDescriptionUpdate";
+import RoleMenuAccess from "./RoleMenuAccess";
 import Lifecycle from "./Lifecycle";
 import Login from "./Login";
 import ForgotPassword from "./ForgotPassword";
@@ -20,35 +21,18 @@ import MailSettings from "./MailSettings";
 import Announcement from "./Announcement";
 import Manuals from "./Manuals";
 import Publish from "./Publish";
-import { getConfig, getVersion } from "./api";
+import { getConfig, getVersion, getRoleMenus } from "./api";
+import { MENU } from "./menuConfig";
 
-// key, label, icon, nav group
-const MENU = [
-  ["dashboard", "Dashboard", "▤", "Main"],
-  ["input", "File Explorer", "🗂", "Main"],
-  ["manual", "Manual", "📖", "Main"],
-  ["buyerorder", "Buyer Order Entry", "✎", "Review & Update"],
-  ["partdescupdate", "Part Description Mapping", "📝", "Review & Update"],
-  ["load", "Load", "📥", "Review & Update"],
-  ["post", "Post", "📮", "Accounts"],
-  ["complete", "Complete", "✅", "Accounts"],
-  ["configuration", "Folder Configuration", "⚙", "Setup"],
-  ["dbconfig", "Database Configuration", "🗄", "Setup"],
-  ["apiconfig", "API Configuration", "🔌", "Setup"],
-  ["template", "Template", "🧩", "Setup"],
-  ["createfield", "Create Field", "✚", "Mapping"],
-  ["mapping", "Field Mapping", "🔗", "Mapping"],
-  ["training", "Model Training", "🧠", "Admin"],
-  ["users", "User Management", "👤", "Admin"],
-  ["mailsettings", "Mail Server Setting", "✉", "Admin"],
-  ["announcement", "Announcement", "📣", "Admin"],
-  ["publish", "Publish", "🚀", "Admin"],
-];
-
-const ROLE_MENUS = {
-  "super admin": MENU.map(([k]) => k),
-  developer: MENU.map(([k]) => k),   // legacy alias (pre-rename sessions)
-  admin: ["dashboard", "input", "manual", "buyerorder", "load", "post", "complete",
+// Fallback used until /api/role-menus answers (and if it ever fails) - also
+// exactly what a brand new deployment's tbl_RoleMenu is seeded with (see
+// database._ROLE_MENU_DEFAULTS, which MUST be kept in sync with this).
+// Super Admin/Developer are never fetched or configurable - they always see
+// every menu (MENU.map below), enforced here regardless of what the Screen
+// Access menu's own table might ever contain.
+const DEFAULT_ROLE_MENUS = {
+  admin: ["dashboard", "input", "manual", "buyerorder", "partdescupdate",
+          "load", "post", "complete",
           "configuration", "apiconfig", "template", "createfield", "users"],
   // Users process invoices, fix Buyer Order Nos, and Load them.
   user: ["dashboard", "input", "manual", "buyerorder", "partdescupdate", "load"],
@@ -58,8 +42,7 @@ const ROLE_MENUS = {
   // blocked server-side too, app.py's _require_not_viewer) but not the
   // Setup/Mapping/Admin screens - those configure the app itself rather
   // than show data, and aren't meant for this role.
-  viewer: ["dashboard", "input", "buyerorder", "partdescupdate",
-           "load", "post", "complete"],
+  viewer: ["dashboard", "input", "buyerorder", "partdescupdate", "load", "post", "complete"],
 };
 
 // Load / Post / Complete are one component parameterised by stage.
@@ -75,6 +58,7 @@ const PAGES = {
   partdescupdate: PartDescriptionUpdate,
   load: Load, post: Post, complete: Complete, manual: Manuals,
   publish: Publish, mailsettings: MailSettings, announcement: Announcement,
+  rolemenus: RoleMenuAccess,
 };
 
 const loadUser = () => {
@@ -124,6 +108,20 @@ export default function App() {
   useEffect(() => {
     getVersion().then((v) => setAppVersion(v.version)).catch(() => {});
   }, []);
+
+  // Which menu keys each role can see - starts at DEFAULT_ROLE_MENUS (so
+  // the sidebar never flashes empty/wrong while this loads) and is
+  // replaced once /api/role-menus answers. refreshRoleMenus is passed down
+  // to every page as onRoleMenusSaved so the Screen Access menu's own Save
+  // button can re-run it, applying a Super Admin's edit to their own
+  // sidebar immediately without a full reload. Super Admin/Developer are
+  // always the full MENU list, never fetched - see DEFAULT_ROLE_MENUS.
+  const [roleMenus, setRoleMenus] = useState(DEFAULT_ROLE_MENUS);
+  const refreshRoleMenus = () =>
+    getRoleMenus()
+      .then((r) => setRoleMenus((prev) => ({ ...prev, ...(r.mapping || {}) })))
+      .catch(() => {});
+  useEffect(() => { refreshRoleMenus(); }, []);
 
   // Single-tab guard: a casual convenience, not real security - a private
   // window, a different browser, or simply not supporting BroadcastChannel
@@ -243,7 +241,10 @@ export default function App() {
     );
   }
 
-  const allowed = ROLE_MENUS[(user.user_type || "").toLowerCase()] || ROLE_MENUS.user;
+  const roleKey = (user.user_type || "").toLowerCase();
+  const allowed = ["super admin", "developer"].includes(roleKey)
+    ? MENU.map(([k]) => k)
+    : roleMenus[roleKey] || DEFAULT_ROLE_MENUS.user;
   const menu = MENU.filter(([k]) => allowed.includes(k));
   const activePage = allowed.includes(page) ? page : menu[0][0];
   const Active = PAGES[activePage];
@@ -316,7 +317,9 @@ export default function App() {
             </select>
           </label>
         </header>
-        <div className="content" style={{ flex: 1 }}>{Active ? <Active user={user} /> : null}</div>
+        <div className="content" style={{ flex: 1 }}>
+          {Active ? <Active user={user} onRoleMenusSaved={refreshRoleMenus} /> : null}
+        </div>
         <div className="hint" style={{ textAlign: "center", padding: "14px 28px",
                                         borderTop: "1px solid var(--border)", whiteSpace: "nowrap" }}>
           © 2026 Precision Techserve Madras Pvt. Ltd. All Rights Reserved. —

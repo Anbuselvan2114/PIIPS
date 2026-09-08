@@ -265,6 +265,19 @@ class JobManager:
             ocr = OCREngine()
             fmt_model = FormatModel()
 
+            # Super Admin toggle (config_store's "allow_scanned_pdfs") for
+            # whether a scanned/photocopied invoice (PART or SERVICE) gets
+            # OCR-extracted instead of rejected outright - see ocr_engine.
+            # read_pdf's own docstring for the full rationale. Loaded once
+            # per run, not per file.
+            try:
+                import config_store
+                allow_scanned_setting = bool(
+                    config_store.load_config().get("allow_scanned_pdfs")
+                )
+            except Exception:  # noqa: BLE001 - default to the safe/off behaviour
+                allow_scanned_setting = False
+
             def _finish_group(ctx, verdict):
                 """Complete one invoice given its verdict (computed
                 immediately for non-SF cases, or from the batched SF apply
@@ -383,7 +396,14 @@ class JobManager:
 
                 try:
 
-                    ocr_result = ocr.read_pdf(src_path)
+                    # Both PART and SERVICE, and both normal processing and
+                    # Train - a scanned file sitting in New_Format is OCR'd
+                    # the same as any other when this is on, so it can
+                    # still be learned/merged as a trained format instead
+                    # of being stuck as permanently unsupported.
+                    allow_scanned = allow_scanned_setting
+
+                    ocr_result = ocr.read_pdf(src_path, allow_scanned=allow_scanned)
 
                     if job.mode == "train":
 
@@ -431,6 +451,16 @@ class JobManager:
 
                             data["Template_Name"] = fmt_name
                             data["Template"] = fmt_name
+
+                            # Whole-document flag from ocr_engine.read_pdf -
+                            # used below (Final data-completeness gate) so a
+                            # missing PDF-sourced field routes to NEW
+                            # TEMPLATE only for a born-digital page; on a
+                            # scanned/OCR'd one it's far more likely this
+                            # one document's own numbers were misread than
+                            # that the (already-matched) template itself
+                            # needs work.
+                            data["_is_scanned"] = bool(ocr_result.get("IsScanned"))
 
                             # GST Vendor Type is derived, not extracted:
                             # a seller with a readable GSTIN is GST
@@ -542,6 +572,22 @@ class JobManager:
                                 invoice_type == "PART"
                                 and not any(not it.get("_charge") for it in data.get("items", []))
                             )
+                            # A scanned page whose format DID match an
+                            # already-trained one, but whose Vendor Invoice
+                            # No. still couldn't be read, isn't a training
+                            # gap - the template is already known, so
+                            # retraining it wouldn't fix anything. It's this
+                            # one scan's own poor OCR quality, the same
+                            # class of problem as a corrupt/unreadable PDF -
+                            # reject it as UNSUPPORTED (via the same
+                            # exception path every other unreadable file
+                            # already takes) instead of parking it as a
+                            # misleading "needs training".
+                            if fmt_name is not None and not inv_no and data.get("_is_scanned"):
+                                raise ValueError(
+                                    "Vendor Invoice No. could not be read from this scan "
+                                    "(the format itself is already trained) — unsupported."
+                                )
                             if fmt_name is None or not inv_no or no_real_items:
                                 # Either the format itself is unrecognized,
                                 # no Vendor Invoice No. could be read off
@@ -659,6 +705,7 @@ class JobManager:
                 self._save_to_db(job)
                 self._reset_moved_files(job)
                 self._resync_pending(job)
+                self._expire_stale_unresolved(job)
                 self._move_by_status(job)
 
             with job._lock:
@@ -796,12 +843,18 @@ class JobManager:
             #     (PENDING IN SF / DATA MISMATCH verdicts are provisional,
             #     not final, until the data itself is checked).
             #   - a mandatory field whose source is the PDF itself (not
-            #     Service First/System/Template) is missing -> NEW TEMPLATE,
-            #     not DATA MISMATCH: the extraction/template failed to read
-            #     something the PDF should have stated outright (e.g.
-            #     Quantity, Direct Unit Cost, Line Amount), which is a
-            #     training gap, not a one-off data problem - copied into
-            #     New_Format the same way an unrecognized format is.
+            #     Service First/System/Template) is missing on a born-
+            #     digital page -> NEW TEMPLATE, not DATA MISMATCH: the
+            #     extraction/template failed to read something the PDF
+            #     should have stated outright (e.g. Quantity, Direct Unit
+            #     Cost, Line Amount), which is a training gap, not a
+            #     one-off data problem - copied into New_Format the same
+            #     way an unrecognized format is. On a scanned/OCR'd page
+            #     (data["_is_scanned"]) this same gap stays DATA MISMATCH
+            #     instead: the format itself already matched a trained
+            #     one, so a blank field here is far more likely this one
+            #     document's own numbers being misread by OCR than a
+            #     genuine template problem retraining could ever fix.
             #   - otherwise anything missing -> DATA MISMATCH, with exactly
             #     which field(s) - excluding one whose only possible source
             #     is an unset Template value (see excel_export._is_none_
@@ -823,7 +876,8 @@ class JobManager:
                 )
                 missing_names = sorted({m["field"] for m in missing})
                 pdf_missing = sorted({m["field"] for m in missing if m["source"] == "PDF"})
-                if pdf_missing:
+                is_scanned = bool((matched[i].get("data") or {}).get("_is_scanned"))
+                if pdf_missing and not is_scanned:
                     tracker["statuses"][i] = "NEW TEMPLATE"
                     tracker["isactives"][i] = False
                     matched[i]["reason"] = (
@@ -903,12 +957,44 @@ class JobManager:
             if not (config_store.load_config().get("db_connection") or "").strip():
                 return
             import database
-            result = database.resync_pending()
+            result = database.resync_pending(batch_name=job.batch_name)
             if result.get("promoted"):
                 print(f"Re-synced {result['promoted']} pending record(s)")
             with job._lock:
                 for reason in result.get("errors", []):
                     job.errors.append({"file": "(re-sync)", "invoice_no": "", "reason": reason})
+        except Exception:  # noqa: BLE001 - best-effort
+            traceback.print_exc()
+
+    @staticmethod
+    def _expire_stale_unresolved(job):
+        """Park any Data Mismatch/Excluded/New Template invoice left
+        unresolved past database.STALE_STATUS_EXPIRY_DAYS as Manually
+        Updated - permanently; it stops counting toward batch status and
+        can never be reprocessed again (see database.expire_stale_unresolved).
+        Also moves each expired PDF into the Manually Updated folder - the
+        DB-only UPDATE doesn't touch the filesystem itself, and these files
+        come from earlier runs, not this job's own results (see
+        _move_by_status). Unsupported gets the same treatment by filesystem
+        age instead (config_store.expire_stale_files), since it never gets
+        a database row at all - a pure exception + file move (see the main
+        loop's UNSUPPORTED handling above)."""
+        try:
+            import config_store
+            if not (config_store.load_config().get("db_connection") or "").strip():
+                return
+            import database
+            filenames = database.expire_stale_unresolved()
+            if filenames:
+                print(f"Expired {len(filenames)} stale record(s) to Manually Updated")
+                for fname in filenames:
+                    config_store.move_pdf_to_status(fname, "MANUALLY UPDATED")
+
+            unsupported = config_store.expire_stale_files(
+                "UNSUPPORTED", database.STALE_STATUS_EXPIRY_DAYS, "MANUALLY UPDATED"
+            )
+            if unsupported:
+                print(f"Expired {len(unsupported)} stale Unsupported file(s) to Manually Updated")
         except Exception:  # noqa: BLE001 - best-effort
             traceback.print_exc()
 

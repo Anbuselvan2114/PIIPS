@@ -6,6 +6,22 @@
   from { opacity: 0; transform: scale(.94) translateY(6px); }
   to { opacity: 1; transform: scale(1) translateY(0); }
 }
+/* Announcement bell: rings briefly at the start of each cycle, then holds
+   still for the rest of it, so it reads as an occasional ring rather than
+   a constant, distracting wobble. */
+@keyframes piips-bell-ring {
+  0%, 100% { transform: rotate(0deg); }
+  1% { transform: rotate(14deg); }
+  2% { transform: rotate(-12deg); }
+  3% { transform: rotate(10deg); }
+  4% { transform: rotate(-8deg); }
+  5% { transform: rotate(4deg); }
+  6% { transform: rotate(0deg); }
+}
+@keyframes piips-badge-pulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(220,38,38,.55); }
+  50% { transform: scale(1.18); box-shadow: 0 0 0 4px rgba(220,38,38,0); }
+}
 
 :root {
   --bg: #eef1f6;
@@ -225,6 +241,11 @@ textarea { height: auto; min-height: 80px; padding: 10px 12px; }
 .row > .field { flex: 1; min-width: 160px; }
 
 input:disabled, select:disabled { background: var(--surface-2); color: var(--muted); cursor: not-allowed; }
+
+/* type-and-search dropdown (SearchableSelect) - a <select> replacement
+   for a long/growing option list, e.g. File Explorer's Template picker */
+.searchable-select-option { padding: 7px 12px; cursor: pointer; font-size: 14px; }
+.searchable-select-option:hover, .searchable-select-option.active { background: var(--surface-2); }
 
 /* generic input with a leading icon */
 .input-group {

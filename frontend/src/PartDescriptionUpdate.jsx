@@ -113,7 +113,7 @@ export default function PartDescriptionUpdate({ user }) {
     }
     setSaving(key); setError(null); setMsg(null);
     try {
-      await savePartDescription(row.PartNoMapID, description, user?.user_id);
+      await savePartDescription(row.PartNoMapID, description, row.PurchaseOrderNo, user?.user_id);
       lastValidRef.current[key] = description;
       setMsg(`Updated Service First's description for the part no ${row.PartNo || "this part"}.`);
     } catch (e) {
@@ -153,6 +153,11 @@ export default function PartDescriptionUpdate({ user }) {
           <div><b>Quantity:</b> {row.Quantity ?? "—"}</div>
           <div><b>Unit Price:</b> {row.UnitPrice ?? "—"}</div>
           <div><b>SF Part Specification:</b> {row.PartSpecification || "—"}</div>
+          {row.DuplicateDescription && (
+            <div style={{ color: "var(--danger, #c0392b)", marginTop: 4, fontWeight: 600 }}>
+              ⚠ Same description also used by another part on this PO
+            </div>
+          )}
         </div>
       ) },
     { key: "Nav_Part_Description", label: "Invoice Part Description (IN SF)", sortable: false,

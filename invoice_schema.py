@@ -773,6 +773,11 @@ def build_invoice_json(result, pdf_path=""):
         buyer_state_code = _state_from_gstin(fields.get("Buyer GSTIN/UIN", ""))
     if not consignee_state_code:
         consignee_state_code = _state_from_gstin(fields.get("Consignee GSTIN/UIN", ""))
+
+    seller_addr = fields.get("Seller Address", "")
+    buyer_addr = fields.get("Buyer Address", "")
+    consignee_addr = fields.get("Consignee Address", "")
+
     if not seller_state_name and seller_state_code in STATE_CODES:
         seller_state_name = STATE_CODES[seller_state_code][0]
     if not buyer_state_name and buyer_state_code in STATE_CODES:
@@ -780,9 +785,16 @@ def build_invoice_json(result, pdf_path=""):
     if not consignee_state_name and consignee_state_code in STATE_CODES:
         consignee_state_name = STATE_CODES[consignee_state_code][0]
 
-    seller_addr = fields.get("Seller Address", "")
-    buyer_addr = fields.get("Buyer Address", "")
-    consignee_addr = fields.get("Consignee Address", "")
+    # Last-resort buyer-state fallback: the buyer on every invoice this
+    # tool processes is Precision Techserve's own Chennai office, which
+    # never moves - unlike the seller (genuinely different per vendor,
+    # so it gets no such default), a blank buyer state here only ever
+    # means the vendor's layout didn't print a Buyer GSTIN/state/address
+    # at all, never that the buyer was actually in some other state.
+    if not buyer_state_code:
+        buyer_state_code = "33"
+    if not buyer_state_name:
+        buyer_state_name = STATE_CODES[buyer_state_code][0]
 
     seller_a1, seller_a2 = _address_lines(seller_addr)
     buyer_a1, buyer_a2 = _address_lines(buyer_addr)

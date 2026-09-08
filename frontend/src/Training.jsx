@@ -5,7 +5,7 @@ import {
 } from "./api";
 import { DataTable, confirmDialog } from "./components";
 
-export default function Training() {
+export default function Training({ user }) {
   const [job, setJob] = useState(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState(null);
@@ -36,7 +36,7 @@ export default function Training() {
   const onRestore = async (name) => {
     if (!(await confirmDialog(`Restore model from backup:\n${name}?`, { confirmLabel: "Restore" }))) return;
     setError(null); setNotice(null);
-    try { const r = await restoreBackup(name); setNotice(r.message || `Restored ${name}`); setCurrent(name); }
+    try { const r = await restoreBackup(name, user?.user_id); setNotice(r.message || `Restored ${name}`); setCurrent(name); }
     catch (e) { setError(e.message); }
   };
 
@@ -57,7 +57,7 @@ export default function Training() {
 
   const onTrain = async () => {
     setError(null); setNotice(null); setJob(null);
-    try { const { job_id } = await startTraining(); setRunning(true); poll(job_id); }
+    try { const { job_id } = await startTraining(user?.user_id); setRunning(true); poll(job_id); }
     catch (e) { setError(e.message); }
   };
 

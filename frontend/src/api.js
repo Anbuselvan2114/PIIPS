@@ -60,6 +60,12 @@ export const saveConfig = (folderPath) =>
     body: JSON.stringify({ folder_path: folderPath }),
   });
 
+export const setScannedPdfsEnabled = (enabled, user_id) =>
+  request("/api/config/scanned-pdfs", {
+    method: "POST",
+    body: JSON.stringify({ enabled, user_id }),
+  });
+
 export const getApiConfig = () => request("/api/api-config");
 
 export const saveApiConfig = (sfApiUrl) =>
@@ -97,16 +103,24 @@ export const setBuyerOrder = (header_id, buyer_order_no, user_id) =>
     body: JSON.stringify({ header_id, buyer_order_no, user_id }),
   });
 
+export const getRoleMenus = () => request("/api/role-menus");
+
+export const saveRoleMenus = (mapping, user_id) =>
+  request("/api/role-menus", {
+    method: "POST",
+    body: JSON.stringify({ mapping, user_id }),
+  });
+
 export const getLifecycleInvoices = (stage) =>
   request(`/api/lifecycle/invoices?stage=${encodeURIComponent(stage)}`);
 
 export const getPartDescriptionUpdateItems = () =>
   request("/api/part-description-update/items");
 
-export const savePartDescription = (part_no_map_id, description, user_id) =>
+export const savePartDescription = (part_no_map_id, description, purchase_order_no, user_id) =>
   request("/api/part-description-update/save", {
     method: "POST",
-    body: JSON.stringify({ part_no_map_id, description, user_id }),
+    body: JSON.stringify({ part_no_map_id, description, purchase_order_no, user_id }),
   });
 
 export const advanceLifecycle = (stage, header_ids, user_id) =>
@@ -136,8 +150,8 @@ export const startProcessing = (user_id) =>
     body: JSON.stringify({ user_id }),
   });
 
-export const startTraining = () =>
-  request("/api/train", { method: "POST" });
+export const startTraining = (user_id) =>
+  request(`/api/train${user_id != null ? `?user_id=${user_id}` : ""}`, { method: "POST" });
 
 export const getTrainFiles = () => request("/api/train/files");
 
@@ -236,10 +250,10 @@ export const changePassword = (user_id, current_password, new_password) =>
 
 export const getUsers = () => request("/api/users");
 
-export const createUser = (username, email, user_type_id, created_by) =>
+export const createUser = (username, email, user_type_id, created_by, password) =>
   request("/api/users", {
     method: "POST",
-    body: JSON.stringify({ username, email, user_type_id, created_by }),
+    body: JSON.stringify({ username, email, user_type_id, created_by, password }),
   });
 
 export const setUserActive = (user_id, is_active, modified_by) =>
@@ -305,8 +319,8 @@ export const stopAnnouncement = (announcement_id, user_id) =>
 
 export const announcementImageUrl = (path) => `${API_BASE}/announcement_media/${encodeURIComponent(path)}`;
 
-export const clearFormats = () =>
-  request("/api/formats", { method: "DELETE" });
+export const clearFormats = (user_id) =>
+  request(`/api/formats${user_id != null ? `?user_id=${user_id}` : ""}`, { method: "DELETE" });
 
 const sub = (subpath) =>
   subpath ? `?subpath=${encodeURIComponent(subpath)}` : "";
@@ -365,8 +379,8 @@ export const publishDeploy = (environment, user_id) =>
 
 export const getBackups = () => request("/api/backups");
 
-export const restoreBackup = (name) =>
+export const restoreBackup = (name, user_id) =>
   request("/api/backups/restore", {
     method: "POST",
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, user_id }),
   });

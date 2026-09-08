@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoicePdfUrl, getActiveAnnouncements, announcementImageUrl } from "./api";
 
@@ -80,13 +80,97 @@ export function PasswordInput({
   );
 }
 
+// Type-and-search <select> replacement: an input that filters `options`
+// (an array of strings) as you type, with a click/keyboard-navigable
+// dropdown below it. Stays a PICKER, not free text - blurring without
+// landing on an exact option reverts the text to `value`, so the parent
+// only ever sees one of `options` (or "") through onChange, same
+// contract a plain <select> has. Built for File Explorer's Template
+// dropdown (which can grow to many entries a native <select> makes
+// tedious to scan) but generic enough for any string-option picker.
+export function SearchableSelect({ value, onChange, options, placeholder = "Search…", disabled, emptyLabel }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState(value || "");
+  const [activeIdx, setActiveIdx] = useState(-1);
+  const blurTimer = useRef(null);
+
+  // Reflect an externally-changed `value` into the displayed text, but
+  // never fight the user while they're actively typing/filtering.
+  useEffect(() => { if (!open) setQuery(value || ""); }, [value, open]);
+  useEffect(() => () => clearTimeout(blurTimer.current), []);
+
+  const q = query.trim().toLowerCase();
+  const filtered = useMemo(
+    () => options.filter((o) => !q || o.toLowerCase().includes(q)),
+    [options, q]
+  );
+
+  const commit = (v) => { onChange(v); setQuery(v); setOpen(false); setActiveIdx(-1); };
+  const revert = () => { setQuery(value || ""); setOpen(false); setActiveIdx(-1); };
+
+  return (
+    <div style={{ position: "relative" }}>
+      <input
+        className="input"
+        value={query}
+        placeholder={placeholder}
+        disabled={disabled}
+        onFocus={() => { setQuery(value || ""); setOpen(true); setActiveIdx(-1); }}
+        onChange={(e) => { setQuery(e.target.value); setOpen(true); setActiveIdx(-1); }}
+        onBlur={() => {
+          // Delayed so a suggestion's onMouseDown (which fires first)
+          // still registers before this closes/reverts the field.
+          blurTimer.current = setTimeout(revert, 150);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") { revert(); e.currentTarget.blur(); }
+          else if (e.key === "ArrowDown") { e.preventDefault(); setOpen(true); setActiveIdx((i) => Math.min(i + 1, filtered.length - 1)); }
+          else if (e.key === "ArrowUp") { e.preventDefault(); setActiveIdx((i) => Math.max(i - 1, 0)); }
+          else if (e.key === "Enter") { e.preventDefault(); if (activeIdx >= 0 && filtered[activeIdx]) commit(filtered[activeIdx]); }
+        }} />
+      {open && filtered.length > 0 && (
+        <div style={{
+          position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50,
+          background: "var(--surface)", border: "1px solid var(--border)",
+          borderRadius: "var(--radius-sm)", marginTop: 2, maxHeight: 220,
+          overflowY: "auto", boxShadow: "0 8px 24px rgba(0,0,0,.12)",
+        }}>
+          {filtered.map((o, i) => (
+            <div key={o} onMouseDown={() => commit(o)}
+                 onMouseEnter={() => setActiveIdx(i)}
+                 className={`searchable-select-option${i === activeIdx ? " active" : ""}`}>
+              {o}
+            </div>
+          ))}
+        </div>
+      )}
+      {open && filtered.length === 0 && emptyLabel && (
+        <div style={{
+          position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50,
+          background: "var(--surface)", border: "1px solid var(--border)",
+          borderRadius: "var(--radius-sm)", marginTop: 2, boxShadow: "0 8px 24px rgba(0,0,0,.12)",
+        }}>
+          <div className="searchable-select-option" style={{ color: "var(--muted)", cursor: "default" }}>
+            {emptyLabel}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Generic table: search box, click-to-sort headers, 10-row pagination.
 // columns: [{ key, label, render?(row), sortable? }]
+// defaultSortKey/defaultSortDir: sort applied up front (shown pre-sorted,
+// with the header's arrow already lit) instead of leaving it unsorted
+// until the user clicks a header - use when the rows' own incoming order
+// isn't a reliable enough guarantee on its own for the caller's intent.
 export function DataTable({ columns, rows, searchKeys, pageSize = 10,
-                            pageSizeOptions, empty, actions }) {
+                            pageSizeOptions, empty, actions,
+                            defaultSortKey = null, defaultSortDir = "asc" }) {
   const [query, setQuery] = useState("");
-  const [sortKey, setSortKey] = useState(null);
-  const [sortDir, setSortDir] = useState("asc");
+  const [sortKey, setSortKey] = useState(defaultSortKey);
+  const [sortDir, setSortDir] = useState(defaultSortDir);
   const [page, setPage] = useState(0);
   // When pageSizeOptions is given, the user can change rows-per-page (incl.
   // "All"); otherwise the fixed `pageSize` prop is used.
@@ -340,12 +424,21 @@ export function AnnouncementBell() {
       <button onClick={openPopup} title="Announcements"
               style={{ position: "relative", background: "none", border: "none", cursor: "pointer",
                        fontSize: 19, lineHeight: 1, padding: 6, color: "var(--text)" }}>
-        🔔
+        <span style={{
+          display: "inline-block", transformOrigin: "50% 0%",
+          animation: unread.length > 0 ? "piips-bell-ring 2.4s ease-in-out infinite" : "none",
+        }}>
+          🔔
+        </span>
         {unread.length > 0 && (
           <span style={{
-            position: "absolute", top: 2, right: 2, width: 9, height: 9, borderRadius: "50%",
-            background: "var(--danger)", border: "2px solid var(--surface)",
-          }} />
+            position: "absolute", top: 0, right: 0, minWidth: 15, height: 15, padding: "0 3px",
+            borderRadius: 8, background: "var(--danger)", border: "2px solid var(--surface)",
+            color: "#fff", fontSize: 10, fontWeight: 700, lineHeight: "11px", textAlign: "center",
+            animation: "piips-badge-pulse 1.6s ease-in-out infinite",
+          }}>
+            {unread.length > 9 ? "9+" : unread.length}
+          </span>
         )}
       </button>
 

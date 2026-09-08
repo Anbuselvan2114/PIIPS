@@ -20,15 +20,26 @@ ACCEPTED_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".web
 
 app = FastAPI(
     title="Precision Intelligent Invoice Processing Suite",
-    version="2.2"
+    version="2.2.1"
 )
 
 
-# Allow the React frontend (dev server / other origin) to call the API.
+# Explicit origin allow-list: the local Vite dev server, plus the real
+# live (piips.precisionit.co.in:8010) and uat (10.0.1.210:8080)
+# deployments. allow_credentials is deliberately False: nothing in
+# api.js's fetch() calls ever sends credentials cross-origin (no
+# `credentials: "include"` anywhere - auth here is just a user_id in the
+# request body/query, not a cookie/session), so allow_origins=["*"] +
+# allow_credentials=True was a spec-disallowed combination protecting
+# nothing.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:5173", "http://localhost:3000",
+        "https://piips.precisionit.co.in:8010",
+        "http://10.0.1.210:8080",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -94,6 +105,22 @@ def _public_config(cfg):
 @app.get("/api/config")
 def get_config():
     return _public_config(config_store.load_config())
+
+
+class ScannedPdfsModel(BaseModel):
+    enabled: bool
+    user_id: Optional[int] = None
+
+
+@app.post("/api/config/scanned-pdfs")
+def set_scanned_pdfs(payload: ScannedPdfsModel):
+    """Super Admin toggle: whether a scanned/photocopied invoice (PART or
+    SERVICE, no embedded text layer) gets OCR-extracted instead of
+    rejected outright. See config_store.DEFAULT_CONFIG's own comment for
+    the full rationale."""
+    _require_developer(payload.user_id)
+    config_store.save_config({"allow_scanned_pdfs": bool(payload.enabled)})
+    return {"ok": True, "allow_scanned_pdfs": bool(payload.enabled)}
 
 
 def _writable(path):
@@ -576,8 +603,17 @@ def status_counts():
             n = len(files())
             if n:
                 sid = database.status_id(name) or 1
+                # Re-inserted at the SAME position it already held in
+                # `counts` (database.status_counts() lists every status,
+                # even a real-tracker-row count of 0 - see
+                # usp_StatusCounts, ordered by DisplayOrder) rather than
+                # forced to the front, so this synthetic folder-based
+                # count still respects DisplayOrder/STATUS_VALUES' order
+                # like every other status.
+                idx = next((i for i, c in enumerate(counts)
+                            if (c.get("status") or "").upper() == name), 0)
                 counts = [c for c in counts if (c.get("status") or "").upper() != name]
-                counts.insert(0, {"status_id": sid, "status": name, "count": n})
+                counts.insert(idx, {"status_id": sid, "status": name, "count": n})
         except Exception:  # noqa: BLE001 - synthetic count is best-effort
             import traceback
             traceback.print_exc()
@@ -729,23 +765,77 @@ def part_description_update_items():
     screen exists to resolve a PDF/SF description MISMATCH specifically,
     so a part whose description already lines up isn't shown just because
     its PO's overall status happens to be DATA MISMATCH for some unrelated
-    reason (a missing field elsewhere, another part on the same PO, etc.)."""
+    reason (a missing field elsewhere, another part on the same PO, etc.) -
+    UNLESS that same description is also claimed by another, different
+    part on the same PO (see DuplicateDescription below), in which case
+    both are always kept regardless: two distinct parts sharing one
+    description means the "match" is ambiguous, not resolved - e.g. an
+    invoice's own line reads "DELL3560-BEZEL" and Service First has BOTH
+    that part AND an unrelated part "0RHGDM" saved under the identical
+    description (someone updated two different parts to the same text) -
+    without this override, whichever part actually corresponds to the PDF
+    line would look "already matched" and silently drop out of view,
+    hiding the fact that a second, wrongly-duplicated part is sitting
+    right behind it, unresolved."""
     import database
     import service_api
     try:
         order_nos = database.buyer_order_nos_for_status("DATA MISMATCH")
         items = service_api.get_specification_mismatch_records(order_nos)
         details_by_po = database.invoice_details_by_buyer_order(order_nos, "DATA MISMATCH")
-        result = []
+
+        # A (PurchaseOrderNo, normalized description) claimed by more than
+        # one distinct PartNoMapID is a real data conflict - flag every
+        # item in the group so the frontend can call it out, and so the
+        # "already matches a PDF description" drop below never applies to
+        # any of them.
+        ids_by_key = {}
+        for item in items:
+            nd = _norm_desc(item.get("Nav_Part_Description"))
+            if not nd:
+                continue
+            key = (item.get("PurchaseOrderNo"), nd)
+            ids_by_key.setdefault(key, set()).add(item.get("PartNoMapID"))
+        dup_keys = {k for k, ids in ids_by_key.items() if len(ids) > 1}
+
+        # First pass: which items are already resolved (dropped below) vs.
+        # kept for review - tracking each PO's resolved descriptions so the
+        # second pass can keep them out of OTHER lines' suggestion list on
+        # the same PO (see kept_items loop below for why).
+        kept_items = []
+        resolved_descs_by_po = {}
         for item in items:
             details = details_by_po.get(item.get("PurchaseOrderNo"), {})
             pdf_descriptions = details.get("descriptions", [])
             item["PdfInvoices"] = details.get("invoices", [])
             item["PdfDescriptions"] = pdf_descriptions
             nav_desc = _norm_desc(item.get("Nav_Part_Description"))
-            if nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
+            key = (item.get("PurchaseOrderNo"), nav_desc)
+            if key in dup_keys:
+                item["DuplicateDescription"] = True
+                kept_items.append(item)
                 continue
+            if nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
+                resolved_descs_by_po.setdefault(item.get("PurchaseOrderNo"), set()).add(nav_desc)
+                continue
+            kept_items.append(item)
+
+        result = []
+        for item in kept_items:
+            po = item.get("PurchaseOrderNo")
+            resolved = resolved_descs_by_po.get(po) or set()
+            # A PO's dropdown offered every one of its PDF's item
+            # descriptions, including ones that already correctly belong to
+            # a DIFFERENT, already-resolved part on the same PO (not shown
+            # here at all) - picking one of those would just recreate the
+            # exact duplicate-description conflict flagged above. Only the
+            # descriptions genuinely still up for grabs (not already
+            # confirmed elsewhere on this PO) are offered.
+            item["PdfDescriptions"] = [
+                d for d in item["PdfDescriptions"] if _norm_desc(d) not in resolved
+            ]
             result.append(item)
+
         return {"items": result}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
@@ -754,6 +844,7 @@ def part_description_update_items():
 class PartDescriptionSaveModel(BaseModel):
     part_no_map_id: int
     description: str
+    purchase_order_no: Optional[str] = None
     user_id: Optional[int] = None
 
 
@@ -764,9 +855,37 @@ def part_description_update_save(payload: PartDescriptionSaveModel):
     InPurchaseLine). part_no_map_id is stores_SparePurchaseLine.PartNoMapID
     (from a GetPurchaseLineSpecificationMismatchRecord row's own
     "PartNoMapID" field) - NOT its "PartID", a different column entirely on
-    the same table."""
+    the same table.
+
+    The same description must map to exactly one part per PO - the
+    frontend already blocks this client-side (PartDescriptionUpdate.jsx's
+    descriptionUsedElsewhereInPo), but that's trivially bypassed (a stale
+    build, a direct API call), and this exact conflict has already
+    happened in practice (two different real parts, e.g. "DELL3560-BEZEL"
+    and "0RHGDM", ended up saved under the identical description) - so it
+    is re-checked here too, against Service First's own current data,
+    before ever pushing the update through. Requires purchase_order_no
+    (the frontend already has it from the row being edited) - the check
+    is skipped, not blocked, when it's not supplied, so this stays
+    backward compatible with any older caller that doesn't send it yet."""
     import service_api
     _require_not_viewer(payload.user_id)
+    desc = (payload.description or "").strip()
+    if payload.purchase_order_no and desc:
+        norm = _norm_desc(desc)
+        try:
+            existing = service_api.get_specification_mismatch_records([payload.purchase_order_no])
+        except Exception:  # noqa: BLE001 - a lookup failure must not silently allow a bad save through
+            raise HTTPException(status_code=502, detail="Could not verify this description against "
+                                                          "Service First's current data - try again.")
+        for item in existing:
+            if (item.get("PartNoMapID") != payload.part_no_map_id
+                    and _norm_desc(item.get("Nav_Part_Description")) == norm):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"\"{desc}\" is already assigned to part {item.get('PartNo') or 'another part'} "
+                           f"on PO {payload.purchase_order_no} - each description can only map to one part.",
+                )
     try:
         result = service_api.update_invoice_description(payload.part_no_map_id, payload.description)
         return {"result": result}
@@ -808,6 +927,39 @@ def invoices_set_buyer_order(payload: BuyerOrderModel):
     return {"ok": True, "new_status": res.get("new_status"),
             "is_active": res.get("is_active"), "reason": res.get("reason", ""),
             "moved_to": moved}
+
+
+@app.get("/api/role-menus")
+def get_role_menus():
+    """Which menu keys each configurable role (admin/user/accounts/viewer)
+    can see - read by every logged-in client to build its own sidebar, so
+    no auth gate here beyond being reachable at all (same as /api/config).
+    Super Admin/Developer always see every menu, unconfigurable, and are
+    never part of this mapping - see database.get_role_menus."""
+    import database
+    try:
+        return {"mapping": database.get_role_menus()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+class RoleMenusModel(BaseModel):
+    mapping: dict
+    user_id: Optional[int] = None
+
+
+@app.post("/api/role-menus")
+def save_role_menus(payload: RoleMenusModel):
+    """Replace the whole role->menu mapping - Screen Access menu's Save
+    button. Super Admin only: this controls who can reach every other
+    screen (including this one), so a lower-privileged role must never be
+    able to grant itself more access."""
+    import database
+    _require_developer(payload.user_id)
+    try:
+        return {"mapping": database.save_role_menus(payload.mapping, payload.user_id)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
 # Load / Post / Complete lifecycle. Each stage lists invoices at its source
@@ -981,6 +1133,22 @@ def download_batch(batch: str, doc_no: Optional[str] = None, entry_no: Optional[
         )
 
     all_batches = database.list_batches()
+
+    # An invoice still parked at Buyer Order No Doesn't Exist has nothing
+    # usable for Navision yet - block the whole batch's download rather
+    # than silently exporting it without a PO, or worse, minting it a
+    # Document No. now that it'll need redone once the PO is fixed later.
+    this_batch = next((b for b in all_batches if b.get("batch") == name), None)
+    missing_po = (this_batch or {}).get("counts", {}).get("BUYER ORDER NO DOESN'T EXIST", 0)
+    if missing_po:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch '{name}' has {missing_po} invoice(s) with no Buyer "
+                "Order No. — kindly fill in the Buyer Order No before "
+                "downloading this batch."
+            ),
+        )
 
     # Batches must clear in creation order: an earlier batch not yet fully
     # Loaded/Posted/Completed (ignoring its excluded invoices) blocks any
@@ -1301,9 +1469,11 @@ def upload_input(subpath: str = "", user_id: Optional[int] = None,
 # ==========================================================================
 
 @app.post("/api/train")
-def train_start():
-    """Learn (merge) invoice formats from PDFs in the server New_Format folder."""
-
+def train_start(user_id: Optional[int] = None):
+    """Learn (merge) invoice formats from PDFs in the server New_Format folder.
+    Super Admin only - the Training screen this action lives on is already
+    restricted to Super Admin/Developer in ROLE_MENUS."""
+    _require_developer(user_id)
     folders = _require_folders()
 
     # Back up the current model before training so a failed/partial run
@@ -1379,9 +1549,11 @@ def list_formats():
 
 
 @app.delete("/api/formats")
-def clear_formats():
-    """Forget all trained formats (start clean)."""
-
+def clear_formats(user_id: Optional[int] = None):
+    """Forget all trained formats (start clean). Super Admin only - wipes
+    every vendor's learned format at once, and the Training screen this
+    lives on is already Super Admin/Developer-only in ROLE_MENUS."""
+    _require_developer(user_id)
     model = FormatModel()
     model.clear()
     return {"formats": [], "message": "All trained formats cleared"}
@@ -1389,6 +1561,7 @@ def clear_formats():
 
 class RestoreModel(BaseModel):
     name: str
+    user_id: Optional[int] = None
 
 
 @app.get("/api/backups")
@@ -1410,8 +1583,9 @@ def list_backups():
 
 @app.post("/api/backups/restore")
 def restore_backup(payload: RestoreModel):
-    """Restore a chosen model backup."""
-
+    """Restore a chosen model backup. Super Admin only - can silently
+    discard every format learned since the chosen backup."""
+    _require_developer(payload.user_id)
     model = FormatModel()
     try:
         model.restore(payload.name)
@@ -1515,6 +1689,9 @@ class TemplateModel(BaseModel):
     po_format: Optional[str] = ""
     static: dict = {}
     user_id: Optional[int] = None
+    # Set only when renaming an existing template (Template Edit screen's
+    # Template name field) - the key it's being renamed FROM.
+    original_key: Optional[str] = None
 
 
 class TemplateKeyModel(BaseModel):
@@ -1551,7 +1728,7 @@ def save_template(payload: TemplateModel):
     try:
         key, folder = template_store.save_template(
             payload.entity, payload.invoice_type, payload.name, payload.po_format,
-            payload.static, payload.user_id,
+            payload.static, payload.user_id, original_key=payload.original_key,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

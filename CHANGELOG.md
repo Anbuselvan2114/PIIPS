@@ -9,7 +9,298 @@ before 2.2 is grouped under **2.1** below as a retrospective summary (by
 theme, not a literal commit-by-commit log) rather than a series of real
 sub-versions.
 
+## 2.2.1 — 2026-09-05
+
+### Read-only Viewer role
+
+- A new "Viewer" user type sees Dashboard, File Explorer, Buyer Order
+  Entry, Part Description Mapping, Load, Post, and Complete with every
+  mutating action blocked server-side; no Manual or Setup/Mapping/Admin
+  screen. Created directly by a Super Admin with a chosen
+  username/password (no email, no forced first-login change). A PBV0030
+  Viewer account is seeded on every startup, same as the built-in Sadmin
+  account.
+- A mandatory field sourced from the PDF itself (Quantity, Direct Unit
+  Cost, Line Amount, …) being missing now routes the invoice to NEW
+  TEMPLATE and copies it to `New_Format` for retraining, instead of the
+  less actionable DATA MISMATCH; a gap in Service First's own data still
+  correctly stays DATA MISMATCH.
+- Outbound emails now show which environment sent them (Local/UAT/Live).
+
+### Manually Updated status with stale-invoice auto-expiry; item-table fixes
+
+- A Data Mismatch/Excluded/New Template invoice left unresolved for 10+
+  days now auto-parks at a new MANUALLY UPDATED status (never
+  reprocessed again, ignored for batch status); Unsupported invoices
+  (no DB row at all) are swept by filesystem age the same way.
+- `find_table` now detects an item-table header wrapped across two
+  stacked lines (previously invisible end to end on some invoices); a
+  scanned invoice whose format is trained but whose Vendor Invoice No.
+  can't be read now routes to UNSUPPORTED instead of the misleading NEW
+  TEMPLATE; Buyer state falls back to Tamil Nadu when a vendor prints no
+  Buyer GSTIN/state at all.
+
+### HSN/SAC, Buyer Order No., payment terms, and UI polish
+
+- HSN/SAC Code is required for an Item line only when the PDF's own raw
+  reading actually had one — flags "Service First failed to confirm an
+  HSN the PDF had", not "neither side ever had one". The Fields popup
+  applies the same rule and now also shows Buyer Order No.
+- Default payment-terms fallback lowered from 45 to 30 days (used only
+  when neither Service First nor the PDF states a usable value).
+- The UI now shows the running app version (`GET /api/version`) and a
+  copyright footer instead of hardcoding a separate copy of either.
+
+### Screen Access — Super Admin-configurable per-role menu visibility
+
+- Which screens Admin/User/Accounts/Viewer can see is now stored in a
+  `tbl_RoleMenu` table instead of hardcoded in `App.jsx`, editable from
+  a new "Screen Access" menu (Super Admin/Developer only — they always
+  see every screen, unconfigurable by design). Self-seeds from the
+  previous hardcoded defaults, so no deployment's menu visibility
+  changes until a Super Admin actually edits and saves something.
+
+### Template rename
+
+- The Template Edit screen's "Template name" field is editable for an
+  existing template, not just at creation. Saving a changed name
+  renames the row in place (its saved static values carry over) and
+  moves its Input folder to match; renaming to a name already in use is
+  blocked with a clear error.
+
+### File Explorer's Template dropdown gains type-and-search
+
+- Replaces the plain `<select>` with a searchable, filter-as-you-type
+  dropdown (arrow-key/Enter navigation) — a native `<select>` got
+  tedious to scan as the template list grew.
+
+### Purchase Invoice Mapping — built, then reverted before release
+
+- A "Purchase Invoice Pending" step between Load and Loaded (requiring
+  the vendor's real Purchase Invoice No. before an invoice reached
+  LOADED), plus its own "Purchase Invoice Mapping" menu, was built,
+  tested, and then fully removed within this same release cycle at the
+  user's request — it never shipped. The lifecycle is unchanged from
+  2.2: Load leads directly to LOADED. The original design (schema,
+  endpoints, role visibility) is archived for a possible future
+  re-implementation.
+
+### Extraction accuracy fixes
+
+Nine `anchor_extract.py` bugs found and fixed this cycle, each verified
+against the full trained-format PDF corpus (209-211 files) with zero
+unintended regressions:
+
+- A GST e-Invoice IRN hash wrapped across two OCR words on the same row
+  slipped past hash-fragment detection and got picked up as the Seller
+  Name.
+- A serial/description split meant only for item-table rows also ran on
+  header metadata shaped like "1424 Dated:", corrupting row
+  classification and losing the seller name on that invoice.
+- A "GSTIN"/"UIN" label found anywhere in a row, even wrapped onto the
+  next row's value, dropped the whole row and silently lost real
+  address/city text that preceded the label on the same line.
+- "ORIGINAL FOR RECIPIENT" and "COMMERCIAL INVOICE" title banners were
+  no longer being recognized as non-name text and were picked up as the
+  Seller Name on some invoices.
+- A seller's own name sharing a row with an unrelated "e-Invoice" badge
+  no longer gets discarded as a false title banner; the 3-column
+  Bill-To/Ship-To header path now applies the same left/right divider
+  slice and claimed-row exclusion every other row already gets.
+- A vendor's own name is no longer wrongly duplicated as the first line
+  of its own address when two separate extraction passes processed the
+  same row.
+- Non-standard "SELLER DETAILS"/"BUYER DETAILS" section captions are
+  now recognized, including when the marker shares a row with unrelated
+  left-side content (e.g. the seller's own GSTIN).
+- A stray punctuation-only first line (e.g. a lone ".") no longer wins
+  the Seller Name outright.
+- Amazon-style marketplace invoices captioning the seller block
+  "Sold By :" (instead of a name/address label) are now recognized, so
+  that phrase isn't mistaken for the Seller Name itself.
+
+### Block a batch's download while it has a missing Buyer Order No.
+
+- `GET /api/batches/download` now refuses to export a batch that has any
+  invoice still parked at BUYER ORDER NO DOESN'T EXIST - there's nothing
+  usable for Navision on that invoice yet, and minting it a Document No.
+  now would just need redoing once the PO is filled in. Returns a clear
+  400 telling the user how many invoices are missing a PO and to fill it
+  in first. `Dashboard.jsx`'s `canDownload`/Download-button tooltip gets
+  the same check client-side, for a proactive disabled state instead of
+  only failing after the click - matches the existing pattern already
+  used for locked/blocked_by batches.
+  Verified live: a batch with 2 Ready To Load invoices + 1 Buyer Order
+  No Doesn't Exist invoice is correctly refused (400, exact invoice
+  count in the message); fixing that one invoice's PO immediately
+  unblocks the download, which then succeeds and produces a real .xlsx.
+
+### Allow excluding a not-yet-advanced invoice from an In Progress batch
+
+- `set_excluded` previously gated BOTH exclude and re-include purely on
+  the batch's own status (Created/Downloaded only) - meaning once any
+  ONE invoice in a batch reached Loaded/Purchase Invoice Pending/etc.,
+  every OTHER invoice in that same batch got permanently stuck if it
+  itself never advanced (e.g. was parked at Buyer Order No Doesn't
+  Exist when the batch was downloaded, then only became Ready To Load
+  afterward - too late for that download's Document No. minting, and
+  its batch was already locked by the time it was fixed). That invoice
+  could never get a Document No., never appear on the Load screen, and
+  - since a batch only "clears" once every non-ignored invoice reaches
+  the same terminal stage - permanently blocked every later batch from
+  ever being downloaded too.
+  Excluding now has one extra allowance: permitted while the batch is
+  In Progress, as long as THIS invoice's own current status hasn't
+  itself advanced past Ready To Load (checked against
+  `_BATCH_LOCK_STATUSES`) - the batch-level lock exists because some
+  OTHER invoice may already be committed downstream, which says nothing
+  about whether pulling this still-unadvanced one out is safe.
+  Re-including is deliberately NOT relaxed - it stays Created/Downloaded
+  only, unchanged.
+  Verified live with an isolated 20-invoice batch (19 at Purchase
+  Invoice Pending, 1 stuck at Ready To Load): excluding the stuck one
+  now succeeds; excluding one of the 19 already-advanced invoices still
+  correctly fails with the (updated) error message; re-including the
+  freshly-excluded invoice while the batch is still In Progress still
+  correctly fails, unchanged.
+
+### Security fix — CORS allowed any origin with credentials
+
+- `allow_origins=["*"]` combined with `allow_credentials=True` (app.py)
+  is a spec-disallowed combination - Starlette reflects the Origin
+  header back, letting credentialed cross-site requests reach the whole
+  API. Checked how the frontend actually uses this before fixing it:
+  production is same-origin already (`api.js`'s own comment - the React
+  build is served behind the same IIS site that reverse-proxies to this
+  backend, `API_BASE` defaults to `""`), and no `fetch()` call anywhere
+  in `api.js` ever sets `credentials: "include"` (auth here is a
+  `user_id` in the request body/query, not a cookie/session) - so
+  `allow_credentials=True` was protecting nothing. Now `allow_origins`
+  is an explicit list - the two local Vite dev ports (5173, 3000), live
+  (`https://piips.precisionit.co.in:8010`), and uat
+  (`http://10.0.1.210:8080`) - and `allow_credentials` is `False`,
+  matching actual usage instead of a wildcard that served no real
+  purpose. Verified live: a preflight from each of the four real origins
+  gets a proper `Access-Control-Allow-Origin` back; one from an
+  arbitrary origin gets rejected outright (400, no CORS headers at all);
+  the `Access-Control-Allow-Credentials` header is confirmed absent from
+  every response.
+
+### Security fix — Training screen actions had no server-side authorization
+
+- `DELETE /api/formats` (wipes every trained vendor format), `POST
+  /api/train`, and `POST /api/backups/restore` (silently discards
+  everything learned since the chosen backup) had no authorization check
+  at all - reachable by anyone who could hit the API directly, even
+  though the Training screen these three actions live on is already
+  Super Admin/Developer-only in the frontend's `ROLE_MENUS`. Found during
+  a full-project review; the three unmatched endpoints were the only gap
+  left in an otherwise-covered set (every other privileged endpoint
+  already calls `_require_not_viewer` or stricter).
+  Now all three call `_require_developer` (Super Admin only - the same
+  guard `GET /api/db-config` already uses), matching what the UI already
+  implied rather than adding a new access tier. `RestoreModel` gained a
+  `user_id` field; `train_start`/`clear_formats` take it as a query
+  param, same pattern as `get_db_config`. Frontend: `Training.jsx` didn't
+  even accept the `user` prop App.jsx already passes to every page - now
+  threads `user?.user_id` through Train/Restore; `clearFormats()` has no
+  UI call site today (unused button), so only the backend guard applies
+  there for now.
+  Verified live: all three reject with 403 for an unauthenticated caller
+  and for a Viewer; a Super Admin caller passes the check (confirmed via
+  a safe not-found case on restore, without triggering the real
+  destructive operations against the live model).
+
+### New `DisplayOrder` column on `tbl_status` - decouples display order from StatusId
+
+- The Dashboard's "Status breakdown" bar chart (and `usp_StatusCounts`
+  generally) ordered by raw `StatusId`, an IDENTITY permanently frozen at
+  whenever a status was first seeded on a given database - a status added
+  later could never sort where it logically belongs no matter where it
+  sits in `STATUS_VALUES`. Added a `DisplayOrder INT` column, re-synced
+  from `STATUS_VALUES`' own list order on every startup (both the live
+  `ensure_menu_schema` DDL path and the CLI-only `init_status_table`), so
+  reordering that Python list is now always enough - no StatusId
+  renumbering, ever. `usp_StatusCounts` orders by
+  `ISNULL(DisplayOrder, StatusId)`. `/api/stats/status-counts` (the
+  Dashboard's data source) had its own bug in the same family: it
+  force-pinned INITIATED/UNSUPPORTED (synthetic, folder-based counts -
+  they have no real tracker rows) to the very front of the list
+  regardless of DisplayOrder; now re-inserted at the position they
+  already held in the DisplayOrder-sorted list instead. Verified via
+  `/api/stats/status-counts` after several live reorders (New Template,
+  Duplicate and Unsupported each repositioned ahead of Initiated) - each
+  one landed exactly where `STATUS_VALUES` placed it, including the
+  previously-pinned Initiated/Unsupported.
+
 ## 2.2 — 2026-08-30
+
+### New "MANUALLY UPDATED" status — stale-invoice auto-expiry
+
+- A Data Mismatch, Excluded, or New Template invoice nobody resolves
+  (re-uploads/fixes, re-includes, retrains) within 10 days
+  (`database.STALE_STATUS_EXPIRY_DAYS`) now auto-parks as a new
+  **MANUALLY UPDATED** status - permanently: it's deliberately never added
+  to `_REPROCESSABLE_STATUSES`, so a later re-upload of that same invoice
+  falls through to DUPLICATE instead of merging back in place, and it's
+  added to `_BATCH_IGNORED_STATUSES` so it never holds up its batch's
+  status label (same treatment Data Mismatch/New Template/Pending In SF
+  already got). An Excluded invoice keeps its IsExcluded/PriorStatusID
+  columns as-is when this fires - the frontend only offers Include/
+  re-inclusion while the tracker's CURRENT status is literally "EXCLUDED",
+  so once StatusID moves off of it that option is already gone. Runs
+  automatically at the end of every Process/Start job
+  (`processor.py`'s `_expire_stale_unresolved`, alongside the existing
+  Pending In SF resync) via a new stored procedure,
+  `usp_ExpireStaleUnresolved` - like the Pending In SF resync, this only
+  ever fires as a side effect of someone clicking Start; there's no
+  background scheduler in this codebase, so a batch nobody revisits
+  won't auto-expire on its own.
+  - Age is measured off `LastModifiedDatetime`, COALESCEd onto
+    `CreatedDatetime` as a safety net for older rows. This surfaced a
+    real pre-existing gap: `usp_SaveInvoiceBatch`'s tracker INSERT never
+    stamped `LastModifiedDatetime` at all (only `CreatedDatetime`), so
+    it sat NULL forever for any row nobody manually touched afterward -
+    silently defeating any age check keyed off it. Now stamped at
+    insert, same as `CreatedDatetime`.
+  - **Unsupported is handled separately** - it never gets a
+    Purchase_Header/Tracker row at all (a pure exception + file move, no
+    database presence to age off), so it's swept by filesystem modified
+    time instead: a new `config_store.expire_stale_files(status_name,
+    days, target_status)` moves any PDF sitting in a status folder longer
+    than the same 10-day window, called for UNSUPPORTED specifically
+    from the same `_expire_stale_unresolved` step.
+  - The DB-only status flip doesn't move the file on its own (these are
+    older records from a past run, not part of the current job's own
+    result list - see `_move_by_status`), so
+    `expire_stale_unresolved()` also returns each expired row's FileName
+    and the caller moves that PDF into the Manually Updated folder to
+    match.
+  - Verified directly: a stale row of each of the three DB-tracked
+    statuses (11 days since last touch) expires, a fresh Data Mismatch
+    row (2 days) doesn't; a stale Unsupported file (11-day-old mtime)
+    moves via the filesystem sweep while a fresh one stays put;
+    batch-status computation confirmed to ignore Manually Updated rows
+    entirely (a batch with some Loaded and some Manually Updated still
+    shows as LOADED, not stuck IN PROGRESS).
+
+### Batch membership for auto-resynced Pending In SF records
+
+- A record promoted out of PENDING IN SF by `_resync_pending` (runs
+  automatically at the end of every Process/Start job, re-attempting
+  Service First for anything still pending - see processor.py) stayed
+  in whichever batch it was originally saved under, even though the
+  equivalent case for a re-uploaded Data Mismatch/New Template/Excluded
+  invoice already moves it into the batch of the run that cleared it
+  (`reprocess_reworkable_header`). `usp_ReplaceReservation` now takes an
+  optional `@BatchName` and `resync_pending()`/`_resync_pending` pass the
+  current job's batch name through, so a Pending In SF record that
+  clears during a Start now moves into THAT run's batch the same way,
+  by updating its existing tracker row in place - no new row inserted.
+  `@BatchName` defaults to NULL and is left unpassed by
+  `apply_manual_buyer_order` (the Buyer Order Entry menu action, not a
+  Start run), so that caller's behaviour - leave the record in its
+  existing batch - is unchanged.
 
 ### Invoice extraction fixes (surfaced during GST e-invoice training)
 
@@ -187,7 +478,118 @@ sub-versions.
   temporary password to (it had none before, by design, since normal
   Viewer setup skips email entirely).
 
----
+### Scanned/photocopied PDF support (PART and Service)
+
+- An invoice with no embedded text layer (a scan or photocopy) used to
+  be rejected outright, moved to UNSUPPORTED, every time, regardless of
+  type. A new Super Admin-only toggle in Folder Configuration ("Allow
+  scanned/photocopied invoices to be processed") switches this to OCR-
+  extracting it instead, using the same PaddleOCR path already used for
+  plain image files (.png/.jpg) — this infrastructure already existed,
+  it just wasn't reachable for a scanned PDF page before. Off by default
+  (unchanged behavior); a genuine handheld photo is still rejected
+  either way, since OCR off an actual photo (vs. a flat scan) stays
+  unreliable regardless of the setting. Applies to normal processing
+  only, not Train, which still expects a clean file. Verified end-to-
+  end for both invoice types: with the toggle on, previously-rejected
+  scans of both PART and Service invoices now correctly extract and
+  match their trained formats; with it off, the exact same files are
+  rejected to UNSUPPORTED exactly as before.
+- Fixed a routing bug this same feature exposed: a scanned invoice whose
+  format DID match an already-trained one, but whose OCR misread its own
+  Quantity/Rate/Amount table, was landing at NEW TEMPLATE ("needs
+  training") - misleading, since retraining an already-recognized
+  format doesn't fix one document's own OCR noise. `ocr_engine.read_pdf`
+  now reports `IsScanned`; the mandatory-field gate only routes a
+  missing PDF-sourced field to NEW TEMPLATE for a born-digital page -
+  the same gap on a scanned one now correctly stays DATA MISMATCH
+  instead. Verified against the exact case that surfaced it (a scanned
+  "IDEAL SYSTEMS" invoice matching its already-trained format11).
+- Train now also honors the toggle (originally normal processing only) -
+  a scanned file sitting in New_Format is OCR'd and learned/merged like
+  any other instead of being stuck there as permanently unsupported.
+  This closed out the last of this session's genuinely-unrecoverable
+  scans: all 11 remaining scanned files in New_Format (including
+  scan1-3.pdf, unsupported since the very start of this session) trained
+  successfully in one run - 9 merged into already-known formats, 2
+  learned as new ones.
+- Fixed a second, earlier routing bug in the same family: a scanned
+  invoice whose format DID match an already-trained one, but whose
+  Vendor Invoice No. itself couldn't be OCR'd off the page, was still
+  landing at NEW TEMPLATE ("needs training") - same problem as the
+  Quantity/Rate/Amount case above, just caught earlier in the pipeline
+  where the format match hadn't been checked yet. Since the template is
+  already known, retraining it fixes nothing; this is this one scan's
+  own OCR noise, the same class of problem as any other unreadable
+  file. Now routed to UNSUPPORTED instead (the same file-move, no-DB-row
+  path every other unreadable file already takes) whenever the format
+  matched, the invoice number is missing, and the page was scanned - an
+  unrecognized format or a PART invoice with no item lines still route
+  to NEW TEMPLATE as before. Verified against invoice 169.pdf (matched
+  format53, PaddleOCR misread "Invoice No." as "Involce No." on a poor-
+  quality scan) - now lands in UNSUPPORTED with no tracker row created.
+
+### Item-table detection fix (born-digital PDFs)
+
+- `find_table` (the scan that locates where an invoice's item table starts)
+  scored keyword matches one row at a time. A layout whose column header
+  wraps onto two stacked lines (e.g. "Sl. No Description Unit Qty Net Tax
+  Tax Tax Total" / "Price Amount Rate Type Amount Amount") never reached
+  the match threshold on either line alone, so the table was invisible to
+  the pipeline end to end - a PART invoice (an Amazon marketplace invoice,
+  IN-8362.pdf) landed at NEW TEMPLATE with "No item line found", even
+  though every other part of its layout was already recognised (format40).
+  `find_table` now also tries combining a row with the next one when
+  neither alone reaches the threshold - but only when the next row
+  doesn't already qualify by itself, so a genuine single-row header
+  sitting just above an unrelated short label line (e.g. a "SN | CGST |
+  SGST" sub-heading) isn't backdated a row early and dragged into the
+  table, which as first written this fix would have quietly done for one
+  sample file (`NMBK - 43.pdf`) - caught by re-running the full 290-file
+  sample set before and after and diffing file-by-file, not just
+  comparing aggregate counts. Note: this only fixes *detecting* the
+  table for this layout - IN-8362.pdf's own item row still has its
+  Quantity/Rate/Amount figures glued into one text block by a separate,
+  unrelated tolerance setting in `_pdf_text_boxes` (tuned for how every
+  other supported layout's phrase-level OCR-style boxes behave); fixing
+  that safely needs its own careful pass, so that file still needs a
+  human to complete it, it just no longer wrongly claims to need
+  retraining.
+- A related attempt - loosening the item-table cleaner's bare
+  "igst"/"cgst"/"sgst" row filter so a real item row that happens to
+  name its own tax type inline wouldn't be discarded - was tried and
+  **reverted**. The first version gated on row length; that let through
+  a tax sub-table's own multi-word column-header row (no real item, just
+  verbose labels), corrupting item parsing for 4 other sample files. A
+  second version gated on "does the row contain any digit" instead;
+  that made things *worse* system-wide, since a genuine standalone tax
+  line almost always contains a rate or amount (a digit) - it now kept
+  rows the original code correctly dropped, spiking NEW TEMPLATE across
+  57 sample files in one run. Getting this right needs the table's
+  column positions (to check whether the row actually has a value under
+  the Description column), which the cleaner doesn't have access to at
+  the point it currently runs - left as still-open work rather than
+  shipped as an unsafe heuristic. Caught before merging by rerunning the
+  full 290-file sample set after every change and diffing the file-level
+  result, not just trusting the aggregate pass/fail counts.
+- Buyer state (`buyer_state` / the "State", "GST Order Address State",
+  "Ship-to Address" Purchase Header columns) now falls back to Tamil
+  Nadu when a vendor's layout prints no Buyer GSTIN and no labelled
+  Buyer State field at all - this app only ever processes Precision
+  Techserve's own inbound invoices, and Precision Techserve's own
+  registered address never moves, so a blank buyer-side state here only
+  ever means the vendor didn't print one, never that the buyer was
+  actually somewhere else. A parallel idea - guessing the *seller's*
+  state from free text in its (often small/unregistered vendor) address
+  block when no GSTIN is printed either - was tried and **reverted**:
+  for one sample vendor (SHWETMANI ENTERPRISES) the "Seller Address"
+  field itself was already mis-anchored (it had captured unrelated
+  invoice-body text, not the real address), and the text-search matched
+  "GOA" inside "5. CAPRI, GOA, Break-Fix..." - silently writing the
+  wrong state (Goa) instead of the vendor's real Maharashtra. A wrong
+  GST state code is worse than a correctly-flagged NEW TEMPLATE, so this
+  stays an open gap for small/unregistered vendors rather than a risky
+  guess.
 
 ## 2.1 — Initial release (retrospective summary)
 

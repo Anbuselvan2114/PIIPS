@@ -22,24 +22,34 @@ import secret_store
 
 ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 
+# A Data Mismatch/Excluded/New Template invoice left unresolved this long
+# auto-parks as Manually Updated (see usp_ExpireStaleUnresolved /
+# expire_stale_unresolved) - permanently, never reprocessable again.
+# Unsupported gets the same treatment by filesystem age instead, since it
+# never gets a database row at all (see config_store.expire_stale_files).
+STALE_STATUS_EXPIRY_DAYS = 10
+
 
 # Ordered status values for tbl_status.
 STATUS_VALUES = [
-    "INITIATED",
-    "UNSUPPORTED",
+    "NEW TEMPLATE",       # unrecognized-format PDFs, previously untracked entirely
     "DUPLICATE",
+    "UNSUPPORTED",
+    "INITIATED",
     "EXTRACTED",
     "BUYER ORDER NO DOESN'T EXIST",
     "SF PROCESSED",
     "PENDING IN SF",
     "DATA MISMATCH",      # renamed from "INCOMPLETE DATA" - see migration below
-    "NEW TEMPLATE",       # unrecognized-format PDFs, previously untracked entirely
     "READY TO LOAD",
     "LOADED",
     "POSTED",
     "COMPLETED",
     "EXCLUDED",
     "REJECTED BY ACCOUNTS",
+    "MANUALLY UPDATED",   # a Data Mismatch left unresolved past the retry
+                           # window (see usp_ExpireStaleUnresolved) -
+                           # permanently parked, never reprocessable again
 ]
 
 # User type values for tbl_UserType. "Accounts" runs the Load/Post/Complete
@@ -56,6 +66,14 @@ INVOICE_TYPE_VALUES = ["PART", "SERVICE"]
 # VALUES(...) list for seeding tbl_status (single quotes escaped).
 _STATUS_SEED_VALUES = ", ".join(
     "('" + v.replace("'", "''") + "')" for v in STATUS_VALUES
+)
+
+# (StatusName, position) pairs for syncing tbl_status.DisplayOrder to
+# STATUS_VALUES' own order on every startup - see the DisplayOrder DDL
+# step below (decouples display order from StatusId, an IDENTITY frozen
+# at whenever a status was first seeded on a given database).
+_STATUS_DISPLAY_ORDER_VALUES = ", ".join(
+    "('" + v.replace("'", "''") + f"', {i})" for i, v in enumerate(STATUS_VALUES)
 )
 
 # VALUES(...) list for seeding tbl_InvoiceType (single quotes escaped).
@@ -305,15 +323,20 @@ def save_grouped(data, batch_name=None, tracker=None):
     return counts
 
 
-def resync_pending():
+def resync_pending(batch_name=None):
     """
     Re-attempt Service First for records still "pending in SF" (status 5).
     Reloads each record's extracted JSON, re-calls the API, and — when the
     part is now available — rebuilds that header's reservation rows and
     promotes the tracker (Ready to Load / sf processed) with a fresh
-    SyncedDatetime. Returns {"promoted": n, "errors": [reason, ...]}.
+    SyncedDatetime. `batch_name`, when given, also moves each promoted
+    record into that batch (same as reprocess_reworkable_header does for a
+    re-uploaded Data Mismatch/New Template/Excluded file - a record that
+    finally clears here belongs to the run that cleared it, not left
+    behind in whatever batch it was originally saved under). Returns
+    {"promoted": n, "errors": [reason, ...]}.
 
-    Sample: resync_pending()
+    Sample: resync_pending(batch_name='PIIPS_Batch_20260902_120000')
     """
     ensure_menu_schema()
 
@@ -360,9 +383,9 @@ def resync_pending():
         try:
             cur = conn.cursor()
             cur.execute(
-                "EXEC dbo.usp_ReplaceReservation ?, ?, ?, ?, ?, ?",
+                "EXEC dbo.usp_ReplaceReservation ?, ?, ?, ?, ?, ?, ?",
                 header_id, json.dumps(re_cols), json.dumps(group["reservations"]),
-                verdict["status"], 1 if verdict["is_active"] else 0, 1,
+                verdict["status"], 1 if verdict["is_active"] else 0, 1, batch_name,
             )
             conn.commit()
         finally:
@@ -372,6 +395,33 @@ def resync_pending():
         errors.extend(verdict["errors"])
 
     return {"promoted": promoted, "errors": errors}
+
+
+def expire_stale_unresolved(days=None):
+    """Park every Data Mismatch/Excluded/New Template invoice that's sat
+    unresolved for more than `days` (default STALE_STATUS_EXPIRY_DAYS) as
+    Manually Updated - permanently: it drops out of batch status entirely
+    (_BATCH_IGNORED_STATUSES) and, since Manually Updated is deliberately
+    never in _REPROCESSABLE_STATUSES, a later re-upload of the same invoice
+    falls through to DUPLICATE instead of merging in place. Unsupported is
+    NOT covered here - see config_store.expire_stale_files for that (it
+    never gets a database row at all). Returns the FileName of every row
+    expired (the caller - processor.py's _expire_stale_unresolved - moves
+    each PDF into the Manually Updated folder to match; this function only
+    ever touches the DB).
+
+    Sample: expire_stale_unresolved()"""
+    ensure_menu_schema()
+    days = STALE_STATUS_EXPIRY_DAYS if days is None else days
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("EXEC dbo.usp_ExpireStaleUnresolved ?", days)
+        filenames = [r[0] for r in cur.fetchall() if r[0]]
+        conn.commit()
+        return filenames
+    finally:
+        conn.close()
 
 
 def apply_manual_buyer_order(header_id, order_no, user_id=None):
@@ -607,18 +657,26 @@ def get_processed_invoices():
 
 # Statuses an existing header may be re-processed FROM (in place, same
 # header/batch/No.) instead of the re-upload being parked as a DUPLICATE -
-# see reprocess_reworkable_header. All four represent an invoice that never
+# see reprocess_reworkable_header. All five represent an invoice that never
 # reached a real, final outcome the first time - Excluded is a deliberate
 # drop (a real re-inclusion - see _mark_batch_reincluded); Pending In SF
 # just means the part hadn't reached Service First yet; Data Mismatch and
-# New Template mean the data/format wasn't usable last time - in every
-# case, a fresh upload deserves a fresh look rather than being told it's a
-# duplicate of itself. This re-processing only ever happens when a USER
-# deliberately re-uploads that exact file and starts a run - nothing here
-# pulls a file back in on its own (see processor.py's main loop, which is
-# the only caller, driven by whatever the user just uploaded).
+# New Template mean the data/format wasn't usable last time; Unsupported
+# means the format matched but something essential (e.g. the Vendor
+# Invoice No.) couldn't be read - in every case, a fresh upload deserves a
+# fresh look rather than being told it's a duplicate of itself. This
+# re-processing only ever happens when a USER deliberately re-uploads that
+# exact file and starts a run - nothing here pulls a file back in on its
+# own (see processor.py's main loop, which is the only caller, driven by
+# whatever the user just uploaded).
+# MANUALLY UPDATED is deliberately NOT in this list - it's what Data
+# Mismatch/Excluded/New Template becomes once usp_ExpireStaleUnresolved
+# parks it as permanently unresolved (Pending In SF is NOT swept by that
+# expiry - a re-upload can still merge into it as before); unlike the
+# five statuses below, a re-upload of a Manually Updated invoice must
+# fall through to DUPLICATE, never merge back in.
 # KEEP IN SYNC with usp_GetProcessedInvoices' own copy of this list.
-_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "DATA MISMATCH", "NEW TEMPLATE")
+_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "DATA MISMATCH", "NEW TEMPLATE", "UNSUPPORTED")
 
 
 def reprocess_reworkable_header(existing_header_id, new_header_id):
@@ -747,11 +805,16 @@ _BATCH_LOCK_STATUSES = ("LOADED", "POSTED", "COMPLETED", "REJECTED BY ACCOUNTS")
 # need further action - a duplicate is already handled under a different
 # header) or off on its own separate resolution path (New Template needs
 # retraining, Data Mismatch needs a data fix, Pending In SF needs Service
-# First to catch up) that shouldn't hold up this batch's own status label,
-# or any batch behind it, indefinitely - e.g. 9 real invoices Loaded plus 1
-# still Pending In SF must show the batch as LOADED, not stuck looking
-# unresolved forever waiting on a part SF may take days to receive.
-_BATCH_IGNORED_STATUSES = ("EXCLUDED", "NEW TEMPLATE", "DUPLICATE", "DATA MISMATCH", "PENDING IN SF")
+# First to catch up, Manually Updated is permanently parked and will never
+# move again - see usp_ExpireStaleUnresolved) that shouldn't hold up this
+# batch's own status label, or any batch behind it, indefinitely - e.g. 9
+# real invoices Loaded plus 1 still Pending In SF must show the batch as
+# LOADED, not stuck looking unresolved forever waiting on a part SF may
+# take days to receive.
+_BATCH_IGNORED_STATUSES = (
+    "EXCLUDED", "NEW TEMPLATE", "DUPLICATE", "DATA MISMATCH", "PENDING IN SF",
+    "MANUALLY UPDATED",
+)
 
 
 def _batch_is_cleared(counts):
@@ -1656,6 +1719,78 @@ def invoices_by_statuses(status_names, active_only=False):
     return _invoice_list(where, names)
 
 
+# The menu keys each role can see BEFORE a Super Admin has ever saved the
+# "Screen Access" menu - i.e. what every existing deployment already
+# behaves like today. Used only to seed tbl_RoleMenu the first time it's
+# empty (see get_role_menus), so nothing changes for anyone until a Super
+# Admin actually visits that menu and saves something. Keep in sync with
+# frontend/src/App.jsx's MENU list if a menu key is ever renamed - this is
+# a one-time seed, not read on every request, so a stale key here only
+# matters for a brand new deployment's first run.
+_ROLE_MENU_DEFAULTS = {
+    "admin": ["dashboard", "input", "manual", "buyerorder", "partdescupdate",
+              "load", "post", "complete",
+              "configuration", "apiconfig", "template", "createfield", "users"],
+    "user": ["dashboard", "input", "manual", "buyerorder", "partdescupdate", "load"],
+    "accounts": ["dashboard", "input", "manual", "post", "complete"],
+    "viewer": ["dashboard", "input", "buyerorder", "partdescupdate", "load", "post", "complete"],
+}
+
+
+def get_role_menus():
+    """{role_name: [menu_key, ...]} for every configurable role (never
+    'super admin'/'developer' - see tbl_RoleMenu's own comment). Seeds the
+    table from _ROLE_MENU_DEFAULTS the first time it's empty.
+    Sample: get_role_menus()"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM dbo.tbl_RoleMenu")
+        if cur.fetchone()[0] == 0:
+            for role, keys in _ROLE_MENU_DEFAULTS.items():
+                for key in keys:
+                    cur.execute(
+                        "INSERT INTO dbo.tbl_RoleMenu (RoleName, MenuKey) VALUES (?, ?)",
+                        role, key)
+            conn.commit()
+        cur.execute("SELECT RoleName, MenuKey FROM dbo.tbl_RoleMenu ORDER BY RoleName, Id")
+        out = {}
+        for role, key in cur.fetchall():
+            out.setdefault(role, []).append(key)
+        return out
+    finally:
+        conn.close()
+
+
+def save_role_menus(mapping, user_id=None):
+    """Replace the whole role -> menu-keys mapping (Screen Access menu's
+    Save button). `mapping` is {role_name: [menu_key, ...]}; a 'super
+    admin'/'developer' entry, if present, is silently dropped - that role
+    always sees every menu and is never stored. Returns the mapping as
+    actually saved (via get_role_menus).
+    Sample: save_role_menus({'admin': ['dashboard', 'input']}, user_id=7)"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM dbo.tbl_RoleMenu")
+        for role, keys in (mapping or {}).items():
+            role = (role or "").strip().lower()
+            if not role or role in ("super admin", "developer"):
+                continue
+            for key in keys or []:
+                key = (key or "").strip()
+                if key:
+                    cur.execute(
+                        "INSERT INTO dbo.tbl_RoleMenu (RoleName, MenuKey) VALUES (?, ?)",
+                        role, key)
+        conn.commit()
+    finally:
+        conn.close()
+    return get_role_menus()
+
+
 def buyer_order_nos_for_status(status_name):
     """Distinct, non-blank Buyer's Order Nos for invoices currently at
     `status_name` - feeds the Service First GetPurchaseLineSpecification-
@@ -1730,6 +1865,7 @@ def invoice_details_by_buyer_order(order_nos, status_name=None):
         return by_po
     finally:
         conn.close()
+
 
 
 def _existing_cols(cur, table, wanted):
@@ -1828,6 +1964,16 @@ def get_invoice_field_check(header_id):
         tracker_row = cur.fetchone()
         buyer_order_no = (tracker_row[0] if tracker_row else "") or ""
 
+        def _num_sort_key(v):
+            # Sorts numerically when possible (Line No./Entry No. are
+            # plain integers-as-strings), blanks/non-numeric values last,
+            # in their original relative order.
+            s = str(v or "").strip()
+            try:
+                return (0, float(s))
+            except ValueError:
+                return (1, s)
+
         # "No." and "HSN/SAC Code" are only mandatory conditionally (on the
         # line's own Type — see excel_export.required_fields_for_line_type),
         # so always fetch both and pick the right one per line below.
@@ -1841,6 +1987,10 @@ def get_invoice_field_check(header_id):
                 header_id,
             )
             line_rows = [dict(zip(line_cols, r)) for r in cur.fetchall()]
+            # Sort by Line No. (the PO's own item sequence) so the Fields
+            # popup lists lines in invoice order rather than whatever order
+            # SQL happened to return them in.
+            line_rows.sort(key=lambda ln: _num_sort_key(ln.get("Line No.")))
 
         # Nav_Part_Description (Service First's GetHSNDetails item-master
         # description) isn't a saved tbl_Purchase_Line column - it only ever
@@ -1921,16 +2071,23 @@ def get_invoice_field_check(header_id):
             source = "Service First" if ln.get("Type") == "Item" else "PDF"
             product_no = str(ln.get("HSN/SAC Code") or "")
             missing = not product_no.strip()
-            # For a part (Item line), a blank result only counts as
-            # "missing" when the PDF itself actually had an HSN that SF
-            # failed to confirm - if the PDF never printed one either,
-            # there was nothing for SF to confirm in the first place, so
-            # it's not a real data problem (Charge lines never touch this:
-            # their HSN already comes straight from the PDF, so a blank
-            # value there always means the PDF genuinely had none).
-            if missing and ln.get("Type") == "Item":
-                desc_key = str(ln.get("Description") or "").strip().lower()
-                missing = bool(pdf_hsn_by_desc.get(desc_key, "").strip())
+            if ln.get("Type") == "Item":
+                # A blank result only counts as "missing" when the PDF
+                # itself actually had an HSN that SF failed to confirm - if
+                # the PDF never printed one either, there was nothing for SF
+                # to confirm in the first place, so it's not a real data
+                # problem.
+                if missing:
+                    desc_key = str(ln.get("Description") or "").strip().lower()
+                    missing = bool(pdf_hsn_by_desc.get(desc_key, "").strip())
+            else:
+                # HSN/SAC Code is optional on a Charge (Item) line (freight/
+                # courier/postage): many vendors never print one, and
+                # excel_export.required_fields_for_line_type never requires
+                # it for this Type either - a blank value here is never a
+                # real data problem, just show whatever the PDF had (if
+                # anything) without flagging it.
+                missing = False
             extra = [
                 {"field": "HSN/SAC Code", "value": product_no,
                  "missing": missing, "source": source},
@@ -1942,7 +2099,12 @@ def get_invoice_field_check(header_id):
                            len(rows) - 1)
             return rows[:idx + 1] + extra + rows[idx + 1:]
 
-        res_cols = _existing_cols(cur, "tbl_Reservation_Entry", excel_export.REQUIRED_RESERVATION_FIELDS)
+        # "Source Ref. No." (= the Purchase Line's own Line No. - see
+        # excel_export._link_override) and "Entry No." are fetched purely
+        # to sort by below, alongside REQUIRED_RESERVATION_FIELDS' own
+        # displayed columns - neither is added to the popup's field list.
+        res_wanted = excel_export.REQUIRED_RESERVATION_FIELDS + ["Source Ref. No.", "Entry No."]
+        res_cols = _existing_cols(cur, "tbl_Reservation_Entry", res_wanted)
         res_rows = []
         if res_cols:
             cur.execute(
@@ -1956,6 +2118,12 @@ def get_invoice_field_check(header_id):
             for rr in res_rows:
                 if "Source Subtype" in rr:
                     rr["Source Subtype"] = "1"
+            # Sort by (Line No., Entry No.) to match line_rows' own Line
+            # No. sort above - groups each reservation under its Purchase
+            # Line, multiple rows for the same line (Quantity > 1) ordered
+            # by Entry No. next.
+            res_rows.sort(key=lambda rs: (_num_sort_key(rs.get("Source Ref. No.")),
+                                           _num_sort_key(rs.get("Entry No."))))
 
         header_rows_out = field_rows("Purchase Header", header_wanted, header_values)
         buyer_order_row = {
@@ -1990,7 +2158,16 @@ def get_invoice_field_check(header_id):
             ],
             "reservations": [
                 {"label": rs.get("Item No.", "") or f"Reservation {i + 1}",
-                 "fields": field_rows("Reservation Entry", excel_export.REQUIRED_RESERVATION_FIELDS, rs)}
+                 # Purchase Line No. (= Source Ref. No., the same value the
+                 # rows are already sorted by above) - display-only, not a
+                 # real mandatory-field check, so it's added straight onto
+                 # the rendered list rather than through
+                 # REQUIRED_RESERVATION_FIELDS: it just lets a user see at a
+                 # glance which Purchase Line this reservation belongs to.
+                 "fields": [
+                     {"field": "Purchase Line No.", "value": rs.get("Source Ref. No.", ""),
+                      "missing": False, "source": "System"},
+                 ] + field_rows("Reservation Entry", excel_export.REQUIRED_RESERVATION_FIELDS, rs)}
                 for i, rs in enumerate(res_rows)
             ],
         }
@@ -2211,35 +2388,53 @@ def set_excluded(header_id, exclude, user_id=None):
     'Excluded' (remembering the prior status), flags IsExcluded and stamps
     ExcludedByID / ExcludedDatetime; including restores the prior status.
     Returns {file_name, new_status} so the caller can relocate the PDF.
-    Both directions are gated purely on this invoice's OWN batch's current
+
+    Re-including is gated purely on this invoice's OWN batch's current
     status (see _current_batch_status) - allowed while it's CREATED or
     DOWNLOADED, refused with a ValueError otherwise (IN PROGRESS/LOADED/
-    POSTED/COMPLETED/EXCLUDED). No OTHER batch's status is ever considered.
-    Once a batch has real progress, its Document Nos./Reservation data may
-    already be committed downstream (Navision), so pulling an invoice out
-    of or back into it at that point could change the batch after the fact.
+    POSTED/COMPLETED/EXCLUDED). Excluding gets one extra allowance: it's
+    also permitted while the batch is IN PROGRESS, as long as THIS
+    invoice's own current status hasn't itself advanced past READY TO
+    LOAD (i.e. isn't in _BATCH_LOCK_STATUSES) - the batch-level lock
+    exists because some OTHER invoice in it may already be committed
+    downstream (Navision), which says nothing about whether pulling
+    THIS still-unadvanced one out is safe. No OTHER batch's status is
+    ever considered either way.
     Sample: set_excluded(42, True, 7)"""
     ensure_menu_schema()
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT StatusID, PriorStatusID, FileName, BatchName FROM dbo.tbl_Purchase_Tracker "
-            "WHERE Purchase_Header_ID = ?", header_id)
+            "SELECT pt.StatusID, pt.PriorStatusID, pt.FileName, pt.BatchName, s.StatusName "
+            "FROM dbo.tbl_Purchase_Tracker pt "
+            "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+            "WHERE pt.Purchase_Header_ID = ?", header_id)
         row = cur.fetchone()
         if not row:
             return None
         file_name = row[2]
         batch_name = row[3]
+        own_status = (row[4] or "").upper()
 
         if batch_name:
             status = _current_batch_status(cur, batch_name)
-            if status not in ("CREATED", "DOWNLOADED"):
-                action = "re-include" if not exclude else "exclude"
+            allowed = status in ("CREATED", "DOWNLOADED") or (
+                exclude and own_status not in _BATCH_LOCK_STATUSES
+            )
+            if not allowed:
+                if exclude:
+                    detail = (
+                        "This is only allowed while a batch is still Created or "
+                        "Downloaded, or - for excluding only - while this "
+                        "invoice's own status hasn't advanced past Ready To Load."
+                    )
+                else:
+                    detail = "This is only allowed while a batch is still Created or Downloaded."
+                action = "exclude" if exclude else "re-include"
                 raise ValueError(
                     f"Can't {action} this invoice — its batch '{batch_name}' "
-                    f"is already {status}. This is only allowed while a "
-                    "batch is still Created or Downloaded."
+                    f"is already {status}. {detail}"
                 )
 
         if exclude:
@@ -2413,6 +2608,21 @@ _MENU_TABLE_DDL = [
     # Status names are always upper case (normalise any legacy mixed-case row).
     "UPDATE dbo.tbl_status SET StatusName = UPPER(StatusName) "
     "WHERE StatusName COLLATE Latin1_General_BIN <> UPPER(StatusName)",
+    # DisplayOrder decouples the Dashboard's "Status breakdown" bar order
+    # (and anywhere else that wants a logical, not historical, order) from
+    # StatusId - StatusId is an IDENTITY, permanently fixed to whenever a
+    # status was first seeded on THIS database, so a status added later
+    # can never sort between two earlier ones by StatusId alone, no matter
+    # where it sits in STATUS_VALUES. Re-synced from STATUS_VALUES' own
+    # order on every startup, so re-ordering that Python list is always
+    # enough going forward - no StatusId renumbering, ever.
+    "IF COL_LENGTH('dbo.tbl_status', 'DisplayOrder') IS NULL "
+    "ALTER TABLE dbo.tbl_status ADD DisplayOrder INT NULL",
+    f"""
+    UPDATE s SET s.DisplayOrder = v.ord
+    FROM dbo.tbl_status s
+    JOIN (VALUES {_STATUS_DISPLAY_ORDER_VALUES}) v(name, ord) ON v.name = s.StatusName
+    """,
     # ---- Invoice type (PART / SERVICE) — needed for the tracker FK --------
     """
     IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'tbl_InvoiceType')
@@ -2577,6 +2787,21 @@ _MENU_TABLE_DDL = [
         MarkedAt   DATETIME NOT NULL
     )
     """,
+    # ---- Which menu keys each (non-Super-Admin) role can see - the "Screen
+    # Access" menu's own storage. Presence of a (RoleName, MenuKey) row means
+    # that role can see that menu; Super Admin/Developer are never rows here
+    # - they always see every menu, unconfigurable, so a Super Admin editing
+    # this table can never lock everyone (including themselves) out. Seeded
+    # from _ROLE_MENU_DEFAULTS the first time it's empty - see get_role_menus.
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'tbl_RoleMenu')
+    CREATE TABLE tbl_RoleMenu (
+        Id       INT IDENTITY(1,1) PRIMARY KEY,
+        RoleName NVARCHAR(50) NOT NULL,
+        MenuKey  NVARCHAR(50) NOT NULL,
+        CONSTRAINT UQ_RoleMenu UNIQUE (RoleName, MenuKey)
+    )
+    """,
 ]
 
 # Table-valued parameter types used by the save procedures for bulk MERGE.
@@ -2668,13 +2893,24 @@ _MENU_PROC_DDL = [
         @PONumberFormat NVARCHAR(100) = NULL,
         @Static         dbo.TemplateStaticTVP READONLY,
         @UserId         INT = NULL,
-        @InvoiceType    NVARCHAR(20) = NULL
+        @InvoiceType    NVARCHAR(20) = NULL,
+        @OldTemplateKey NVARCHAR(500) = NULL
     AS
     BEGIN
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_SaveTemplate @Entity='SPR', @Name='Bosch', @TemplateKey='SPR\PART\Bosch', @PONumberFormat='SPRPUR/2026/', @Static=@StaticVals, @UserId=7, @InvoiceType='PART'
+        -- Renaming a template (Template Edit screen's Template name field)
+        -- passes @OldTemplateKey = the key being edited, @TemplateKey = the
+        -- new one - looked up by the OLD key so the SAME row (and its
+        -- already-associated tbl_TemplateStaticValue rows, FK'd by
+        -- TemplateId, not by key) gets its Name/TemplateKey updated in
+        -- place, rather than this becoming a brand new template that
+        -- leaves the old one behind. A plain (non-rename) save always
+        -- passes @OldTemplateKey = NULL, so COALESCE just falls back to
+        -- the unchanged @TemplateKey lookup.
         DECLARE @TemplateId INT;
-        SELECT @TemplateId = Id FROM dbo.tbl_Template WHERE TemplateKey = @TemplateKey;
+        SELECT @TemplateId = Id FROM dbo.tbl_Template
+         WHERE TemplateKey = COALESCE(@OldTemplateKey, @TemplateKey);
 
         IF @TemplateId IS NULL
         BEGIN
@@ -2686,7 +2922,7 @@ _MENU_PROC_DDL = [
         ELSE
         BEGIN
             UPDATE dbo.tbl_Template
-               SET Entity = @Entity, Name = @Name, PONumberFormat = @PONumberFormat,
+               SET Entity = @Entity, Name = @Name, TemplateKey = @TemplateKey, PONumberFormat = @PONumberFormat,
                    InvoiceType = @InvoiceType,
                    IsActive = 1, ModifiedById = @UserId, ModifiedDatetime = GETDATE()
              WHERE Id = @TemplateId;
@@ -2808,6 +3044,11 @@ _MENU_PROC_DDL = [
         -- from each header's source file; the status name and IsActive are
         -- per-invoice (carried in the JSON as _StatusName / _IsActive) so the
         -- Service First outcome can flag each invoice independently.
+        -- LastModifiedDatetime is stamped here too (same as CreatedDatetime)
+        -- rather than left NULL until some later action touches the row -
+        -- usp_ExpireStaleUnresolved measures "how long has this sat
+        -- unresolved" off it, and a row nobody has ever touched needs a
+        -- real starting timestamp to age from.
         IF OBJECT_ID('dbo.tbl_Purchase_Tracker') IS NOT NULL
         BEGIN
             INSERT INTO dbo.tbl_Purchase_Tracker
@@ -2815,7 +3056,7 @@ _MENU_PROC_DDL = [
                  StartedByID, StartedDatetime, BatchName, StatusID, IsActive,
                  SyncedByID, SyncedDatetime, IsSynced, FileName, TemplateFormat,
                  InvoiceTypeID, BuyerOrderNo, SourceJson,
-                 CreatedById, CreatedDatetime)
+                 CreatedById, CreatedDatetime, LastModifiedById, LastModifiedDatetime)
             SELECT m.HeaderId, s._InitById, s._InitAt,
                    @StartedByID, @StartedDatetime, s._BatchName,
                    st.StatusId, ISNULL(s._IsActive, 1),
@@ -2824,7 +3065,7 @@ _MENU_PROC_DDL = [
                    ISNULL(s._Synced, 0),
                    s._FileName, s._Format,
                    it.InvoiceTypeId, s._BuyerOrderNo, s._SourceJson,
-                   @StartedByID, GETDATE()
+                   @StartedByID, GETDATE(), @StartedByID, GETDATE()
             FROM OPENJSON(@Headers)
                  WITH ([_gid] INT '$._gid',
                        [_InitById] INT '$._InitById',
@@ -2918,6 +3159,65 @@ _MENU_PROC_DDL = [
         DROP TABLE #hmap;
     END
     """,
+    # ---- Expire stale unresolved rows (each Start) -------------------------
+    # A Data Mismatch/Excluded/New Template invoice nobody has resolved
+    # (re-uploaded/fixed, re-included, retrained) within STALE_STATUS_
+    # EXPIRY_DAYS is parked permanently as Manually Updated - it stops
+    # counting toward batch status (_BATCH_IGNORED_STATUSES) and, since
+    # Manually Updated is deliberately never added to
+    # _REPROCESSABLE_STATUSES, a later re-upload of the same invoice now
+    # falls through to DUPLICATE instead of merging in place (Excluded's
+    # own IsExcluded/PriorStatusID columns are left as-is when this fires -
+    # the frontend only offers Include/re-inclusion while the tracker's
+    # CURRENT status is literally "EXCLUDED", so once StatusID moves off
+    # of it that option is already gone). Age is measured off
+    # LastModifiedDatetime (stamped at insert - see usp_SaveInvoiceBatch -
+    # and refreshed by any later touch, e.g. reprocess_reworkable_header or
+    # set_excluded), COALESCEd onto CreatedDatetime only as a safety net
+    # for rows saved before that stamp-at-insert fix shipped. Unsupported
+    # is NOT handled here - it never gets a Purchase_Header/Tracker row at
+    # all (a pure exception + file move - see processor.py), so it's swept
+    # separately by filesystem age instead (config_store.expire_stale_files).
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_ExpireStaleUnresolved
+        @Days INT
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_ExpireStaleUnresolved @Days=10
+        IF OBJECT_ID('dbo.tbl_Purchase_Tracker') IS NULL OR OBJECT_ID('dbo.tbl_status') IS NULL
+        BEGIN
+            SELECT CAST(NULL AS NVARCHAR(400)) AS FileName WHERE 1 = 0;
+            RETURN;
+        END
+        DECLARE @StaleIds TABLE (StatusId INT);
+        INSERT INTO @StaleIds
+        SELECT StatusId FROM dbo.tbl_status
+         WHERE StatusName IN ('DATA MISMATCH', 'EXCLUDED', 'NEW TEMPLATE');
+        DECLARE @ManuallyUpdatedId INT = (SELECT StatusId FROM dbo.tbl_status WHERE StatusName = 'MANUALLY UPDATED');
+        IF NOT EXISTS (SELECT 1 FROM @StaleIds) OR @ManuallyUpdatedId IS NULL
+        BEGIN
+            SELECT CAST(NULL AS NVARCHAR(400)) AS FileName WHERE 1 = 0;
+            RETURN;
+        END
+
+        -- FileName of every row this expires, so the caller can also move
+        -- each PDF into the Manually Updated folder (this UPDATE only ever
+        -- touches the DB row - a PDF from an EARLIER run isn't part of the
+        -- current job's file list, so nothing else would move it).
+        DECLARE @Expired TABLE (FileName NVARCHAR(400));
+
+        UPDATE dbo.tbl_Purchase_Tracker
+           SET StatusID = @ManuallyUpdatedId,
+               IsActive = 0,
+               LastModifiedDatetime = GETDATE()
+        OUTPUT inserted.FileName INTO @Expired
+         WHERE StatusID IN (SELECT StatusId FROM @StaleIds)
+           AND COALESCE(LastModifiedDatetime, CreatedDatetime) <= DATEADD(day, -@Days, GETDATE());
+
+        SELECT FileName FROM @Expired;
+    END
+    """,
     # ---- Re-sync pending reservations (each Start) -----------------------
     # Records still "pending in SF" (no reservation received yet) that should
     # be re-attempted against the API on the next Start.
@@ -2949,11 +3249,17 @@ _MENU_PROC_DDL = [
         @Rows       NVARCHAR(MAX),   -- JSON array of {col: value}
         @StatusName NVARCHAR(150),
         @IsActive   BIT,
-        @SyncedById INT
+        @SyncedById INT,
+        @BatchName  NVARCHAR(300) = NULL   -- pass the CURRENT run's batch to
+                                            -- move a promoted record into it
+                                            -- (resync_pending); NULL (the
+                                            -- default) leaves BatchName as-is
+                                            -- for callers outside a Start run
+                                            -- (e.g. apply_manual_buyer_order)
     AS
     BEGIN
         SET NOCOUNT ON;
-        -- Sample: EXEC dbo.usp_ReplaceReservation @HeaderId=42, @Cols='["Serial No.","Nav_Item_No"]', @Rows='[{"Serial No.":"SN123","Nav_Item_No":"ITM-1001"}]', @StatusName='READY TO LOAD', @IsActive=1, @SyncedById=1
+        -- Sample: EXEC dbo.usp_ReplaceReservation @HeaderId=42, @Cols='["Serial No.","Nav_Item_No"]', @Rows='[{"Serial No.":"SN123","Nav_Item_No":"ITM-1001"}]', @StatusName='READY TO LOAD', @IsActive=1, @SyncedById=1, @BatchName='PIIPS_Batch_20260902_120000'
 
         IF OBJECT_ID('dbo.tbl_Reservation_Entry') IS NOT NULL
             DELETE FROM dbo.tbl_Reservation_Entry WHERE Purchase_Header_ID = @HeaderId;
@@ -2985,7 +3291,8 @@ _MENU_PROC_DDL = [
                SyncedByID = @SyncedById,
                SyncedDatetime = GETDATE(),
                LastModifiedById = @SyncedById,
-               LastModifiedDatetime = GETDATE()
+               LastModifiedDatetime = GETDATE(),
+               BatchName = ISNULL(@BatchName, BatchName)
          WHERE Purchase_Header_ID = @HeaderId;
     END
     """,
@@ -3004,12 +3311,17 @@ _MENU_PROC_DDL = [
             RETURN;
         END
         -- Every status appears, even with a 0 count (for the bar chart).
+        -- Ordered by DisplayOrder (a logical order re-synced from
+        -- STATUS_VALUES on every startup - see its own DDL comment), not
+        -- StatusId (an IDENTITY frozen at whenever each status was first
+        -- seeded, so a status added later can never sort where it
+        -- logically belongs by StatusId alone).
         -- NOLOCK: pure display (Dashboard tiles), never gates a write decision.
         SELECT s.StatusId, s.StatusName, COUNT(pt.Id) AS Cnt
         FROM dbo.tbl_status s WITH (NOLOCK)
         LEFT JOIN dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) ON pt.StatusID = s.StatusId
-        GROUP BY s.StatusId, s.StatusName
-        ORDER BY s.StatusId;
+        GROUP BY s.StatusId, s.StatusName, s.DisplayOrder
+        ORDER BY ISNULL(s.DisplayOrder, s.StatusId);
     END
     """,
     # ---- User Management -------------------------------------------------
@@ -3226,17 +3538,17 @@ _MENU_PROC_DDL = [
         -- be uploaded again by anyone, so it is NOT treated as a duplicate.
         -- Same for a file whose linked invoice is currently in any of
         -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/New
-        -- Template) - KEEP THIS LIST IN SYNC with database._REPROCESSABLE_
-        -- STATUSES. Re-uploading one of these is a deliberate correction
-        -- (see processor.py/reprocess_reworkable_header), not a duplicate,
-        -- so it must reach processing rather than being silently skipped
-        -- here before it ever gets that far.
+        -- Template/Unsupported) - KEEP THIS LIST IN SYNC with database.
+        -- _REPROCESSABLE_STATUSES. Re-uploading one of these is a deliberate
+        -- correction (see processor.py/reprocess_reworkable_header), not a
+        -- duplicate, so it must reach processing rather than being silently
+        -- skipped here before it ever gets that far.
         SELECT r.RelPath, r.FileName, r.InitiatedByID, u.UserName AS InitiatedByName,
                r.InitiatedDatetime
         FROM ranked r
         LEFT JOIN dbo.tbl_user u ON u.UserId = r.InitiatedByID
         WHERE r.rn = 1 AND ISNULL(r.StatusID, -1) <> 0
-          AND ISNULL(r.StatusName, '') NOT IN ('EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE');
+          AND ISNULL(r.StatusName, '') NOT IN ('EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE', 'UNSUPPORTED');
     END
     """,
     # ---- Reset input-file log entries (moved to New_Format) --------------
@@ -3445,9 +3757,9 @@ _MENU_PROC_DDL = [
         -- HeaderId/IsReprocessable let the caller re-process an invoice
         -- whose only existing record is in one of database.
         -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/
-        -- New Template), instead of flagging it as a duplicate (see
-        -- database.get_processed_invoices/reprocess_reworkable_header) -
-        -- KEEP THIS LIST IN SYNC with _REPROCESSABLE_STATUSES. Picks one
+        -- New Template/Unsupported), instead of flagging it as a duplicate
+        -- (see database.get_processed_invoices/reprocess_reworkable_header)
+        -- - KEEP THIS LIST IN SYNC with _REPROCESSABLE_STATUSES. Picks one
         -- representative header per invoice no. (MIN Id) since an invoice
         -- no. is expected to map to a single real header in practice.
         -- BuyerOrderNo comes from the tracker (a fixed schema column,
@@ -3457,7 +3769,7 @@ _MENU_PROC_DDL = [
         SELECT h.InvoiceNo, MIN(pt.BatchName) AS BatchName,
                MIN(h.Id) AS HeaderId,
                MAX(CASE WHEN s.StatusName IN (
-                       'EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE'
+                       'EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE', 'UNSUPPORTED'
                    ) THEN 1 ELSE 0 END) AS IsReprocessable,
                MIN(pt.BuyerOrderNo) AS BuyerOrderNo
         FROM dbo.tbl_Purchase_Header h
@@ -3768,8 +4080,12 @@ def get_templates_data():
         conn.close()
 
 
-def save_template(entity, name, template_key, po_format, static, user_id=None, invoice_type=None):
+def save_template(entity, name, template_key, po_format, static, user_id=None, invoice_type=None, old_template_key=None):
     """Upsert one template header and MERGE its static values in bulk.
+    `old_template_key`, when given and different from `template_key`, is a
+    RENAME: the row is found by the OLD key and its Name/TemplateKey are
+    updated in place (see usp_SaveTemplate's own comment) instead of this
+    becoming a new template.
     Sample: save_template('SPR', 'Bosch', 'SPR\\PART\\Bosch', 'SPRPUR/2026/', {'Purchase Header': {'Location_Code': 'CHN'}}, 7, 'PART')"""
     ensure_menu_schema()
     rows = [
@@ -3782,8 +4098,9 @@ def save_template(entity, name, template_key, po_format, static, user_id=None, i
     try:
         cur = conn.cursor()
         cur.execute(
-            "EXEC dbo.usp_SaveTemplate ?, ?, ?, ?, ?, ?, ?",
+            "EXEC dbo.usp_SaveTemplate ?, ?, ?, ?, ?, ?, ?, ?",
             entity, name, template_key, (po_format or None), rows, user_id, invoice_type,
+            old_template_key if old_template_key and old_template_key != template_key else None,
         )
         conn.commit()
     finally:
@@ -3938,7 +4255,27 @@ def init_status_table():
             )
         conn.commit()
 
-        cur.execute("SELECT StatusId, StatusName FROM tbl_status ORDER BY StatusId")
+        # DisplayOrder decouples the Dashboard's "Status breakdown" bar
+        # order (and anywhere else that wants a logical, not historical,
+        # order) from StatusId - StatusId is an IDENTITY, permanently
+        # fixed to whenever a status was first seeded on THIS database, so
+        # a status added later can never sort between two earlier ones by
+        # StatusId alone, no matter where it sits in STATUS_VALUES.
+        # Re-synced from STATUS_VALUES' own order on every startup, so
+        # re-ordering that Python list is always enough going forward.
+        cur.execute(
+            "IF COL_LENGTH('dbo.tbl_status', 'DisplayOrder') IS NULL "
+            "ALTER TABLE dbo.tbl_status ADD DisplayOrder INT NULL"
+        )
+        conn.commit()
+        for i, name in enumerate(STATUS_VALUES):
+            cur.execute(
+                "UPDATE tbl_status SET DisplayOrder = ? WHERE StatusName = ?",
+                i, name,
+            )
+        conn.commit()
+
+        cur.execute("SELECT StatusId, StatusName FROM tbl_status ORDER BY DisplayOrder")
         return [(r[0], r[1]) for r in cur.fetchall()]
     finally:
         conn.close()
