@@ -161,11 +161,16 @@ export function SearchableSelect({ value, onChange, options, placeholder = "Sear
 
 // Generic table: search box, click-to-sort headers, 10-row pagination.
 // columns: [{ key, label, render?(row), sortable? }]
+// defaultSortKey/defaultSortDir: sort applied up front (shown pre-sorted,
+// with the header's arrow already lit) instead of leaving it unsorted
+// until the user clicks a header - use when the rows' own incoming order
+// isn't a reliable enough guarantee on its own for the caller's intent.
 export function DataTable({ columns, rows, searchKeys, pageSize = 10,
-                            pageSizeOptions, empty, actions }) {
+                            pageSizeOptions, empty, actions,
+                            defaultSortKey = null, defaultSortDir = "asc" }) {
   const [query, setQuery] = useState("");
-  const [sortKey, setSortKey] = useState(null);
-  const [sortDir, setSortDir] = useState("asc");
+  const [sortKey, setSortKey] = useState(defaultSortKey);
+  const [sortDir, setSortDir] = useState(defaultSortDir);
   const [page, setPage] = useState(0);
   // When pageSizeOptions is given, the user can change rows-per-page (incl.
   // "All"); otherwise the fixed `pageSize` prop is used.

@@ -506,6 +506,7 @@ export default function Dashboard({ user }) {
               <div className="alert alert-danger" style={{ marginBottom: 12 }}>{batchError}</div>
             )}
             <DataTable columns={batchColumns} rows={batchRows} searchKeys={["batch", "created"]}
+                       defaultSortKey="batch" defaultSortDir="desc"
                        empty="No batches yet. Run Start to create one." />
           </div>
 
