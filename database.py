@@ -22,11 +22,12 @@ import secret_store
 
 ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 
-# A Data Mismatch/Excluded/New Template invoice left unresolved this long
-# auto-parks as Manually Updated (see usp_ExpireStaleUnresolved /
-# expire_stale_unresolved) - permanently, never reprocessable again.
-# Unsupported gets the same treatment by filesystem age instead, since it
-# never gets a database row at all (see config_store.expire_stale_files).
+# A Data Mismatch/Excluded/New Template/Buyer Order No Doesn't Exist
+# invoice left unresolved this long auto-parks as Manually Updated (see
+# usp_ExpireStaleUnresolved / expire_stale_unresolved) - permanently,
+# never reprocessable again. Unsupported gets the same treatment by
+# filesystem age instead, since it never gets a database row at all (see
+# config_store.expire_stale_files).
 STALE_STATUS_EXPIRY_DAYS = 10
 
 
@@ -398,9 +399,10 @@ def resync_pending(batch_name=None):
 
 
 def expire_stale_unresolved(days=None):
-    """Park every Data Mismatch/Excluded/New Template invoice that's sat
-    unresolved for more than `days` (default STALE_STATUS_EXPIRY_DAYS) as
-    Manually Updated - permanently: it drops out of batch status entirely
+    """Park every Data Mismatch/Excluded/New Template/Buyer Order No
+    Doesn't Exist invoice that's sat unresolved for more than `days`
+    (default STALE_STATUS_EXPIRY_DAYS) as Manually Updated - permanently:
+    it drops out of batch status entirely
     (_BATCH_IGNORED_STATUSES) and, since Manually Updated is deliberately
     never in _REPROCESSABLE_STATUSES, a later re-upload of the same invoice
     falls through to DUPLICATE instead of merging in place. Unsupported is
@@ -3235,8 +3237,9 @@ _MENU_PROC_DDL = [
     END
     """,
     # ---- Expire stale unresolved rows (each Start) -------------------------
-    # A Data Mismatch/Excluded/New Template invoice nobody has resolved
-    # (re-uploaded/fixed, re-included, retrained) within STALE_STATUS_
+    # A Data Mismatch/Excluded/New Template/Buyer Order No Doesn't Exist
+    # invoice nobody has resolved (re-uploaded/fixed, re-included,
+    # retrained, given a manual PO) within STALE_STATUS_
     # EXPIRY_DAYS is parked permanently as Manually Updated - it stops
     # counting toward batch status (_BATCH_IGNORED_STATUSES) and, since
     # Manually Updated is deliberately never added to
@@ -3268,7 +3271,8 @@ _MENU_PROC_DDL = [
         DECLARE @StaleIds TABLE (StatusId INT);
         INSERT INTO @StaleIds
         SELECT StatusId FROM dbo.tbl_status
-         WHERE StatusName IN ('DATA MISMATCH', 'EXCLUDED', 'NEW TEMPLATE');
+         WHERE StatusName IN ('DATA MISMATCH', 'EXCLUDED', 'NEW TEMPLATE',
+                               'BUYER ORDER NO DOESN''T EXIST');
         DECLARE @ManuallyUpdatedId INT = (SELECT StatusId FROM dbo.tbl_status WHERE StatusName = 'MANUALLY UPDATED');
         IF NOT EXISTS (SELECT 1 FROM @StaleIds) OR @ManuallyUpdatedId IS NULL
         BEGIN

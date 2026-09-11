@@ -986,10 +986,11 @@ class JobManager:
 
     @staticmethod
     def _expire_stale_unresolved(job):
-        """Park any Data Mismatch/Excluded/New Template invoice left
-        unresolved past database.STALE_STATUS_EXPIRY_DAYS as Manually
-        Updated - permanently; it stops counting toward batch status and
-        can never be reprocessed again (see database.expire_stale_unresolved).
+        """Park any Data Mismatch/Excluded/New Template/Buyer Order No
+        Doesn't Exist invoice left unresolved past database.
+        STALE_STATUS_EXPIRY_DAYS as Manually Updated - permanently; it
+        stops counting toward batch status and can never be reprocessed
+        again (see database.expire_stale_unresolved).
         Also moves each expired PDF into the Manually Updated folder - the
         DB-only UPDATE doesn't touch the filesystem itself, and these files
         come from earlier runs, not this job's own results (see
