@@ -25,6 +25,19 @@ from format_model import FormatModel
 import template_store
 import service_api
 
+# On a scanned/OCR'd page, a missing PDF-sourced field is normally left as
+# DATA MISMATCH (see _save_batch_to_db) - far more likely this one
+# document's own numbers being misread than the template itself needing
+# work. These particular fields are the exception: each one comes off a
+# whole table column or address block (not a single OCR'd character), so a
+# blank here means that column/block wasn't picked up from the page at
+# all - a template gap training can fix, not scattered OCR noise. Routed
+# to NEW TEMPLATE instead in that case, same as a born-digital page.
+SCANNED_CRITICAL_PDF_FIELDS = {
+    "Buy-from Address", "Pay-to Address", "GST Order Address State", "State",
+    "Quantity", "Direct Unit Cost", "Line Amount", "GST Base Amount",
+}
+
 
 class ProcessingJob:
 
@@ -851,10 +864,12 @@ class JobManager:
             #     one-off data problem - copied into New_Format the same
             #     way an unrecognized format is. On a scanned/OCR'd page
             #     (data["_is_scanned"]) this same gap stays DATA MISMATCH
-            #     instead: the format itself already matched a trained
-            #     one, so a blank field here is far more likely this one
+            #     instead: the format itself already matched a trained one,
+            #     so a blank field here is far more likely this one
             #     document's own numbers being misread by OCR than a
-            #     genuine template problem retraining could ever fix.
+            #     genuine template problem retraining could ever fix - EXCEPT
+            #     for SCANNED_CRITICAL_PDF_FIELDS, still routed to NEW
+            #     TEMPLATE even when scanned (see its own comment above).
             #   - otherwise anything missing -> DATA MISMATCH, with exactly
             #     which field(s) - excluding one whose only possible source
             #     is an unset Template value (see excel_export._is_none_
@@ -877,7 +892,10 @@ class JobManager:
                 missing_names = sorted({m["field"] for m in missing})
                 pdf_missing = sorted({m["field"] for m in missing if m["source"] == "PDF"})
                 is_scanned = bool((matched[i].get("data") or {}).get("_is_scanned"))
-                if pdf_missing and not is_scanned:
+                if pdf_missing and (
+                    not is_scanned
+                    or any(f in SCANNED_CRITICAL_PDF_FIELDS for f in pdf_missing)
+                ):
                     tracker["statuses"][i] = "NEW TEMPLATE"
                     tracker["isactives"][i] = False
                     matched[i]["reason"] = (

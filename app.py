@@ -72,6 +72,104 @@ def _bootstrap_menu_storage():
         traceback.print_exc()
 
 
+@app.on_event("startup")
+def _run_part_description_migration():
+    """One-time data-quality migration, NOT a general cleanup: older
+    ocr_engine.py extraction bugs (now fixed - see EXCLUDE_KW's hsn/sac,
+    way bill, net amount, bank name, beneficiary, account no, ifsc code,
+    branch, continued, contd, computer generated invoice, rounded off
+    entries) saved corrupted text straight into tbl_Purchase_Line's own
+    [Description] for invoices processed before those fixes existed - which
+    then surfaces as a wrong/junk suggestion on the Part Description
+    Mapping screen (Part_Description_Update_Items -> PdfDescriptions).
+    Runs ONCE ever, guarded by config.json's part_description_migration_done
+    (set only after a run actually completes with a real, non-ambiguous
+    signal - see the "inconclusive" comment below): re-OCRs, with today's
+    fixed extraction, ONLY the PDFs currently backing a row this screen
+    itself would show right now (never a blanket table scan, and never an
+    invoice the screen doesn't currently flag), and overwrites ONLY the
+    [Description] column of the specific tbl_Purchase_Line row(s) that
+    PDF's own re-extraction positionally matches (see
+    database.fix_purchase_line_descriptions) - no other column, table,
+    invoice, or tracker status is touched. Best-effort per PDF: one
+    failure is logged and skipped, never aborts the rest of the run or
+    blocks startup."""
+    import traceback
+    try:
+        cfg = config_store.load_config()
+        if cfg.get("part_description_migration_done"):
+            return
+        if not (cfg.get("db_connection") or "").strip():
+            return  # DB not configured yet - nothing to migrate
+
+        import database
+
+        order_nos = database.buyer_order_nos_for_status("DATA MISMATCH")
+        if not order_nos:
+            # Nothing at DATA MISMATCH at all - determined entirely from
+            # our own DB, no dependency on Service First being reachable,
+            # so this is a safe, unambiguous "done".
+            config_store.save_config({"part_description_migration_done": True})
+            return
+
+        # The EXACT same screen logic (order_nos -> SF mismatch records ->
+        # drop-if-already-resolved) - reused as-is (not reimplemented) so
+        # the candidate set is always byte-for-byte what a user would
+        # currently see on the Part Description Mapping screen.
+        items = part_description_update_items().get("items") or []
+        if not items:
+            # Ambiguous: could genuinely mean "every PO is already
+            # resolved", or Service First being unreachable right now
+            # (get_specification_mismatch_records swallows its own errors
+            # and returns [] either way). Don't mark done on a guess - a
+            # transient SF outage at the one moment this fires must not
+            # look like "nothing to fix" forever. Retried on next startup.
+            return
+
+        candidates = {}
+        for item in items:
+            po = item.get("PurchaseOrderNo")
+            for inv in item.get("PdfInvoices") or []:
+                fname = inv.get("FileName")
+                if po and fname:
+                    candidates[(po, fname)] = True
+
+        from ocr_engine import OCREngine
+        from invoice_schema import build_invoice_json
+
+        ocr = OCREngine()
+        allow_scanned = bool(cfg.get("allow_scanned_pdfs"))
+        fixed_lines = 0
+        fixed_invoices = 0
+        for po, fname in candidates:
+            try:
+                header_id = database.purchase_header_id_for_invoice(po, fname, "DATA MISMATCH")
+                if not header_id:
+                    continue
+                path = config_store.find_pdf(fname)
+                if not path:
+                    continue
+                ocr_result = ocr.read_pdf(path, allow_scanned=allow_scanned)
+                invoice_groups = ocr_result.get("Invoices") or [ocr_result]
+                data = build_invoice_json(invoice_groups[0], path)
+                n = database.fix_purchase_line_descriptions(header_id, data.get("items") or [])
+                if n:
+                    fixed_lines += n
+                    fixed_invoices += 1
+            except Exception:  # noqa: BLE001 - one bad PDF must not stop the rest
+                traceback.print_exc()
+                continue
+
+        config_store.save_config({"part_description_migration_done": True})
+        print(
+            f"[part-description-migration] Corrected {fixed_lines} Purchase "
+            f"Line description(s) across {fixed_invoices} invoice(s) "
+            f"({len(candidates)} candidate(s) examined). Will not run again."
+        )
+    except Exception:  # noqa: BLE001 - never block startup
+        traceback.print_exc()
+
+
 @app.get("/health")
 def health():
     return {"status": "Healthy"}
@@ -757,7 +855,7 @@ def part_description_update_items():
     menu, so a user can see what SF actually has on file for a PO's parts.
     Each row also carries PdfInvoices (PIIPS's own InvoiceNo/FileName for
     that PO - Purchase Details column) and PdfDescriptions (the invoice's
-    own Purchase Line Description text(s) for that PO - the screen's
+    own saved Purchase Line Description text(s) for that PO - the screen's
     autocomplete when typing a corrected SF description).
 
     A row is dropped when its own Nav_Part_Description already matches one

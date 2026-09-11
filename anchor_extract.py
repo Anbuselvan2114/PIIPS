@@ -726,13 +726,28 @@ def extract(header_rows, footer_rows, page_width):
                     continue
                 low = text.lower()
 
-                # section change?
+                # section change? A caption like "Buyer (if other than
+                # consignee)" matches BOTH markers - "buyer" at the start
+                # (the actual subject) and "consignee" buried in the
+                # parenthetical qualifier - so whichever phrase occurs
+                # EARLIEST in the text wins, not whichever section happens
+                # to be checked first in the list above. Without this, the
+                # Consignee entry's blanket "consignee" substring always
+                # won on a row like that regardless of what the row is
+                # actually captioning, silently re-triggering Consignee
+                # (a no-op, since it's already active) and discarding the
+                # row's real content - including the Buyer's own Name,
+                # often printed on that same caption line.
                 switched = False
+                best_pos, best_name, best_marker = None, None, None
                 for name, marks in SECTION_MARKERS:
-                    if any(m in low for m in marks):
-                        section = name
-                        switched = True
-                        break
+                    for m in marks:
+                        pos = low.find(m)
+                        if pos != -1 and (best_pos is None or pos < best_pos):
+                            best_pos, best_name, best_marker = pos, name, m
+                if best_name is not None:
+                    section = best_name
+                    switched = True
                 if not switched:
                     stripped = low.strip(" :,-.")
                     for name, marks in EXACT_SECTION_MARKERS:
@@ -742,7 +757,41 @@ def extract(header_rows, footer_rows, page_width):
                             break
                 if switched:
                     any_switch = True
-                    continue
+                    # The winning marker phrase can share its row with real
+                    # content for the section it just switched INTO (e.g.
+                    # "Buyer (if other than consignee)\nPRECISION TECHSERVE
+                    # PVT LTD" clustered as one row by the text layout) -
+                    # strip the marker phrase itself, and an immediately-
+                    # following parenthetical qualifier (never real content
+                    # either, e.g. "(if other than consignee)"), and let
+                    # whatever remains fall through to the normal per-row
+                    # handling below under the NEW section, instead of
+                    # unconditionally discarding the whole row the way a
+                    # bare marker-only row correctly should be. Not
+                    # applicable to an EXACT_SECTION_MARKERS match (bare
+                    # "To,") - that only ever matches when the WHOLE row is
+                    # the marker, so there is never a real remainder.
+                    if best_marker is None:
+                        continue
+                    remainder = text[best_pos + len(best_marker):]
+                    # The marker phrase can be a PREFIX of a longer word in
+                    # the actual text (e.g. marker "customer detail"
+                    # matching inside "Customer Details:") - strip any
+                    # lowercase letters immediately continuing that same
+                    # word (the "s" in "Details") first, so that leftover
+                    # word-fragment doesn't itself become a spurious one-
+                    # character "name" once real content is sought below.
+                    word_tail = re.match(r"^[a-z]+", remainder)
+                    if word_tail:
+                        remainder = remainder[word_tail.end():]
+                    remainder = remainder.strip(" :,-.")
+                    paren = re.match(r"^\([^)]*\)\s*", remainder)
+                    if paren:
+                        remainder = remainder[paren.end():].strip(" :,-.")
+                    if not remainder or not any(c.isalpha() for c in remainder):
+                        continue
+                    text = remainder
+                    low = text.lower()
 
                 # A section marker on the RIGHT half of this SAME row (past
                 # the divider) - e.g. "BUYER DETAILS" landing a few columns
