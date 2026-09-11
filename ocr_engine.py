@@ -97,6 +97,27 @@ def _looks_like_photo_page(image):
     return signals >= 2
 
 
+# A properly-focused scan of a text document has sharp glyph edges, which
+# show up as a high-variance response to a Laplacian (edge-detection)
+# filter; a shaky/blurry/out-of-focus capture smears those edges, dropping
+# the variance sharply. Calibrated empirically against every already-
+# working scanned page in the trained-format corpus (lowest observed:
+# ~56, a short, sparse invoice with little text to produce edges from even
+# in perfect focus) - set well below that with a safety margin, so this
+# only catches a scan meaningfully worse than anything already processed
+# successfully, not a merely sparse or simple one.
+_BLUR_VARIANCE_MIN = 25.0
+
+
+def _looks_like_blurry_page(image):
+    """True when a rasterised page is too blurry/shaky to trust for
+    extraction - see _BLUR_VARIANCE_MIN's calibration note above."""
+    if image is None or image.size == 0:
+        return False
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var() < _BLUR_VARIANCE_MIN
+
+
 # Indian GSTIN: 2-digit state code + 10-char PAN + entity/check chars (15 total).
 _GSTIN_RE = re.compile(r"\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]{2}")
 
@@ -1036,6 +1057,12 @@ class OCREngine:
                     "(uneven lighting/background or non-paper aspect ratio) — "
                     "unsupported."
                 )
+            blurry_count = sum(1 for image in rasterised if _looks_like_blurry_page(image))
+            if blurry_count * 2 > len(rasterised):
+                raise ValueError(
+                    "Document looks too blurry/shaky to read reliably "
+                    "(low edge sharpness) — unsupported."
+                )
             if not allow_scanned:
                 raise ValueError(
                     "Document is a scanned or photocopied PDF, not an original "
@@ -1214,6 +1241,20 @@ class OCREngine:
 
         text = "\n\n".join(group["text"])
 
+        # A party's own Name is always fully printed on the single page
+        # that introduces it - never legitimately split/continued onto a
+        # later page the way an address or terms block might be (see the
+        # "Append multiline values" rule below, which exists for exactly
+        # that legitimate case). Without this exception, an unrelated
+        # later-page label that happens to read as a bare name - e.g. a
+        # "Bank Details" footer's "Name : Indusand bank" line, picked up
+        # by that page's own independent anchor-extraction pass via its
+        # "first unclaimed line = party name" fallback (a fresh page
+        # starts that pass with nothing claimed yet) - gets silently
+        # concatenated onto the correct first-page value instead of being
+        # ignored, corrupting the real Seller/Buyer/Consignee Name.
+        _SINGLE_VALUE_FIELDS = {"Seller Name", "Buyer Name", "Consignee Name"}
+
         merged_fields = {}
         for fields in group["fields"]:
             for key, value in fields.items():
@@ -1221,6 +1262,8 @@ class OCREngine:
                     continue
                 if key not in merged_fields:
                     merged_fields[key] = value
+                elif key in _SINGLE_VALUE_FIELDS:
+                    continue
                 elif value not in merged_fields[key]:
                     # Append multiline values
                     merged_fields[key] += "\n" + value
@@ -2290,6 +2333,61 @@ class OCREngine:
                      "shipping", "packing", "handling", "cartage",
                      "loading", "insurance")
 
+        # "continued"/"contd" is a multi-page invoice's own page-footer
+        # marker ("continued ...", printed below the table on every page
+        # but the last), and "this is a computer generated invoice" is the
+        # standalone footer line every page of this layout prints at the
+        # very bottom - both have no leading serial and real letters, so
+        # without excluding them they silently glue onto whichever item
+        # happened to be last on that page's table (e.g. "Hinges ... Part
+        # No : 5H50S29037 continued" / "... This is a Computer Generated
+        # Invoice"). "Rounded Off" (past tense) is the actual wording
+        # several vendors print ("Dell Mouse MS116 Rounded Off", "...Less :
+        # Rounded Off (-)0.40") - "round off"/"round-off"/"roundoff" above
+        # don't substring-match it (the "ed" breaks it), so it slipped
+        # through and glued onto the previous item exactly like
+        # "continued" did.
+        # Hoisted to function scope (not just the continuation-line branch
+        # below that originally needed it): also needed by the "no leading
+        # serial" item-start fallback further down, so a genuine tax-
+        # summary/footer row with a real Amount on it (e.g. "Taxable
+        # Amount  ₹56,888.00") isn't mistaken for a whole new phantom line
+        # item just because it has real words and a number that parses as
+        # an amount.
+        EXCLUDE_KW = ("output", "igst", "cgst", "sgst", "tax amount",
+                      "total", "round off", "round-off", "roundoff",
+                      "rounded off",
+                      "rupees", "inr ", "grand total", "tax rate",
+                      "taxable", "amount chargeable", "in words",
+                      "declaration", "continued", "contd",
+                      "computer generated invoice",
+                      # A vendor that has no separate HSN/SAC table
+                      # column instead prints "HSN/SAC-84733099" as
+                      # its own line within the description cell
+                      # itself (e.g. Shupla IT) - real printed text,
+                      # but Service First's own catalog description
+                      # for the part never includes this restatement,
+                      # so keeping it in Description only prevents an
+                      # otherwise-clean match. The digits themselves are
+                      # still recovered separately - see the HSN-caption
+                      # capture just above the charge-line handling below.
+                      "hsn/sac",
+                      # A bank-details footer block (account for payment,
+                      # not part of the invoice's own line items) sitting
+                      # directly below the table's "Total" row (e.g.
+                      # Printer World's "Bank Name / Beneficiary / Account
+                      # No / IFSC Code / Branch: SECUNDERABAD / Way Bill No
+                      # | Net Amount 1,711.00") - without these, "Branch:
+                      # SECUNDERABAD" glues onto the last real item's
+                      # Description, and "Way Bill No | Net Amount
+                      # 1,711.00" (real words + the invoice's own real
+                      # Amount, no leading serial) is indistinguishable from
+                      # a genuine item and becomes a phantom line with a
+                      # blank HSN/Quantity - the same failure shape as the
+                      # "Taxable Amount"/"Total" case above.
+                      "way bill", "net amount", "bank name", "beneficiary",
+                      "account no", "ifsc code", "branch")
+
 
         def _strip_currency(value):
             # A Rate/Amount token glued to its currency symbol ("₹ 14000.00",
@@ -2375,21 +2473,25 @@ class OCREngine:
 
         def descriptive_text(wds):
             """Real description words from a row: unit words (No./Nos/
-            Pcs/...) are always noise, and a number is noise ONLY when it
-            sits under the Quantity/Rate/Amount column - a genuine spec
-            number that happens to be part of the description (e.g. "90"
-            in "90 Days Warranty") is printed in the Description column's
-            own territory and must survive, while a Quantity/Rate/Amount
-            figure that leaked onto this row (already harvested above)
-            should not be echoed into the text too."""
+            Pcs/...) are always noise, a GST cell's combined amount+percent
+            text (e.g. "Rs 45.00 (18%)") is always noise regardless of
+            whether it happens to parse as a plain number, and a number is
+            noise ONLY when it sits under the Quantity/Rate/Amount column -
+            a genuine spec number that happens to be part of the
+            description (e.g. "90" in "90 Days Warranty") is printed in the
+            Description column's own territory and must survive, while a
+            Quantity/Rate/Amount figure that leaked onto this row (already
+            harvested above) should not be echoed into the text too."""
             out = []
             for w in wds:
                 t = w["text"].strip()
                 if is_unit(t):
                     continue
-                if is_number(t) and value_cols:
+                if value_cols:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
-                    if col in ("Quantity", "Rate", "Amount"):
+                    if col == "GST":
+                        continue
+                    if is_number(t) and col in ("Quantity", "Rate", "Amount"):
                         continue
                 out.append((w, t))
             if not out:
@@ -2422,7 +2524,7 @@ class OCREngine:
         value_cols = {
             key: columns[key]
             for key in ("SI", "Description", "HSN", "Quantity", "Rate",
-                        "Per", "Amount", "Discount", "IGST", "Total")
+                        "Per", "Amount", "Discount", "IGST", "GST", "Total")
             if columns and key in columns
         }
 
@@ -2577,6 +2679,50 @@ class OCREngine:
                 serial_from_token = True
             else:
                 glued = re.match(r"^(\d{1,3})[.)]?\s*([A-Za-z].*)$", first)
+                # Same measurement/warranty-period guard as split_serial_
+                # description's own two checks (a size like "8GB ..." or a
+                # validity period like "45 Days ...") - this token is real
+                # description content, not a serial number starting a new
+                # item. Without this, a wrapped continuation line beginning
+                # this way (e.g. "45 DAYS WARRNATY", the tail of a multi-
+                # line description) gets misread as "item start, serial
+                # 45", then folded back into the current item's Description
+                # anyway once row_has_values() finds nothing else on the
+                # row - but by then the leading number itself is already
+                # gone (only GB/TB/MB/KB had their own narrow reattachment
+                # fix-up below; DAYS and the rest of the unit list never
+                # did, and the reattachment only helps `cont`'s exact
+                # prefix anyway, not text a caller further down builds).
+                if glued and re.match(
+                    r"^\d{1,3}[.)]?\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?)\b",
+                    first,
+                    re.IGNORECASE,
+                ):
+                    glued = None
+                # General case covering any OTHER part/SKU code that
+                # happens to start with a digit (e.g. "4QL27-80101", a
+                # genuine part number wrapped onto its own line within a
+                # multi-line item description) - same reasoning as
+                # split_serial_description's own general check: a real
+                # English word (a genuine "1CPU"-style serial + item name)
+                # always has a lowercase letter somewhere; a part/SKU code
+                # never does. Checked against just the word immediately
+                # after the digit, not the whole remainder, in case a
+                # longer wrapped line genuinely continues into real prose.
+                if glued:
+                    first_word = glued.group(2).split(None, 1)[0] if glued.group(2).split() else ""
+                    # A plain unit abbreviation ("QTY", "PCS") is legitimate
+                    # glued text even though it has no lowercase letter -
+                    # only reject when it ALSO isn't a recognised unit, so a
+                    # bare "<qty> <UNIT>" row (e.g. the invoice's own
+                    # unlabelled grand-total line "03 QTY") still parses as
+                    # serial="03"/desc="QTY" and can be folded downstream by
+                    # the has_desc_text/row_has_values checks, instead of
+                    # silently skipping serial detection altogether and
+                    # falling through to a different code path that has no
+                    # such fold-back safeguard.
+                    if first_word and not is_unit(first_word) and not any(c.islower() for c in first_word):
+                        glued = None
                 if glued:
                     serial = glued.group(1)
                     desc = glued.group(2).strip()
@@ -2633,6 +2779,16 @@ class OCREngine:
             # has real (non-unit) label text and a genuine Amount, so it
             # would otherwise pass every check above and get misfiled as a
             # purchased item worth a few paise/rupees - exclude it by name.
+            # A tax-summary/footer row with its own real Amount - "Taxable
+            # Amount  ₹56,888.00", "Total  ₹66,788.00" - has exactly the
+            # same shape (real words, a genuine amount, no leading serial)
+            # and was otherwise indistinguishable from a real item lacking
+            # only its own Quantity/Rate, becoming a phantom item that then
+            # wrongly routes the whole invoice to NEW TEMPLATE for
+            # "missing" fields that were never a real line item's to begin
+            # with. EXCLUDE_KW is the same footer/summary-keyword list the
+            # continuation-line path below already uses for this exact
+            # reason.
             # The HSN check is column-gated (not "any 4-10 digit token
             # anywhere in the row") for the same reason as row_has_values
             # below: a wrapped description can itself contain a bare number
@@ -2645,6 +2801,7 @@ class OCREngine:
                 serial is None
                 and value_cols
                 and not any(k in lower for k in CHARGE_KW)
+                and not any(k in lower for k in EXCLUDE_KW)
                 and not re.search(r"round(?:ed)?[\s-]*off", lower)
                 and (
                     any(
@@ -2673,10 +2830,28 @@ class OCREngine:
                     words[:serial_word_idx] + words[serial_word_idx + 1:]
                     if serial_from_token else words
                 )
+                # A genuine new item needs BOTH a real value (row_has_values)
+                # AND real descriptive text naming the product - a row with
+                # values but no description at all is exactly the shape of
+                # the invoice's own grand-total line (e.g. "03 QTY  ₹
+                # 10,797.00", no label on that row - the total quantity and
+                # total amount, structurally identical to a genuine item's
+                # own leading serial + amount). Without this, that total
+                # row's bare "03" reads as a real serial (row_has_values
+                # sees a genuine Amount) and becomes a standalone phantom
+                # item with a blank Description.
+                desc_clean = desc.strip()
+                has_desc_text = (
+                    desc_clean and not is_unit(desc_clean) and not is_number(desc_clean)
+                ) or any(
+                    w["text"].strip() and not is_unit(w["text"].strip())
+                    and not is_number(w["text"].strip())
+                    for w in cont_words
+                )
                 if (
                     serial_from_token
                     and current_item is not None
-                    and not row_has_values(cont_words)
+                    and (not row_has_values(cont_words) or not has_desc_text)
                 ):
                     cont = desc
                     for w in cont_words:
@@ -2817,6 +2992,20 @@ class OCREngine:
                                 continue
 
 
+                        # A GST cell's combined amount+percent text (e.g.
+                        # "₹ 684.00 (18%)") never parses as a plain number
+                        # as a whole, so without this it fell straight
+                        # through to the generic "free text becomes
+                        # description" fallback below - corrupting the
+                        # item's real Description with leaked price/tax
+                        # text (sometimes landing mid-description, ahead of
+                        # a wrapped second line, since this token is
+                        # processed on the row's first physical line).
+                        # Discarded outright, same as a stray Quantity/
+                        # Rate/Amount number under another column.
+                        if col == "GST":
+                            continue
+
                         # Numbers under other columns (e.g. discount) are
                         # ignored; free text becomes description.
                         if not is_number(txt):
@@ -2919,29 +3108,17 @@ class OCREngine:
                     or any(_SIZE_SPEC_RE.match(w["text"].strip()) for w in words)
                 )
 
-                # "continued"/"contd" is a multi-page invoice's own page-
-                # footer marker ("continued ...", printed below the table on
-                # every page but the last), and "this is a computer
-                # generated invoice" is the standalone footer line every
-                # page of this layout prints at the very bottom - both have
-                # no leading serial and real letters, so without excluding
-                # them here they silently glue onto whichever item happened
-                # to be last on that page's table (e.g. "Hinges ... Part No
-                # : 5H50S29037 continued" / "... This is a Computer
-                # Generated Invoice").
-                # "Rounded Off" (past tense) is the actual wording several
-                # vendors print ("Dell Mouse MS116 Rounded Off", "...Less :
-                # Rounded Off (-)0.40") - "round off"/"round-off"/"roundoff"
-                # above don't substring-match it (the "ed" breaks it), so it
-                # slipped through and glued onto the previous item exactly
-                # like "continued" did.
-                EXCLUDE_KW = ("output", "igst", "cgst", "sgst", "tax amount",
-                              "total", "round off", "round-off", "roundoff",
-                              "rounded off",
-                              "rupees", "inr ", "grand total", "tax rate",
-                              "taxable", "amount chargeable", "in words",
-                              "declaration", "continued", "contd",
-                              "computer generated invoice")
+                # "HSN/SAC-84733099" glued onto its own wrapped line (see
+                # EXCLUDE_KW's "hsn/sac" entry above) is excluded from the
+                # open item's Description on purpose, but the code itself is
+                # real, PDF-stated data - a vendor with no dedicated HSN
+                # table column has nowhere else to put it. Recover it onto
+                # the still-open item so a genuine HSN value isn't lost
+                # outright and mistaken for the template lacking one.
+                if current_item is not None and "hsn/sac" in lower and not current_item.get("HSN"):
+                    hsn_match = re.search(r"hsn\s*/\s*sac\D{0,3}(\d{4,8})", lower)
+                    if hsn_match:
+                        current_item["HSN"] = hsn_match.group(1)
 
                 is_charge = (has_text
                              and any(k in lower for k in CHARGE_KW)
@@ -3251,6 +3428,15 @@ class OCREngine:
                 # Tax columns: kept only as partition anchors so their
                 # amounts don't spill into the item Amount.
                 columns.setdefault("IGST", x)
+
+            elif "gst" in txt:
+                # A compact single "GST" column combining amount + rate in
+                # one cell (e.g. "Rs 45.00 (18%)"), distinct from the full
+                # IGST/CGST/SGST breakdown above - kept only as a partition
+                # anchor (see extract_items' value_cols/GST skip below) so
+                # its glued amount+percent text doesn't leak into Quantity/
+                # Rate/Amount or, worse, the item Description itself.
+                columns.setdefault("GST", x)
 
             elif txt == "total":
                 columns.setdefault("Total", x)
@@ -3569,16 +3755,64 @@ class OCREngine:
                 )
 
                 # A token that is wholly a measurement ("8GB", "1TB",
-                # "2666MHz", "500GB") is NOT a serial glued to a description —
-                # it is a size in the item description. Leave it intact so it
-                # is not mis-split into a fake serial + "GB"/"TB".
+                # "2666MHz", "500GB") or a warranty/validity period ("45
+                # Days", "90 DAYS") is NOT a serial glued to a description —
+                # it is real content in the item description (a size spec,
+                # or - per descriptive_text's own docstring - a genuine spec
+                # number like "90" in "90 Days Warranty" that must survive).
+                # Leave it intact so it is not mis-split into a fake serial +
+                # "GB"/"TB"/"Days".
                 if match and re.fullmatch(
-                    r"\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V)",
+                    r"\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?)",
                     text,
                     re.IGNORECASE,
                 ):
                     match = None
 
+                # Same reasoning, but for a token that is the size/period
+                # PLUS more description text glued on with it as one run
+                # ("8GB PC4 2R*8 3200 DESKTOP RAM", "45 DAYS WARRNATY" - a
+                # born-digital PDF's whole item-name/continuation-line cell
+                # read as a single word, no space detected before the next
+                # word). The measurement/period still isn't a serial number
+                # here either - only the immediately-following unit matters,
+                # not whether anything else follows it.
+                if match and re.match(
+                    r"^\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?)\b",
+                    text,
+                    re.IGNORECASE,
+                ):
+                    match = None
+
+                # General case covering any OTHER part/SKU code that
+                # happens to start with a digit (e.g. "4QL27-80101" - a
+                # genuine part number wrapped onto its own line within a
+                # multi-line item description, unrelated to the specific
+                # measurement/period vocabulary above) - rather than
+                # listing every possible code shape, check the word
+                # immediately after the digit for the one thing a real
+                # English word (a genuine "1Adaptor"-style serial +
+                # description) always has and a code never does: a
+                # lowercase letter. "Adaptor" has one; "QL27-80101" does
+                # not. Without this, the leading digit is silently torn
+                # off and lost as a fake serial number.
+                if match:
+                    first_word = match.group(2).split(None, 1)[0] if match.group(2).split() else ""
+                    # A plain unit abbreviation ("QTY", "PCS", "NOS", ...)
+                    # has no lowercase letter either, but it is legitimate
+                    # glued text (e.g. the invoice's own unlabelled
+                    # grand-total row "03 QTY") - only reject as a part/SKU
+                    # code when it ISN'T also a recognised unit, so this row
+                    # still splits into serial "03" + "QTY" and can be
+                    # folded back downstream instead of surviving as one
+                    # unsplit token that item-detection then mistakes for a
+                    # standalone new item with no description.
+                    is_unit_word = first_word.lower().strip(".,)") in (
+                        "no", "nos", "pcs", "pc", "kg", "kgs", "unit", "qty",
+                        "each", "ea", "day", "days",
+                    )
+                    if first_word and not is_unit_word and not any(c.islower() for c in first_word):
+                        match = None
 
                 if match:
 

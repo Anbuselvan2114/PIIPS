@@ -142,6 +142,10 @@ export default function PartDescriptionUpdate({ user }) {
                   </button>
                 ) : "—"}
               </div>
+              <div>
+                <b>Processed:</b>{" "}
+                {inv.StartedDatetime ? inv.StartedDatetime.replace("T", " ").slice(0, 19) : "—"}
+              </div>
             </div>
           ))}
         </div>

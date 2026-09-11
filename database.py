@@ -22,11 +22,12 @@ import secret_store
 
 ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 
-# A Data Mismatch/Excluded/New Template invoice left unresolved this long
-# auto-parks as Manually Updated (see usp_ExpireStaleUnresolved /
-# expire_stale_unresolved) - permanently, never reprocessable again.
-# Unsupported gets the same treatment by filesystem age instead, since it
-# never gets a database row at all (see config_store.expire_stale_files).
+# A Data Mismatch/Excluded/New Template/Buyer Order No Doesn't Exist
+# invoice left unresolved this long auto-parks as Manually Updated (see
+# usp_ExpireStaleUnresolved / expire_stale_unresolved) - permanently,
+# never reprocessable again. Unsupported gets the same treatment by
+# filesystem age instead, since it never gets a database row at all (see
+# config_store.expire_stale_files).
 STALE_STATUS_EXPIRY_DAYS = 10
 
 
@@ -398,9 +399,10 @@ def resync_pending(batch_name=None):
 
 
 def expire_stale_unresolved(days=None):
-    """Park every Data Mismatch/Excluded/New Template invoice that's sat
-    unresolved for more than `days` (default STALE_STATUS_EXPIRY_DAYS) as
-    Manually Updated - permanently: it drops out of batch status entirely
+    """Park every Data Mismatch/Excluded/New Template/Buyer Order No
+    Doesn't Exist invoice that's sat unresolved for more than `days`
+    (default STALE_STATUS_EXPIRY_DAYS) as Manually Updated - permanently:
+    it drops out of batch status entirely
     (_BATCH_IGNORED_STATUSES) and, since Manually Updated is deliberately
     never in _REPROCESSABLE_STATUSES, a later re-upload of the same invoice
     falls through to DUPLICATE instead of merging in place. Unsupported is
@@ -1815,14 +1817,15 @@ def buyer_order_nos_for_status(status_name):
 
 def invoice_details_by_buyer_order(order_nos, status_name=None):
     """{BuyerOrderNo: {"descriptions": [...], "invoices": [{"InvoiceNo",
-    "FileName"}, ...]}} for the given POs - PIIPS's own invoice(s) for each
-    PO (Purchase Details column) and their Purchase Line Description text
-    (Part Description Update screen's autocomplete), matching a Service
-    First row's PurchaseOrderNo against what's actually in PIIPS for that
-    same PO. "descriptions" excludes "Charge (Item)" lines (Freight
-    Outward/Courier) - those aren't real parts, so they're never valid
-    matches for a Service First part row and shouldn't be offered as a
-    selectable description.
+    "FileName", "StartedDatetime"}, ...]}} for the given POs - PIIPS's own
+    invoice(s) for each PO (Purchase Details column; StartedDatetime = when
+    the file was processed/Started) and their saved Purchase Line
+    Description text (Part Description Update screen's autocomplete),
+    matching a Service First row's PurchaseOrderNo against what's actually
+    in PIIPS for that same PO. "descriptions" excludes "Charge (Item)"
+    lines (Freight Outward/Courier) - those aren't real parts, so they're
+    never valid matches for a Service First part row and shouldn't be
+    offered as a selectable description.
     A PO can carry multiple tracker rows across earlier re-uploads/re-runs
     (superseded ones parked DUPLICATE) - pass `status_name` (the same status
     the caller scoped `order_nos` to) to only surface the invoice(s) that
@@ -1843,7 +1846,7 @@ def invoice_details_by_buyer_order(order_nos, status_name=None):
             where += " AND s.StatusName = ?"
             params.append(status_name)
         cur.execute(
-            "SELECT DISTINCT pt.BuyerOrderNo, h.InvoiceNo, pt.FileName, "
+            "SELECT DISTINCT pt.BuyerOrderNo, h.InvoiceNo, pt.FileName, pt.StartedDatetime, "
             "  pl.[Description], pl.[Type] "
             "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
             "JOIN dbo.tbl_Purchase_Header h WITH (NOLOCK) ON h.Id = pt.Purchase_Header_ID "
@@ -1854,18 +1857,92 @@ def invoice_details_by_buyer_order(order_nos, status_name=None):
             params,
         )
         by_po = {}
-        for po, invoice_no, file_name, desc, line_type in cur.fetchall():
+        for po, invoice_no, file_name, started_at, desc, line_type in cur.fetchall():
             entry = by_po.setdefault(po, {"descriptions": [], "invoices": []})
             if desc and (line_type or "").strip() != "Charge (Item)":
                 if desc not in entry["descriptions"]:
                     entry["descriptions"].append(desc)
-            pair = {"InvoiceNo": invoice_no or "", "FileName": file_name or ""}
+            pair = {"InvoiceNo": invoice_no or "", "FileName": file_name or "",
+                     "StartedDatetime": started_at.isoformat() if started_at is not None else ""}
             if pair not in entry["invoices"]:
                 entry["invoices"].append(pair)
         return by_po
     finally:
         conn.close()
 
+
+def purchase_header_id_for_invoice(buyer_order_no, file_name, status_name):
+    """Purchase_Header_ID of the ACTIVE tracker row matching this exact
+    (BuyerOrderNo, FileName) pair at the given status - None if there's no
+    match or more than one (an ambiguous match is skipped rather than
+    guessed at). Used by the one-time Part Description cleanup migration
+    (app.py) to find exactly which invoice a Part Description Mapping
+    screen row's PdfInvoices entry refers to, without touching any other
+    invoice that happens to share a filename.
+    Sample: purchase_header_id_for_invoice('SPRPUR/2026/04/27-83650', 'inv1.pdf', 'DATA MISMATCH')"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        # NOT filtered by IsActive: every non-terminal status (including
+        # DATA MISMATCH, the only status this is ever called with) is
+        # saved with IsActive=0 by evaluate_invoice() - see
+        # invoices_by_batch's own note on this. The (BuyerOrderNo,
+        # FileName, StatusName) triple plus the len(rows)==1 check below
+        # is what keeps this scoped to exactly one invoice.
+        cur.execute(
+            "SELECT pt.Purchase_Header_ID "
+            "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
+            "JOIN dbo.tbl_Status s WITH (NOLOCK) ON s.StatusId = pt.StatusID "
+            "WHERE pt.BuyerOrderNo = ? AND pt.FileName = ? AND s.StatusName = ?",
+            buyer_order_no, file_name, status_name,
+        )
+        rows = cur.fetchall()
+        return rows[0][0] if len(rows) == 1 else None
+    finally:
+        conn.close()
+
+
+def fix_purchase_line_descriptions(header_id, new_items):
+    """One-time Part Description cleanup migration helper (see app.py's
+    _run_part_description_migration): overwrite ONLY the [Description]
+    column of this header's EXISTING Purchase_Line rows, matched
+    positionally to `new_items` (freshly re-extracted with the fixed OCR
+    logic) - Line No. is minted sequentially in the same order extraction
+    produced its items at save time (see save_grouped), so the Nth
+    existing line by Line No. is always the Nth item ocr_engine just
+    re-extracted. If today's fix also changed the ITEM COUNT (e.g. a
+    phantom footer line the old code misread as a second item no longer
+    appears), zip() simply stops at the shorter list - the extra old
+    line's Description is left exactly as-is rather than guessed at or
+    deleted. Every other column (Quantity/Amount/HSN/...) is untouched
+    even if it also differs: this is a Description-only correction, not a
+    re-save. Returns how many rows were actually changed (a value that's
+    already correct, or a blank freshly-extracted one, doesn't count and
+    isn't written). Best-effort per row.
+    Sample: fix_purchase_line_descriptions(4821, [{"Description": "HP ProBook..."}])"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT Id, [Description] FROM dbo.tbl_Purchase_Line "
+            "WHERE Purchase_Header_ID = ? ORDER BY [Line No.]",
+            header_id,
+        )
+        existing = cur.fetchall()
+        changed = 0
+        for (line_id, old_desc), item in zip(existing, new_items or []):
+            new_desc = (item.get("Description") or "").strip()
+            if not new_desc or new_desc == (old_desc or ""):
+                continue
+            cur.execute(
+                "UPDATE dbo.tbl_Purchase_Line SET [Description] = ? WHERE Id = ?",
+                new_desc, line_id,
+            )
+            changed += 1
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
 
 
 def _existing_cols(cur, table, wanted):
@@ -3160,8 +3237,9 @@ _MENU_PROC_DDL = [
     END
     """,
     # ---- Expire stale unresolved rows (each Start) -------------------------
-    # A Data Mismatch/Excluded/New Template invoice nobody has resolved
-    # (re-uploaded/fixed, re-included, retrained) within STALE_STATUS_
+    # A Data Mismatch/Excluded/New Template/Buyer Order No Doesn't Exist
+    # invoice nobody has resolved (re-uploaded/fixed, re-included,
+    # retrained, given a manual PO) within STALE_STATUS_
     # EXPIRY_DAYS is parked permanently as Manually Updated - it stops
     # counting toward batch status (_BATCH_IGNORED_STATUSES) and, since
     # Manually Updated is deliberately never added to
@@ -3193,7 +3271,8 @@ _MENU_PROC_DDL = [
         DECLARE @StaleIds TABLE (StatusId INT);
         INSERT INTO @StaleIds
         SELECT StatusId FROM dbo.tbl_status
-         WHERE StatusName IN ('DATA MISMATCH', 'EXCLUDED', 'NEW TEMPLATE');
+         WHERE StatusName IN ('DATA MISMATCH', 'EXCLUDED', 'NEW TEMPLATE',
+                               'BUYER ORDER NO DOESN''T EXIST');
         DECLARE @ManuallyUpdatedId INT = (SELECT StatusId FROM dbo.tbl_status WHERE StatusName = 'MANUALLY UPDATED');
         IF NOT EXISTS (SELECT 1 FROM @StaleIds) OR @ManuallyUpdatedId IS NULL
         BEGIN
