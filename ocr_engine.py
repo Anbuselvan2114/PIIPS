@@ -2316,11 +2316,39 @@ class OCREngine:
         current_item = None
 
         # Some layouts wrap a long description onto the line BEFORE the row
-        # carrying the serial number/qty/amount, instead of after it — that
-        # lead-in text has nowhere to attach (no item has started yet) and
-        # would otherwise be silently dropped. Buffered here and prepended
-        # to the next item's Description once it actually starts.
+        # carrying the serial number/qty/amount, instead of after it - most
+        # visibly before the very FIRST item (no item has started yet, so
+        # that lead-in text has nowhere to attach and would otherwise be
+        # silently dropped) - buffered here and prepended to the next
+        # item's Description once it actually starts. Also reused (see
+        # last_peelable_addition below) for the exact same layout
+        # recurring between LATER items, where the lead-in line gets
+        # wrongly appended onto the PREVIOUS item first before anyone
+        # notices it was actually the next item's own opening line.
         pending_lead_in = ""
+
+        # A vendor whose numeric columns (HSN/Qty/Rate/Amount) sit
+        # vertically CENTERED against a multi-line wrapped description
+        # cell (common in HTML-table-rendered invoices) prints that row's
+        # serial+values on a physical OCR row in the MIDDLE of the cell,
+        # not its top line - e.g. a 3-line cell "DELL ADAPTER 65W C TYPE" /
+        # "(Latitude 5420 Adaptor)+values" / "Serial No.: ...". The top
+        # line ("DELL ADAPTER 65W C TYPE") has no serial of its own, so it
+        # falls through as a plain continuation of the item running before
+        # it started - by the time the row WITH the serial/values is seen,
+        # that opening line has already been wrongly glued onto the
+        # PREVIOUS item's Description. Tracks the single most recent
+        # continuation line appended this way (None once anything else
+        # happens to current_item, so only a line DIRECTLY, immediately
+        # before a new item's own row is ever a candidate) so it can be
+        # peeled back off the previous item and re-attached as the new
+        # item's own lead-in instead, right when that new item starts (see
+        # its own use below). Only a non-parenthetical line qualifies - a
+        # "(...)" line is a clarifying suffix of whatever precedes it
+        # (e.g. "(Epson M3170 Maintenance Box)" genuinely belongs to the
+        # item before it, not the one after), never a new item's own
+        # opening phrase.
+        last_peelable_addition = None
 
         # Freight / courier etc. printed in the item table become their OWN
         # line — captured, but flagged as a charge so the SF part /
@@ -2489,7 +2517,7 @@ class OCREngine:
                     continue
                 if value_cols:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
-                    if col == "GST":
+                    if col in ("GST", "IGST"):
                         continue
                     if is_number(t) and col in ("Quantity", "Rate", "Amount"):
                         continue
@@ -2710,7 +2738,8 @@ class OCREngine:
                 # after the digit, not the whole remainder, in case a
                 # longer wrapped line genuinely continues into real prose.
                 if glued:
-                    first_word = glued.group(2).split(None, 1)[0] if glued.group(2).split() else ""
+                    remainder_words = glued.group(2).split()
+                    first_word = remainder_words[0] if remainder_words else ""
                     # A plain unit abbreviation ("QTY", "PCS") is legitimate
                     # glued text even though it has no lowercase letter -
                     # only reject when it ALSO isn't a recognised unit, so a
@@ -2721,7 +2750,24 @@ class OCREngine:
                     # silently skipping serial detection altogether and
                     # falling through to a different code path that has no
                     # such fold-back safeguard.
-                    if first_word and not is_unit(first_word) and not any(c.islower() for c in first_word):
+                    # A vendor that prints its item names in ALL CAPS (e.g.
+                    # Bestech: "1 HP PRO BOOK 440 G8 LAPTOP", "3 COURIER
+                    # CHARGES") has no lowercase letter anywhere either, so
+                    # the lowercase check alone would wrongly reject every
+                    # one of its genuine items too - the real distinguishing
+                    # signal for "this is actually a bare part/SKU code, not
+                    # a description" is that a code is always ONE unspaced
+                    # token ("4QL27-80101"), while a genuine description -
+                    # caps or not - is almost always multiple words. Only
+                    # reject when the remainder is a single word AND has no
+                    # lowercase letter; two or more words survives either
+                    # way.
+                    if (
+                        first_word
+                        and not is_unit(first_word)
+                        and not any(c.islower() for c in first_word)
+                        and len(remainder_words) < 2
+                    ):
                         glued = None
                 if glued:
                     serial = glued.group(1)
@@ -2868,10 +2914,31 @@ class OCREngine:
                         cont = serial + cont
                     if cont:
                         current_item["Description"] += " " + cont
+                    last_peelable_addition = None
                     continue
 
                 if serial_from_token and serial.isdigit():
                     item_seq = int(serial)
+
+                # This new item's own opening line may already be sitting,
+                # wrongly, at the end of the PREVIOUS item's Description -
+                # see last_peelable_addition's own comment above. Peel it
+                # back off before that previous item is closed out below,
+                # and hand it to THIS item as its lead-in instead (same
+                # mechanism pending_lead_in already uses before the very
+                # first item).
+                if (
+                    current_item
+                    and last_peelable_addition
+                    and current_item["Description"].endswith(last_peelable_addition)
+                ):
+                    current_item["Description"] = current_item["Description"][
+                        : -len(last_peelable_addition)
+                    ].rstrip()
+                    pending_lead_in = (
+                        last_peelable_addition + " " + pending_lead_in
+                    ).strip() if pending_lead_in else last_peelable_addition
+                last_peelable_addition = None
 
                 if current_item:
 
@@ -3002,8 +3069,13 @@ class OCREngine:
                         # a wrapped second line, since this token is
                         # processed on the row's first physical line).
                         # Discarded outright, same as a stray Quantity/
-                        # Rate/Amount number under another column.
-                        if col == "GST":
+                        # Rate/Amount number under another column. Same
+                        # treatment for a full CGST/SGST/IGST breakdown
+                        # (its own repeated Rate/Amount sub-columns, e.g.
+                        # Bestech's "0.00% - 0.00% - 18.00% 892.37") - those
+                        # land nearest the IGST partition anchor (see
+                        # detect_table_columns), never a real description.
+                        if col in ("GST", "IGST"):
                             continue
 
                         # Numbers under other columns (e.g. discount) are
@@ -3186,6 +3258,7 @@ class OCREngine:
                         current_item["Description"] = (
                             current_item["Description"] + " " + label
                         ).strip()
+                        last_peelable_addition = None
                         continue
 
                     if current_item:
@@ -3200,6 +3273,7 @@ class OCREngine:
                         "ChargeRatePercent": charge_rate,
                     }
                     pending_lead_in = ""
+                    last_peelable_addition = None
                     continue
 
                 if (current_item and has_text
@@ -3216,6 +3290,7 @@ class OCREngine:
                     # x-position qualifies, so a part number or size that
                     # happens to be numeric but sits elsewhere on the row
                     # isn't mistaken for it.
+                    recovered_value = False
                     if value_cols:
                         for w in words:
                             t = w["text"].strip()
@@ -3228,9 +3303,41 @@ class OCREngine:
                                 and abs(w["x"] - value_cols[col]) < 150
                             ):
                                 current_item[col] = clean_number(t)
+                                recovered_value = True
                     content = descriptive_text(words)
                     if content:
                         current_item["Description"] += " " + content
+                    # Only a plain, non-parenthetical, non-"label: value",
+                    # multi-WORD text-only row is ever a candidate to be
+                    # peeled back onto a LATER item as its own lead-in (see
+                    # last_peelable_addition's comment near pending_lead_in
+                    # above). One that also carried a real Quantity/Rate/
+                    # Amount for THIS item, or a "(...)" clarifying suffix,
+                    # definitely belongs here. So does a "Serial No.:"/
+                    # "S/N:"/etc. reference line (e.g. Bestech's own "S/N:
+                    # IN0HH6MPB8TFC66J039U", right below its Dell monitor,
+                    # immediately followed by an unrelated "COURIER CHARGES"
+                    # item) - a colon-introduced attribute line is always
+                    # describing whatever item precedes it, never a new
+                    # item's own opening name. Same for a bare single word
+                    # (e.g. Bestech's own "cable", the tail of "HP PRO BOOK
+                    # 440 G8 LAPTOP DISPLAY / cable" wrapping onto its own
+                    # line, immediately followed by an unrelated "COURIER
+                    # CHARGES" item) - a genuine new item's opening name, if
+                    # it needed to wrap onto its own line at all, is almost
+                    # always more than one word; a lone leftover word is far
+                    # more likely the tail of whatever came before it.
+                    last_peelable_addition = (
+                        content
+                        if (
+                            content
+                            and not recovered_value
+                            and not content.startswith("(")
+                            and ":" not in content
+                            and len(content.split()) > 1
+                        )
+                        else None
+                    )
                 elif (current_item is None and has_text
                         and not any(k in lower for k in EXCLUDE_KW)
                         and not any(k in lower for k in CHARGE_KW)):
@@ -3411,7 +3518,17 @@ class OCREngine:
                 columns["Quantity"] = x
 
             elif "rate" in txt or "price" in txt:
-                columns["Rate"] = x
+                # A grouped CGST/SGST/IGST breakdown repeats its own "Rate"
+                # sub-label once per tax group (e.g. Bestech: base Rate,
+                # then CGST Rate, SGST Rate, IGST Rate, four occurrences
+                # total) - only the FIRST (base, leftmost) one is the real
+                # per-unit Rate column; setdefault so a later repeat can
+                # never drag this anchor rightward onto a tax sub-column,
+                # which would then misattribute every token in the row by
+                # nearest-x distance (scrambling Quantity along with it -
+                # see extract_items' value recovery, which reads off this
+                # same anchor).
+                columns.setdefault("Rate", x)
 
             elif txt == "per":
                 columns["Per"] = x
@@ -3442,8 +3559,15 @@ class OCREngine:
                 columns.setdefault("Total", x)
 
             elif "amount" in txt:
+                # Same repeated-sub-column reasoning as "Rate" just above -
+                # the first plain "Amount" wins and later repeats (CGST/
+                # SGST/IGST's own Amount, then a final "Total Amount") are
+                # ignored, UNLESS "Taxable" explicitly locked a different,
+                # more authoritative Amount column already (still wins
+                # unconditionally either way - amount_locked only gates
+                # THIS generic branch, never the "taxable" branch above).
                 if not amount_locked:
-                    columns["Amount"] = x
+                    columns.setdefault("Amount", x)
 
         # ------------------------------------------
         # Merge split headers
@@ -3926,6 +4050,31 @@ class OCREngine:
 
                 if current_text.startswith("si") and next_text == "no.":
 
+                    current.extend(rows[i + 1])
+                    current.sort(key=lambda x: x["x"])
+
+                    merged.append(current)
+                    i += 2
+                    continue
+
+                # A grouped CGST/SGST/IGST header prints its own "Rate"/
+                # "Amount" sub-labels as a SECOND physical header row (e.g.
+                # "SL. | Name... | CGST | SGST | IGST | Total Amount" then
+                # "No. | Rate | Amount | Rate | Amount | Rate | Amount") -
+                # the "si"+"no." check above only catches this when the
+                # first row's own leading word literally starts "si"; this
+                # vendor's header says "SL." instead, so that check misses
+                # it. Caught more generally here: a row made up ENTIRELY of
+                # repeated "No."/"Rate"/"Amount" tokens is unambiguously a
+                # sub-header, never real item data - merged into the
+                # header regardless of what the row before it says, so it
+                # can never fall through as ordinary table content and get
+                # glued onto item 1's own Description as a false lead-in
+                # (see pending_lead_in above).
+                next_words = next_text.split()
+                if next_words and all(
+                    w in ("no.", "no", "rate", "amount") for w in next_words
+                ):
                     current.extend(rows[i + 1])
                     current.sort(key=lambda x: x["x"])
 
