@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -138,7 +138,10 @@ def _run_part_description_migration():
         from invoice_schema import build_invoice_json
 
         ocr = OCREngine()
-        allow_scanned = bool(cfg.get("allow_scanned_pdfs"))
+        # Part Description Mapping is PART-only by definition (see this
+        # function's own docstring/scope), so the PART toggle is the
+        # correct one here regardless of SERVICE's own setting.
+        allow_scanned = bool(cfg.get("allow_scanned_pdfs_part"))
         fixed_lines = 0
         fixed_invoices = 0
         for po, fname in candidates:
@@ -207,18 +210,22 @@ def get_config():
 
 class ScannedPdfsModel(BaseModel):
     enabled: bool
+    invoice_type: Literal["PART", "SERVICE"]
     user_id: Optional[int] = None
 
 
 @app.post("/api/config/scanned-pdfs")
 def set_scanned_pdfs(payload: ScannedPdfsModel):
-    """Super Admin toggle: whether a scanned/photocopied invoice (PART or
-    SERVICE, no embedded text layer) gets OCR-extracted instead of
-    rejected outright. See config_store.DEFAULT_CONFIG's own comment for
-    the full rationale."""
+    """Super Admin toggle: whether a scanned/photocopied invoice of the
+    given type (PART or SERVICE, no embedded text layer) gets OCR-extracted
+    instead of rejected outright. Kept separate per invoice type so turning
+    it on for one doesn't also start OCR'ing scanned invoices of the other
+    - see config_store.DEFAULT_CONFIG's own comment for the full
+    rationale."""
     _require_developer(payload.user_id)
-    config_store.save_config({"allow_scanned_pdfs": bool(payload.enabled)})
-    return {"ok": True, "allow_scanned_pdfs": bool(payload.enabled)}
+    key = f"allow_scanned_pdfs_{payload.invoice_type.lower()}"
+    config_store.save_config({key: bool(payload.enabled)})
+    return {"ok": True, key: bool(payload.enabled)}
 
 
 def _writable(path):

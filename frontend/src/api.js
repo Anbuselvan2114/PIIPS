@@ -60,10 +60,10 @@ export const saveConfig = (folderPath) =>
     body: JSON.stringify({ folder_path: folderPath }),
   });
 
-export const setScannedPdfsEnabled = (enabled, user_id) =>
+export const setScannedPdfsEnabled = (enabled, invoiceType, user_id) =>
   request("/api/config/scanned-pdfs", {
     method: "POST",
-    body: JSON.stringify({ enabled, user_id }),
+    body: JSON.stringify({ enabled, invoice_type: invoiceType, user_id }),
   });
 
 export const getApiConfig = () => request("/api/api-config");

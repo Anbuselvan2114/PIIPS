@@ -278,18 +278,19 @@ class JobManager:
             ocr = OCREngine()
             fmt_model = FormatModel()
 
-            # Super Admin toggle (config_store's "allow_scanned_pdfs") for
-            # whether a scanned/photocopied invoice (PART or SERVICE) gets
-            # OCR-extracted instead of rejected outright - see ocr_engine.
-            # read_pdf's own docstring for the full rationale. Loaded once
-            # per run, not per file.
+            # Super Admin toggles (config_store's "allow_scanned_pdfs_part"/
+            # "_service") for whether a scanned/photocopied invoice of that
+            # type gets OCR-extracted instead of rejected outright - see
+            # ocr_engine.read_pdf's own docstring for the full rationale.
+            # Loaded once per run, not per file.
             try:
                 import config_store
-                allow_scanned_setting = bool(
-                    config_store.load_config().get("allow_scanned_pdfs")
-                )
+                _scan_cfg = config_store.load_config()
+                allow_scanned_part = bool(_scan_cfg.get("allow_scanned_pdfs_part"))
+                allow_scanned_service = bool(_scan_cfg.get("allow_scanned_pdfs_service"))
             except Exception:  # noqa: BLE001 - default to the safe/off behaviour
-                allow_scanned_setting = False
+                allow_scanned_part = False
+                allow_scanned_service = False
 
             def _finish_group(ctx, verdict):
                 """Complete one invoice given its verdict (computed
@@ -409,12 +410,30 @@ class JobManager:
 
                 try:
 
-                    # Both PART and SERVICE, and both normal processing and
-                    # Train - a scanned file sitting in New_Format is OCR'd
-                    # the same as any other when this is on, so it can
-                    # still be learned/merged as a trained format instead
-                    # of being stuck as permanently unsupported.
-                    allow_scanned = allow_scanned_setting
+                    if job.mode == "train":
+                        # New_Format is a flat folder (see the source_files
+                        # scan above) - no <entity>/<invoice_type>/<name>
+                        # structure to resolve the type from here, so a
+                        # scanned file sitting in it is OCR'd the same as
+                        # any other as long as EITHER type's toggle is on,
+                        # so it can still be learned/merged as a trained
+                        # format instead of being stuck as permanently
+                        # unsupported.
+                        allow_scanned = allow_scanned_part or allow_scanned_service
+                    else:
+                        invoice_type_here = template_store.invoice_type_for_path(
+                            job.source_folder, src_path
+                        )
+                        if invoice_type_here == "SERVICE":
+                            allow_scanned = allow_scanned_service
+                        elif invoice_type_here == "PART":
+                            allow_scanned = allow_scanned_part
+                        else:
+                            # Type unresolvable from this path - conservative
+                            # default, matching the original off-by-default
+                            # behaviour, rather than guessing which toggle
+                            # applies.
+                            allow_scanned = False
 
                     ocr_result = ocr.read_pdf(src_path, allow_scanned=allow_scanned)
 

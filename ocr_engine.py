@@ -1040,8 +1040,8 @@ class OCREngine:
         # it, so it gets moved to UNSUPPORTED upstream instead of silently
         # producing lower-confidence data.
         #
-        # `allow_scanned=True` (config_store's "allow_scanned_pdfs" toggle,
-        # PART and SERVICE alike - see processor.py) skips that rejection:
+        # `allow_scanned=True` (config_store's per-type "allow_scanned_pdfs_
+        # part"/"_service" toggles - see processor.py) skips that rejection:
         # `boxes` stays None for a rasterised page, so
         # process_page's own OCR path below runs PaddleOCR on it exactly
         # the way an image file (.png/.jpg) already always has. A genuine
@@ -2888,6 +2888,15 @@ class OCREngine:
                 and not any(k in lower for k in CHARGE_KW)
                 and not any(k in lower for k in EXCLUDE_KW)
                 and not re.search(r"round(?:ed)?[\s-]*off", lower)
+                # "Total" is already in EXCLUDE_KW, but a scanned/photocopied
+                # page can OCR-drop its trailing letter ("Tota") - e.g. this
+                # exact row, "Nos | Tota | 1 | 2,600.00", is genuinely the
+                # invoice's own Total row (quantity "1 Nos", amount
+                # "2,600.00"), not a second line item. Word-boundary regex
+                # (not a plain EXCLUDE_KW substring) specifically so this
+                # doesn't also match "tota" buried inside an unrelated real
+                # word (e.g. "Toyota").
+                and not re.search(r"\btota\b", lower)
                 and (
                     any(
                         _hsn_token_value(t.replace(",", "")) is not None
@@ -3067,6 +3076,33 @@ class OCREngine:
                             and _hsn_token_value(txt) is not None
                         ):
                             col = "HSN"
+
+
+                        # A narrow Quantity column's own values (typically a
+                        # bare 1-3 digit integer, sometimes "N.00") are often
+                        # right-aligned within that column while the header
+                        # LABEL text ("Quantity") is wide and left-anchored -
+                        # so the value itself can land physically closer to
+                        # the NEXT column's anchor (Rate/Amount) by just a
+                        # handful of pixels (e.g. Viyona's own "1" quantity:
+                        # 128px from its true Quantity anchor vs 123px from
+                        # Rate - Rate wins the naive nearest-distance check
+                        # by 5px, so the quantity is misfiled as Rate, then
+                        # silently overwritten once the row's real Rate
+                        # value arrives right after it, leaving Quantity
+                        # blank). Reroute a near-tie back to Quantity when
+                        # it's still unclaimed and the token itself is
+                        # quantity-shaped (a plain integer or simple
+                        # decimal, not a currency-formatted Rate/Amount).
+                        if (
+                            col in ("Rate", "Amount")
+                            and "Quantity" in value_cols
+                            and current_item.get("Quantity") is None
+                            and re.fullmatch(r"\d{1,3}(\.\d{1,2})?", txt)
+                            and abs(word["x"] - value_cols["Quantity"])
+                            <= abs(word["x"] - value_cols[col]) + 40
+                        ):
+                            col = "Quantity"
 
 
                         # HSN / SAC code (4, 6 or 8 digits, optional letter -
@@ -3322,7 +3358,8 @@ class OCREngine:
 
                 if (current_item and has_text
                         and not any(k in lower for k in EXCLUDE_KW)
-                        and not any(k in lower for k in CHARGE_KW)):
+                        and not any(k in lower for k in CHARGE_KW)
+                        and not re.search(r"\btota\b", lower)):
                     # A scanned/garbled image can split one logical item
                     # row across several OCR rows, with the Quantity/Rate/
                     # Amount figures landing on a row that has no
@@ -3554,6 +3591,19 @@ class OCREngine:
 
             elif "hsn" in txt:
                 columns["HSN"] = x
+                # A scanned page with no visible gap between adjacent
+                # headers can OCR-merge two labels into one token (e.g.
+                # "HSN/SACQuantity", HSN and Quantity glued together with
+                # nothing between them) - the elif chain only ever
+                # classifies a token as ONE column, so "Quantity" would
+                # otherwise never get an anchor at all, and its row values
+                # have nowhere to attach for the rest of the document.
+                # Same x as HSN (the true split point is unknown) is still
+                # far better than no anchor at all; setdefault so a later,
+                # separately-printed "Quantity" header (the normal case)
+                # always wins over this approximation.
+                if "qty" in txt or "quantity" in txt:
+                    columns.setdefault("Quantity", x)
 
             elif "sac" == txt:
                 columns.setdefault("HSN", x)

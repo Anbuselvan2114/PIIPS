@@ -22,6 +22,7 @@ RIGHT_FIELDS = {
         "invioce no",  # genuine vendor-template typo seen on a real invoice, not an OCR artifact
         "invoice :",  # some vendors label it bare "Invoice :" with no "No."/"No" at all
         "invoice#",  # a vendor template with no space before the "#" - "invoice #" above doesn't substring-match this
+        "invno",  # a vendor template glues "Inv" and "No." together with no space - "inv no" above doesn't substring-match this
     ],
     "Dated": ["dated", "invoice date", "date"],
     "Buyer's Order No.": [
@@ -43,7 +44,8 @@ RIGHT_FIELDS = {
 SECTION_MARKERS = [
     ("Consignee", ["consignee", "ship to", "shipped to", "shipping addres"]),
     ("Buyer", ["party details", "customer detail", "details of receiver",
-               "bill to", "billed to", "buyer (bill to)", "buyer"]),
+               "bill to", "billed to", "buyer (bill to)", "buyer",
+               "billing address"]),
 ]
 
 # Stricter subset of SECTION_MARKERS, used ONLY for the right-half-of-a-
@@ -93,7 +95,7 @@ LABEL_WORDS = [
     # "triplicate" alone were already here; "original" (not just the
     # "original copy" phrase) was the missing third.
     "original", "original copy", "duplicate", "triplicate", "contect person",
-    "contact person", "shipping addres", "shipping address", "address",
+    "contact person", "shipping addres", "shipping address", "billing address", "address",
     # A "Seller Details" section caption (a "Buyer Details"/"Bill To"
     # counterpart with no dedicated marker of its own, since Seller is
     # already the default starting section - nothing switches INTO it,
@@ -581,6 +583,48 @@ def _marker_row(label, x, sample_row):
     return [{"text": label, "x": x, "y": y}]
 
 
+def _find_marker(rows, start_ri, phrase):
+    """First row at or after `start_ri` whose text contains `phrase`,
+    returning (row_index, x_of_the_matched_word) - or None. Used by
+    _split_stacked_address_columns below, where (unlike
+    _split_three_column_header's side-by-side pair) the two markers never
+    share a row, so each is located independently."""
+    for ri in range(start_ri, len(rows)):
+        text, spans = _row_text_with_spans(rows[ri])
+        idx = text.lower().find(phrase)
+        if idx == -1:
+            continue
+        found = next(((s, w) for s, e, w in spans if s <= idx < e), None)
+        if found is None:
+            continue
+        return ri, found[1]["x"]
+    return None
+
+
+def _split_stacked_address_columns(rows):
+    """Detect a marketplace-style layout where the Buyer ("Billing
+    Address") and Consignee ("Shipping Address") blocks print STACKED one
+    after another in a single right-hand column, running in PARALLEL
+    alongside an unrelated Seller block ("Sold By :") that spans the same
+    row range on the left - e.g. Amazon invoices. Unlike
+    _split_three_column_header's side-by-side columns (both markers share
+    one row), these two markers are on different rows entirely, so the
+    normal party-block scan (one `section` value shared by the whole row)
+    can never see "Billing Address" and "Shipping Address" as anything but
+    ordinary Seller-block content miles down the page.
+
+    Returns (bill_ri, bill_x, ship_ri, ship_x) - the row index and x
+    position of each marker phrase - or None if this shape isn't present.
+    """
+    bill = _find_marker(rows, 0, "billing address")
+    if bill is None:
+        return None
+    ship = _find_marker(rows, bill[0] + 1, "shipping address")
+    if ship is None:
+        return None
+    return bill[0], bill[1], ship[0], ship[1]
+
+
 def extract(header_rows, footer_rows, page_width):
     fields = {}
     three_col = _split_three_column_header(header_rows)
@@ -592,8 +636,12 @@ def extract(header_rows, footer_rows, page_width):
         # picking up an "Invoice"/"No. :" 2-line wrap that's now a clean,
         # uninterleaved sequence.
         rows = _merge_wrapped_labels(header_rows[:marker_ri] + _merge_wrapped_values(detail_rows))
+        stacked = None
     else:
         rows = _merge_wrapped_labels(header_rows)
+        # Only tried when the side-by-side 3-column shape above wasn't
+        # found - see _split_stacked_address_columns's own docstring.
+        stacked = _split_stacked_address_columns(rows)
     divider = page_width * 0.42
     # Rows whose LEFT-hand text (the half the party-block pass reads) was
     # already consumed by a labeled anchor there — e.g. "Customer Name: Acme
@@ -603,6 +651,13 @@ def extract(header_rows, footer_rows, page_width):
     # right of the SAME row) must not be claimed — the two halves are
     # unrelated content that only happen to share a row.
     claimed_rows = set()
+
+    # Every row where a RIGHT_FIELDS anchor matched anywhere (left or right
+    # of the divider) - used below to tell a genuine right-column metadata
+    # row (already claimed as some field's value) apart from a row that's
+    # merely unlucky enough to sit past the divider for structural reasons
+    # (see the right/center-aligned-letterhead fallback in _party_pass).
+    right_field_rows = set()
 
     # First row (not claimed on its left side) where "Invoice No." or
     # "Dated" was anchored on the RIGHT half of the page - the common
@@ -655,6 +710,7 @@ def extract(header_rows, footer_rows, page_width):
                     val = _value_right_or_below(rows, ri, anchor, offset)
                     if val:
                         fields[field] = val
+                        right_field_rows.add(ri)
                         if anchor["x"] < divider:
                             claimed_rows.add(ri)
                         elif field in ("Invoice No.", "Dated") and meta_row is None:
@@ -822,6 +878,35 @@ def extract(header_rows, footer_rows, page_width):
                     sorted(row, key=lambda w: w["x"]) if rows_override is not None
                     else sorted([w for w in row if w["x"] < divider], key=lambda w: w["x"])
                 )
+                if (not left and rows_override is None and section == "Seller"
+                        and not any_switch and ri != 0 and ri not in right_field_rows):
+                    # Row 0 is deliberately excluded - it already went through
+                    # its own title-banner-vs-letterhead disambiguation above
+                    # (and, if that decided it's not a title, the dedicated
+                    # "Seller Name fallback" earlier in extract() already
+                    # handles a right/center-aligned company-name-only first
+                    # line). Falling through past that to land here as an
+                    # ordinary content row would wrongly treat leftover title
+                    # text (e.g. "Tax Invoice/Bill of Supply/Cash Memo" after
+                    # "Tax Invoice" is stripped) as a genuine Seller Name.
+                    #
+                    # A right/center-aligned seller letterhead (name, address,
+                    # GSTIN, email all centered around the page's midline
+                    # rather than sitting at the true left margin) straddles
+                    # the fixed left/right divider line-by-line - a longer
+                    # line starts further left than a short one (e.g. the
+                    # company name itself), so some lines land entirely past
+                    # the divider even though they're genuine Seller content,
+                    # not real right-column invoice metadata (which WOULD
+                    # have matched a RIGHT_FIELDS phrase above and landed in
+                    # right_field_rows). Only tried pre-switch, while still
+                    # in the Seller block - once Buyer/Consignee starts, the
+                    # right column reliably carries real per-row metadata
+                    # (PO No., dates) that must stay excluded.
+                    left = sorted(row, key=lambda w: w["x"])
+                    used_letterhead_fallback = True
+                else:
+                    used_letterhead_fallback = False
                 if not left:
                     continue
                 text = " ".join(w["text"].strip() for w in left).strip()
@@ -907,7 +992,7 @@ def extract(header_rows, footer_rows, page_width):
                 # switched here, so THIS row's own left-side text - which
                 # may still genuinely belong to the OLD section - keeps its
                 # normal classification below.
-                if rows_override is None:
+                if rows_override is None and not used_letterhead_fallback:
                     right_only = [w for w in row if w["x"] >= divider]
                     if right_only:
                         right_low = " ".join(w["text"].strip() for w in right_only).strip().lower()
@@ -926,7 +1011,8 @@ def extract(header_rows, footer_rows, page_width):
                 # duplicates this row's left-side text — a shape no genuine
                 # Seller-block metadata row has (those pair a left LABEL
                 # with a right VALUE, never identical text on both sides).
-                if rows_override is None and section == "Seller" and named["Seller"]:
+                if (rows_override is None and section == "Seller" and named["Seller"]
+                        and not used_letterhead_fallback):
                     right = sorted([w for w in row if w["x"] >= divider], key=lambda w: w["x"])
                     right_text = " ".join(w["text"].strip() for w in right).strip()
                     if right_text and re.sub(r"\s+", "", low) == re.sub(r"\s+", "", right_text.lower()):
@@ -973,10 +1059,14 @@ def extract(header_rows, footer_rows, page_width):
 
                 # State. Matches "state name"/"state code" (Tally-style), a bare
                 # "State" label (word-bounded — \b so "Estate" in an address line
-                # is never mistaken for it), or "place of supply".
+                # is never mistaken for it), "place of supply", or a
+                # marketplace invoice's "place of delivery" (same GST
+                # concept, different wording - e.g. Amazon's Consignee
+                # block). Not itself a separate field worth keeping - just
+                # needs to stop it falling through as bogus Address text.
                 if (
                     "state name" in low or "state code" in low
-                    or "place of supply" in low
+                    or "place of supply" in low or "place of delivery" in low
                     or re.search(r"\bstate\b", low)
                 ):
                     out.setdefault(
@@ -1027,6 +1117,24 @@ def extract(header_rows, footer_rows, page_width):
                     start, end = span
                     if start == 0:
                         text = text[end:].lstrip(" :,-.")
+                        # A glued "<label>: <value>" row (nothing before the
+                        # label to keep) whose value is a BARE date - e.g. a
+                        # redundant "Invoice Date : 24.07.2026" repeated
+                        # inside the Consignee block - is metadata, not real
+                        # Name/Address content, even though it survived the
+                        # label strip above. The genuine Invoice Date was
+                        # already captured by the RIGHT_FIELDS anchor pass;
+                        # this is just a second copy that would otherwise
+                        # become a bogus trailing Address line.
+                        # Not DATE_RE itself (that one's tuned for the
+                        # dash/slash "Dated" fallback scan above and
+                        # deliberately excludes dot-separated dates, which
+                        # would otherwise misparse a dotted decimal amount
+                        # elsewhere) - this is only a plain "is the leftover
+                        # text just a date" check, so dots are fine too
+                        # (e.g. "24.07.2026").
+                        if re.fullmatch(r"\d{1,2}[-/.]\S+[-/.]\d{2,4}", text.strip()):
+                            continue
                     else:
                         text = text[:start].rstrip(" ,;:-")
                     if not text:
@@ -1078,6 +1186,38 @@ def extract(header_rows, footer_rows, page_width):
             + [_marker_row("Ship to", ship_x, marker_row_src)] + ship_rows
         )
         party_fields, any_switch = _party_pass(rows_override=side_by_side_rows)
+    elif stacked is not None:
+        bill_ri, bill_x, ship_ri, ship_x = stacked
+        # Unlike the 3-column case, the Seller block here isn't confined to
+        # a prefix before a marker row - it runs down the LEFT half of the
+        # very same rows the Billing/Shipping column occupies on the
+        # RIGHT, for the whole span. So the whole page's left-of-divider
+        # words become the Seller pass content (skipping any row already
+        # claimed by an anchor, same as the ordinary non-split path), and
+        # the right-of-divider words are what get split at the two
+        # markers into a Billing block then a Shipping block.
+        seller_rows = [
+            [w for w in row if w["x"] < divider]
+            for ri, row in enumerate(rows)
+            if ri not in claimed_rows and ri not in right_field_rows
+        ]
+        bill_rows, ship_rows = [], []
+        for ri, row in enumerate(rows):
+            if ri in right_field_rows:
+                continue
+            rw = [w for w in row if w["x"] >= divider]
+            if not rw:
+                continue
+            if bill_ri < ri < ship_ri:
+                bill_rows.append(rw)
+            elif ri > ship_ri:
+                ship_rows.append(rw)
+        stacked_rows = (
+            seller_rows
+            + [_marker_row("Billing Address", bill_x, rows[bill_ri])] + bill_rows
+            + [_marker_row("Shipping Address", ship_x, rows[ship_ri])] + ship_rows
+        )
+        party_fields, any_switch = _party_pass(rows_override=stacked_rows)
     else:
         party_fields, any_switch = _party_pass()
     if not any_switch and not party_fields.get("Buyer Name") and meta_row is not None:
