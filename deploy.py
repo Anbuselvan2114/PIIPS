@@ -43,7 +43,14 @@ _ROBOCOPY_XD = [
     "logs", "output", "New_Format", "model_backups", "old",
     "sample_input", "manuals", "announcement_media",
 ]
-_ROBOCOPY_XF = ["config.json", "PIIPS.sql", "*.log", "*.pyc"]
+# format_model.json holds each environment's own trained-format knowledge
+# (learned from THAT environment's own real invoices) - same category of
+# per-environment data as config.json just above, and excluded for the
+# same reason: staging it here means Deploy_To_Network.txt's day-to-day
+# /MIR sync (see PART 1b there) would overwrite the target server's real
+# trained formats with whatever this dev machine happens to have learned
+# locally.
+_ROBOCOPY_XF = ["config.json", "format_model.json", "PIIPS.sql", "*.log", "*.pyc"]
 
 
 class PublishError(Exception):

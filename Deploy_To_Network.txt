@@ -24,7 +24,7 @@ if (-not (Test-Path $Destination)) {
 # One line on purpose - backtick line-continuation is fragile when pasted
 # into a PowerShell console (a blank line before it, or the console's own
 # ">>" continuation prompts, can corrupt the paste).
-robocopy $Source $Destination /E /XJ /R:2 /W:5 /MT:8 /XD ".git" ".claude" "venv" ".venv" "__pycache__" "node_modules" "dist" "logs" "output" "New_Format" "model_backups" "old" /XF "config.json" "*.log" "*.pyc"
+robocopy $Source $Destination /E /XJ /R:2 /W:5 /MT:8 /XD ".git" ".claude" "venv" ".venv" "__pycache__" "node_modules" "dist" "logs" "output" "New_Format" "model_backups" "old" /XF "config.json" "format_model.json" "*.log" "*.pyc"
 
 ------------------------------------------------------------------
 Notes
@@ -37,6 +37,14 @@ Notes
   Configuration screen before login (no login needed) so this is normally
   a one-time fill-in-the-form step, not a file edit. If you do need to
   edit it by hand (e.g. no browser access yet), see "Login fails" below.
+- format_model.json is deliberately excluded for the same reason as
+  config.json: each environment learns its own trained invoice formats
+  from its own real traffic, and copying this machine's file would
+  overwrite the destination's real trained-format knowledge with
+  whatever this machine happens to have learned locally instead. On a
+  fresh destination with no format_model.json at all, the app just
+  starts with zero trained formats - normal, they accumulate as real
+  invoices get trained the same way any other environment's did.
 - venv/ and frontend/node_modules/ are excluded because they are
   environment-specific; reinstall them on the destination with
   `pip install --no-deps -r requirements.txt` / `npm install` per the
@@ -78,7 +86,7 @@ $Destination = "E:\PIIPS_Application"      # <-- EDIT THIS to the real server pa
                                             #     \\10.0.1.210\E$\PIIPS_Application
                                             #     if copying over the network)
 
-robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 /XD "venv" ".venv" "__pycache__" "node_modules" "logs" /XF "config.json" "*.log"
+robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 /XD "venv" ".venv" "__pycache__" "node_modules" "logs" /XF "config.json" "format_model.json" "*.log"
 
 # /XD above is not optional: the staged build never contains venv/ or
 # __pycache__/ in the first place (excluded at staging time), so without
@@ -90,7 +98,14 @@ robocopy $StagedBuild $Destination /MIR /XJ /R:2 /W:5 /MT:8 /XD "venv" ".venv" "
 
 # config.json is excluded from BOTH the copy AND the deletion pass (/XF
 # excludes a name from mirroring entirely) - the server keeps its own
-# DPAPI-encrypted connection string, never overwritten by this sync.
+# connection string, never overwritten by this sync. format_model.json
+# is excluded the same way and for the same reason (the server's own
+# trained-format knowledge, never overwritten) - it matters even more
+# here than it did for the earlier PART 1 copy: deploy.py's own staging
+# step (Publish menu) already excludes format_model.json when building
+# $StagedBuild, so without also excluding it HERE, /MIR's deletion pass
+# would see the server's real format_model.json as "extra" (absent from
+# the source) and delete it outright, not just leave it stale.
 # robocopy exit codes 0-7 mean success; 8+ is a real failure.
 
 Restart-Service PIIPS_Backend
