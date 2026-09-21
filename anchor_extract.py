@@ -110,7 +110,14 @@ LABEL_WORDS = [
     "e-mail", "email", "tel", "phone", "msme", "bank", "ifsc", "terms",
     "declaration", "authorised", "authorized", "signatory", "grand total",
     "tax rate", "taxable", "total tax", "due date", "name of product",
-    "service", "particulars",
+    # Bare "service" alone is too broad - it's a substring of "Services",
+    # extremely common in real company names ("R-Logic Technology
+    # SERVICES India Pvt. Ltd."), and was truncating those names at the
+    # false-positive match. Scoped to the actual table-header phrasing
+    # this was for instead ("Item-Service Code", "Name of Product /
+    # Service" table captions - "name of product" alone, right above,
+    # already covers one variant of that same header).
+    "item-service", "product / service", "particulars",
     # dispatch / delivery labels — these are field captions, never values,
     # so a blank "Buyer's Order No." must not swallow the next label below it.
     "despatch", "dispatch", "despatched", "dispatched", "document no",
@@ -753,7 +760,30 @@ def extract(header_rows, footer_rows, page_width):
                     whole = _row_text(row)
                     if not named["Seller"]:
                         if whole and _is_label(whole):
-                            continue
+                            # The label can sit ENTIRELY in the right half
+                            # of this same row (already excluded from
+                            # `text` by the ordinary left-of-divider slice
+                            # above), cleanly separate from a genuine
+                            # letterhead on the left - e.g. "R-Logic
+                            # Technology Services India Pvt. Ltd." (left)
+                            # sharing its row with "TAX INVOICE" (right,
+                            # well past the divider). Discarding the WHOLE
+                            # row in that case loses the real Seller Name
+                            # entirely, leaving the block shifted down by
+                            # one line (the first genuine ADDRESS line gets
+                            # mistaken for the Name instead). Only actually
+                            # discard when stripping the matched label
+                            # leaves nothing substantial behind either side
+                            # - the genuinely-straddling-title case this
+                            # check exists for (see its own docstring
+                            # above) - not just "a label phrase appears
+                            # somewhere in this row".
+                            span = _label_span(whole)
+                            remainder = (
+                                whole[:span[0]] + " " + whole[span[1]:]
+                            ).strip(" :,-.") if span else ""
+                            if len(re.sub(r"[^A-Za-z]", "", remainder)) < 10:
+                                continue
                     elif whole and out.get("Seller Name") == whole:
                         # The "Seller Name fallback" above already consumed
                         # this exact row (its own unsliced text became
