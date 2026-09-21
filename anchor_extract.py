@@ -437,8 +437,23 @@ def _split_three_column_header(rows):
     for ri, row in enumerate(rows):
         text, spans = _row_text_with_spans(row)
         low = text.lower()
-        bill_idx = low.find("bill to")
-        ship_idx = low.find("ship to")
+        # Some vendors caption this exact same Buyer/Consignee-block-plus-
+        # metadata-column shape with a different phrase pair than the
+        # common Tally "Bill To"/"Ship To" - e.g. R-Logic's SAP Business
+        # One template prints "Billing Address : .../Delivery Address:
+        # ..." side by side, with a third, unrelated Customer Code/Contact
+        # Details column further right. Same physical layout, same fix -
+        # try each known pair in turn; first one where BOTH phrases are
+        # found on this row wins.
+        bill_idx = ship_idx = -1
+        for bill_phrase, ship_phrase in (
+            ("bill to", "ship to"),
+            ("billing address", "delivery address"),
+        ):
+            bill_idx = low.find(bill_phrase)
+            ship_idx = low.find(ship_phrase)
+            if bill_idx != -1 and ship_idx != -1:
+                break
         if bill_idx == -1 or ship_idx == -1:
             continue
 
@@ -460,13 +475,35 @@ def _split_three_column_header(rows):
             # row - some layouts start the third column directly with its
             # first real sub-label instead (e.g. "Bill To, Ship To Inv No.
             # :... Date :..."). Fall back to the first word on this row that
-            # starts strictly after the "Ship To" phrase ends - the true
-            # start of column 3 either way, captioned or not.
-            ship_end = ship_idx + len("ship to")
+            # starts strictly after the ship-marker phrase ends (whichever
+            # of the phrase-pair options above actually matched - NOT
+            # hardcoded to "ship to"'s own length, which would
+            # miscalculate the boundary for "delivery address" and any
+            # future pair with a different length) - the true start of
+            # column 3 either way, captioned or not.
+            ship_end = ship_idx + len(ship_phrase)
             details_x = next(
                 (w["x"] for start, end, w in spans if start >= ship_end and w["x"] > ship_x),
                 None,
             )
+        if details_x is None:
+            # Still nothing on the marker row itself - some layouts (e.g.
+            # R-Logic's) don't reveal column 3 until a few rows further
+            # down (its own metadata block starts blank on the marker row,
+            # then "Customer Name :"/"Contact Details :" etc. appear later
+            # at a consistent x far past the ship column's own natural
+            # width). Look ahead a bounded number of rows for the
+            # left-most word sitting meaningfully right of ship_x - a
+            # margin (not just "> ship_x") so a ship-column value merely
+            # drifting a little right on its own wrapped line is never
+            # mistaken for a whole new column.
+            margin = max(200, (ship_x - bill_x) / 2)
+            candidates = [
+                w["x"] for later in rows[ri:ri + 10] for w in later
+                if w["x"] > ship_x + margin
+            ]
+            if candidates:
+                details_x = min(candidates)
         mid = (bill_x + ship_x) / 2
         ship_hi = ((ship_x + details_x) / 2) if (details_x and details_x > ship_x) else float("inf")
 
@@ -481,6 +518,25 @@ def _split_three_column_header(rows):
             marker_dw = [w for w in row if w["x"] >= ship_hi]
             if marker_dw:
                 detail_rows.append(marker_dw)
+        # Same problem, but for the bill/ship marker's OWN value, when it's
+        # glued onto the very same OCR word as the marker phrase itself
+        # rather than sitting in a later, separate word/row - e.g.
+        # "Billing Address : PRECISION TECHSERVE PRIVATE" is one merged
+        # token, so bill_x's own word never gets picked up by the
+        # position-only scan below (which only ever looks at LATER rows).
+        # Without this, only a wrapped continuation line (if any) becomes
+        # the party's Name, silently dropping the marker row's own real
+        # value entirely.
+        for idx, phrase, dest in ((bill_idx, bill_phrase, bill_rows),
+                                   (ship_idx, ship_phrase, ship_rows)):
+            found = next(((s, w) for s, e, w in spans if s <= idx < e), None)
+            if found is None:
+                continue
+            word_start, src_w = found
+            local_end = idx - word_start + len(phrase)
+            val = src_w["text"][local_end:].strip(" :,-.")
+            if val:
+                dest.append([{"text": val, "x": src_w["x"], "y": src_w.get("y", 0)}])
         for later in rows[ri + 1:]:
             bw = [w for w in later if bill_x - 1 <= w["x"] < mid]
             sw = [w for w in later if mid <= w["x"] < ship_hi]
