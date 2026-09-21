@@ -110,6 +110,16 @@ LABEL_WORDS = [
     "e-mail", "email", "tel", "phone", "msme", "bank", "ifsc", "terms",
     "declaration", "authorised", "authorized", "signatory", "grand total",
     "tax rate", "taxable", "total tax", "due date", "name of product",
+    # A grid-style header (e.g. R-Logic's "Invoice Number | Invoice Date |
+    # Order Number | Customer Ref No", values one row below, column-
+    # aligned) has every column's OWN label sharing that same row with
+    # "Invoice Date"'s. The "value to the right on this row" scan (see
+    # _value_right_or_below) stops at the next recognized label - without
+    # these, "Order Number"/"Customer Ref No" aren't recognized as labels
+    # at all, so they get collected as if they were Invoice Date's own
+    # VALUE text ("Order Number Customer Ref No"), and the real value
+    # sitting one row down is never reached.
+    "order number", "customer ref",
     # Bare "service" alone is too broad - it's a substring of "Services",
     # extremely common in real company names ("R-Logic Technology
     # SERVICES India Pvt. Ltd."), and was truncating those names at the
@@ -324,7 +334,14 @@ def _value_right_or_below(rows, ri, anchor_word, offset):
         return right_text
 
     # --- value below, in the same (bounded) column band ---
-    band_lo, band_hi = ax - 40, ax + 220
+    # A narrower value (e.g. a date) sitting under a wider label can start
+    # a bit further left than the label's own x (R-Logic's "01-September-
+    # 2026" sits ~44px left of its own "Invoice Date" label) - widened
+    # from -40 to -60 to comfortably cover that drift while still safely
+    # short of the previous grid column, which real invoices space far
+    # wider apart than that (R-Logic's own neighboring columns sit ~300px+
+    # apart).
+    band_lo, band_hi = ax - 60, ax + 220
     for nri in range(ri + 1, min(ri + 4, len(rows))):
         nrow = sorted(rows[nri], key=lambda w: w["x"])
         cell = [w for w in nrow if band_lo <= w["x"] <= band_hi]
