@@ -2414,7 +2414,23 @@ class OCREngine:
                       # blank HSN/Quantity - the same failure shape as the
                       # "Taxable Amount"/"Total" case above.
                       "way bill", "net amount", "bank name", "beneficiary",
-                      "account no", "ifsc code", "branch")
+                      "account no", "ifsc code", "branch",
+                      # R Logic's own footer/summary lines: "TCS | 0.00" (Tax
+                      # Collected at Source, a real GST line item on the
+                      # invoice's own tax-summary block, not a purchased
+                      # part) has no leading serial and a genuine trailing
+                      # amount, so without this it's indistinguishable from
+                      # a real item and becomes a phantom 5th line with
+                      # blank HSN - the same failure shape as "Taxable
+                      # Amount"/"Total" above. "Important Note :" and
+                      # "Remarks : Based On Sales Orders ..." are boilerplate
+                      # invoice notes printed right after the last charge
+                      # line (Packing and Forwarding Expenses) with no
+                      # amount of their own, so they'd otherwise fold into
+                      # that charge's own Description via the "bare
+                      # charge-keyword row wraps onto the next line" rule
+                      # just above.
+                      "tcs", "important note", "remarks")
 
 
         def _strip_currency(value):
@@ -2471,6 +2487,29 @@ class OCREngine:
             # broader row-classification checks intentionally stay strict.
             v = value.strip()
             return is_hsn(v) or re.match(r"^99\d{2}$", v) is not None
+
+        def _hsn_token_value(value):
+            """The normalized (plain-digit) HSN/SAC value a table-cell
+            token represents, or None if it isn't HSN-shaped at all. Some
+            vendors (e.g. R Logic) print the code split by its own real
+            chapter.heading.sub-heading structure - "84.73.3020" for what's
+            really HSN 84733020 - rather than as one plain digit run;
+            without this, is_hsn's own plain \\d{4,10} check never matches
+            it, the HSN column stays blank, and the whole invoice fails the
+            mandatory-field gate for it despite the PDF genuinely stating a
+            code. Accepts a bare optional trailing letter the same as the
+            plain form does (see is_hsn's own docstring)."""
+            v = value.strip()
+            m = re.match(r"^\d{4,10}[A-Za-z]?$", v)
+            if m:
+                return v
+            if re.fullmatch(r"\d{2,4}(?:\.\d{1,4}){1,3}[A-Za-z]?", v):
+                digits = re.sub(r"\.", "", v)
+                letter = digits[-1] if digits[-1].isalpha() else ""
+                num_part = digits[:-1] if letter else digits
+                if 4 <= len(num_part) <= 10:
+                    return num_part + letter
+            return None
 
 
 
@@ -2590,13 +2629,13 @@ class OCREngine:
                 t = w["text"].strip()
                 if value_cols:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
-                    if col == "HSN" and is_hsn(t.replace(",", "")):
+                    if col == "HSN" and _hsn_token_value(t.replace(",", "")) is not None:
                         return True
                     if col in ("Quantity", "Rate", "Amount") and (
                         is_number(t) or number_with_unit(t) is not None
                     ):
                         return True
-                elif is_hsn(t.replace(",", "")) or is_number(t):
+                elif _hsn_token_value(t.replace(",", "")) is not None or is_number(t):
                     return True
             return False
 
@@ -2851,7 +2890,7 @@ class OCREngine:
                 and not re.search(r"round(?:ed)?[\s-]*off", lower)
                 and (
                     any(
-                        is_hsn(t.replace(",", ""))
+                        _hsn_token_value(t.replace(",", "")) is not None
                         and min(value_cols, key=lambda c: abs(w["x"] - value_cols[c])) == "HSN"
                         for w, t in zip(words, texts)
                     )
@@ -3025,17 +3064,22 @@ class OCREngine:
                         if (
                             col == "Quantity"
                             and "HSN" in value_cols
-                            and re.match(r"^\d{4,10}[A-Za-z]?$", txt)
+                            and _hsn_token_value(txt) is not None
                         ):
                             col = "HSN"
 
 
-                        # HSN / SAC code (4, 6 or 8 digits, optional letter)
-                        if col == "HSN" and re.match(
-                            r"^\d{4,10}[A-Za-z]?$",
-                            txt
-                        ):
-                            current_item["HSN"] = txt
+                        # HSN / SAC code (4, 6 or 8 digits, optional letter -
+                        # or the same digits printed with dot separators
+                        # following the code's own chapter.heading.sub-
+                        # heading structure, e.g. "84.73.3020" for what's
+                        # really HSN 84733020 - _hsn_token_value strips the
+                        # dots so the saved value always matches the plain
+                        # digit form used everywhere else (SF lookup, other
+                        # vendors' own printed HSN, etc.)).
+                        hsn_val = _hsn_token_value(txt) if col == "HSN" else None
+                        if hsn_val is not None:
+                            current_item["HSN"] = hsn_val
                             continue
 
 
