@@ -8,6 +8,7 @@ from pydantic import BaseModel
 import os
 import re
 import shutil
+import threading
 import traceback
 import uuid
 from datetime import datetime
@@ -82,6 +83,13 @@ def _bootstrap_menu_storage():
             database.ensure_default_viewer()
     except Exception:  # noqa: BLE001 - never block startup on DB issues
         traceback.print_exc()
+
+
+@app.on_event("startup")
+def _warm_extraction_pool():
+    """Start the parallel-extraction worker processes in the background so
+    the first Start click isn't slowed by their ~30 s OCR-engine load."""
+    threading.Thread(target=job_manager.warm_pool, daemon=True).start()
 
 
 @app.on_event("startup")
@@ -653,7 +661,7 @@ def process_start(payload: Optional[StartModel] = None):
 
 
 @app.get("/api/job/active")
-def active_job(mode: Optional[str] = None):
+def active_job(mode: Optional[str] = None, brief: bool = False):
     """Active job (optionally for a specific mode: process | train) so the
     UI can resume progress after navigating away. Returns {"active": false}
     when there is none."""
@@ -661,7 +669,7 @@ def active_job(mode: Optional[str] = None):
     job = job_manager.active_job(mode)
     if not job:
         return {"active": False}
-    return job.status_dict()
+    return job.status_dict(brief=brief)
 
 
 @app.get("/api/batches")
@@ -1553,14 +1561,14 @@ def download_manual(user_id: int, kind: str = "user"):
 
 
 @app.get("/api/process/status/{job_id}")
-def process_status(job_id: str):
+def process_status(job_id: str, brief: bool = False):
 
     job = job_manager.get(job_id)
 
     if not job:
         raise HTTPException(status_code=404, detail="Unknown job_id")
 
-    return job.status_dict()
+    return job.status_dict(brief=brief)
 
 
 @app.get("/api/process/result/{job_id}")

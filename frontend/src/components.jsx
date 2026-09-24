@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoicePdfUrl, getActiveAnnouncements, announcementImageUrl } from "./api";
+import { invoicePdfUrl, getActiveAnnouncements, announcementImageUrl, getActiveJob } from "./api";
 
 // PIIPS logo — a monogram "P" (source: logo/PIIPS-logo.svg) on an indigo-to-
 // magenta gradient badge; the P's counter doubles as a precision-target dot,
@@ -291,6 +291,78 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
     </div>
   );
 }
+
+// A progress bar split into one piece per step: every file is a piece, and
+// (process runs) a final extra piece is the Service First sync + save - so a
+// 100-file run shows 101 pieces and only fills the last one when the run is
+// really complete. `done` pieces are filled left to right; with files being
+// extracted in parallel the fill advances as each one finishes. The last
+// piece pulses while its step is running.
+export function SegmentedProgress({ total, done, syncStep = false, failed = false }) {
+  const n = Math.max(0, total || 0);
+  if (!n) return <div className="progress"><div className="progress-bar" style={{ width: "0%" }} /></div>;
+  const filled = Math.min(done || 0, n);
+  const cells = [];
+  for (let i = 0; i < n; i++) {
+    const isSync = syncStep && i === n - 1;
+    let cls = "seg";
+    if (i < filled) cls += failed ? " seg-failed" : " seg-done";
+    else if (isSync && filled >= n - 1) cls += " seg-active";
+    if (isSync) cls += " seg-sync";
+    cells.push(<span key={i} className={cls}
+      title={isSync ? "Service First sync & save" : `File ${i + 1} of ${syncStep ? n - 1 : n}`} />);
+  }
+  return (
+    <div className="seg-progress" style={{ gridTemplateColumns: `repeat(${n}, 1fr)` }}
+         role="progressbar" aria-valuemin={0} aria-valuemax={n} aria-valuenow={filled}>
+      {cells}
+    </div>
+  );
+}
+
+
+// Slim, app-wide progress strip for the invoice-processing run that is
+// currently going - whoever started it. Only one process run can exist at a
+// time, so every signed-in user (on any screen) sees the same live bar, who
+// started it, and knows Start is unavailable until it finishes. Hidden when
+// nothing is running (and on the Dashboard, which shows the full card).
+export function JobBanner({ hidden = false }) {
+  const [job, setJob] = useState(null);
+  useEffect(() => {
+    let stop = false;
+    let timer = null;
+    const tick = async () => {
+      let next = null;
+      try {
+        const j = await getActiveJob("process", true);
+        if (j && (j.status === "running" || j.status === "pending")) next = j;
+      } catch { /* server briefly unreachable - keep the last view */ next = undefined; }
+      if (stop) return;
+      if (next !== undefined) setJob(next);
+      timer = setTimeout(tick, next ? 1000 : 3000);
+    };
+    tick();
+    return () => { stop = true; clearTimeout(timer); };
+  }, []);
+  if (!job || hidden) return null;
+  const files = job.file_total ?? job.total;
+  const phase = job.processed >= job.total ? "finishing"
+    : job.processed >= job.total - 1 ? "syncing with Service First" : "extracting";
+  return (
+    <div className="job-banner">
+      <div className="progress-meta" style={{ marginBottom: 6 }}>
+        <span>
+          <strong>Invoice processing in progress</strong>
+          {job.started_by_name ? ` — started by ${job.started_by_name}` : ""}
+          {" · "}{phase}
+        </span>
+        <span>{Math.min(job.processed, files)}/{files} files · {job.percent}%</span>
+      </div>
+      <SegmentedProgress total={job.total} done={job.processed} syncStep />
+    </div>
+  );
+}
+
 
 export function Modal({ title, onClose, children, width = 1000 }) {
   return (

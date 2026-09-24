@@ -6,19 +6,31 @@ engine, maps the result into the downstream invoice schema and writes
 one <pdf>.json per file. Progress is tracked in memory so the frontend
 can poll it and drive a live progress bar.
 
-Processing runs on a worker thread (PaddleOCR is CPU bound and not
-thread-safe, so only one job runs at a time).
+Processing runs on a worker thread (only one job per mode at a time). The
+per-file extraction itself is fanned out to a small pool of worker
+PROCESSES (PaddleOCR is CPU bound and not thread-safe, so the parallelism is
+per process - see extract_worker.py); everything after extraction (format
+match, duplicate check, Service First sync, DB save) stays sequential and in
+file order so results are deterministic.
+
+Progress is measured in steps: one per file, plus - in process mode - one
+final step for the Service First sync / DB save. A 100-file run therefore
+reports 101 steps and only reads 100% once that last step is done.
 """
 
 import json
+import multiprocessing
 import os
 import re
 import shutil
 import threading
 import traceback
 import uuid
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime
 
+import extract_worker
 from ocr_engine import OCREngine
 from invoice_schema import build_invoice_json, resolve_payment_terms, add_days_to_date
 from format_model import FormatModel
@@ -65,10 +77,12 @@ class ProcessingJob:
         self.batch_name = ""             # batch saved to the DB (process mode)
         # Purchase-tracker attribution: who clicked Start, and when.
         self.started_by = started_by
+        self.started_by_name = ""        # shown to every other user watching this run
         self.started_at = datetime.now()
 
         self.status = "pending"          # pending | running | completed | failed
-        self.total = 0
+        self.total = 0                   # steps: files (+1 sync step in process mode)
+        self.file_total = 0              # files only
         self.processed = 0
         self.current_file = ""
         self.stage = ""                  # Extracting | Syncing | Processing (per file)
@@ -85,16 +99,23 @@ class ProcessingJob:
             return 0
         return round(self.processed / self.total * 100)
 
-    def status_dict(self):
+    def status_dict(self, brief=False):
         """Lightweight snapshot for polling (no extracted JSON payload).
-        Sample: job.status_dict()"""
+        `brief=True` also leaves out the per-file result list and errors - a
+        run of hundreds of files makes those large, and every signed-in
+        user's screen polls this once a second while a run is going.
+        Sample: job.status_dict(brief=True)"""
 
         with self._lock:
-            return {
+            snapshot = {
                 "job_id": self.job_id,
                 "mode": self.mode,
                 "status": self.status,
                 "total": self.total,
+                "file_total": self.file_total,
+                "started_by": self.started_by,
+                "started_by_name": self.started_by_name,
+                "started_at": self.started_at.isoformat(timespec="seconds"),
                 "processed": self.processed,
                 "percent": self._percent(),
                 "current_file": self.current_file,
@@ -102,6 +123,10 @@ class ProcessingJob:
                 "error": self.error,
                 "export_file": self.export_file,
                 "batch_name": self.batch_name,
+            }
+            if brief:
+                return snapshot
+            snapshot.update({
                 "results": [
                     {
                         "file": r["file"],
@@ -118,7 +143,8 @@ class ProcessingJob:
                     for r in self.results
                 ],
                 "errors": list(self.errors),
-            }
+            })
+            return snapshot
 
     def result_dict(self):
         """Full snapshot including each file's extracted JSON.
@@ -182,9 +208,21 @@ class JobManager:
             current = self._jobs.get(self._active.get(mode))
 
             if current and current.status in ("pending", "running"):
-                return None, f"A {mode} job is already running. Please wait for it to finish."
+                who = f" (started by {current.started_by_name})" if current.started_by_name else ""
+                return None, (
+                    f"A {mode} job is already running{who}. "
+                    "Please wait for it to finish - its progress is shown on every screen."
+                )
 
             job_id = uuid.uuid4().hex[:12]
+            starter = ""
+            if started_by:
+                try:
+                    import database
+                    info = database.get_username_and_role(started_by)
+                    starter = (info or {}).get("username") or ""
+                except Exception:  # noqa: BLE001 - the name is cosmetic
+                    starter = ""
             job = ProcessingJob(
                 job_id,
                 source_folder,
@@ -196,6 +234,7 @@ class JobManager:
                 started_by=started_by,
             )
 
+            job.started_by_name = starter
             self._jobs[job_id] = job
             self._active[mode] = job_id
 
@@ -235,7 +274,10 @@ class JobManager:
             source_files.sort()
 
             with job._lock:
-                job.total = len(source_files)
+                job.file_total = len(source_files)
+                # Process mode has one extra, final step: the Service First
+                # sync + database save that follows the last extraction.
+                job.total = len(source_files) + (1 if job.mode == "process" else 0)
 
             os.makedirs(job.output_folder, exist_ok=True)
             if job.unknown_folder:
@@ -275,7 +317,6 @@ class JobManager:
                 except Exception:  # noqa: BLE001
                     traceback.print_exc()
 
-            ocr = OCREngine()
             fmt_model = FormatModel()
 
             # Super Admin toggles (config_store's "allow_scanned_pdfs_part"/
@@ -291,6 +332,27 @@ class JobManager:
             except Exception:  # noqa: BLE001 - default to the safe/off behaviour
                 allow_scanned_part = False
                 allow_scanned_service = False
+
+            def _allow_scanned_for(src_path):
+                """Whether a scanned/photocopied file at `src_path` may be
+                OCR-extracted, per the Super Admin toggle for its type."""
+                if job.mode == "train":
+                    # New_Format is a flat folder - no <entity>/<invoice_type>
+                    # structure to resolve the type from - so a scanned file
+                    # is OCR'd as long as EITHER type's toggle is on, so it
+                    # can still be learned as a trained format instead of
+                    # being stuck as permanently unsupported.
+                    return allow_scanned_part or allow_scanned_service
+                invoice_type_here = template_store.invoice_type_for_path(
+                    job.source_folder, src_path
+                )
+                if invoice_type_here == "SERVICE":
+                    return allow_scanned_service
+                if invoice_type_here == "PART":
+                    return allow_scanned_part
+                # Type unresolvable from this path - conservative default,
+                # matching the original off-by-default behaviour.
+                return False
 
             def _finish_group(ctx, verdict):
                 """Complete one invoice given its verdict (computed
@@ -400,42 +462,22 @@ class JobManager:
             # batched fetch_sf_batch()/apply_sf_batch() call after this loop.
             pending = []
 
-            for src_path in source_files:
+            for src_path, extracted in self._extract_stream(
+                job, source_files, _allow_scanned_for
+            ):
 
                 filename = os.path.basename(src_path)
 
                 with job._lock:
-                    job.current_file = filename
                     job.stage = "Extracting"
 
                 try:
 
-                    if job.mode == "train":
-                        # New_Format is a flat folder (see the source_files
-                        # scan above) - no <entity>/<invoice_type>/<name>
-                        # structure to resolve the type from here, so a
-                        # scanned file sitting in it is OCR'd the same as
-                        # any other as long as EITHER type's toggle is on,
-                        # so it can still be learned/merged as a trained
-                        # format instead of being stuck as permanently
-                        # unsupported.
-                        allow_scanned = allow_scanned_part or allow_scanned_service
-                    else:
-                        invoice_type_here = template_store.invoice_type_for_path(
-                            job.source_folder, src_path
-                        )
-                        if invoice_type_here == "SERVICE":
-                            allow_scanned = allow_scanned_service
-                        elif invoice_type_here == "PART":
-                            allow_scanned = allow_scanned_part
-                        else:
-                            # Type unresolvable from this path - conservative
-                            # default, matching the original off-by-default
-                            # behaviour, rather than guessing which toggle
-                            # applies.
-                            allow_scanned = False
-
-                    ocr_result = ocr.read_pdf(src_path, allow_scanned=allow_scanned)
+                    # `extracted` is the file's OCR result, or the exception
+                    # its extraction raised (in a worker process or here).
+                    if isinstance(extracted, BaseException):
+                        raise extracted
+                    ocr_result = extracted
 
                     if job.mode == "train":
 
@@ -718,10 +760,11 @@ class JobManager:
                         "moved_to": moved_to,
                     }]
 
+                # (Progress is ticked when a file's EXTRACTION finishes - see
+                # _extract_stream - not here, so it reflects the parallel work.)
                 with job._lock:
                     for record in records:
                         job.results.append(record)
-                    job.processed += 1
 
             # ---- Batched Service First lookup ---------------------------
             # One GetSparePurchaseItem call and one GetHSNDetails call for
@@ -778,6 +821,8 @@ class JobManager:
                 self._move_by_status(job)
 
             with job._lock:
+                # The final step (Service First sync + DB save) is done.
+                job.processed = job.total
                 job.status = "completed"
                 job.current_file = ""
                 job.stage = ""
@@ -789,6 +834,177 @@ class JobManager:
             with job._lock:
                 job.status = "failed"
                 job.error = str(exc)
+
+    # -- parallel extraction -----------------------------------------------
+
+    # Fewer files than this and spinning up worker processes (each loads its
+    # own PaddleOCR, a few seconds) costs more than it saves.
+    PARALLEL_MIN_FILES = 8
+
+    @staticmethod
+    def _worker_count(file_count):
+        """How many extraction processes to use for `file_count` files:
+        config.json's "parallel_workers" (1 = extract sequentially in this
+        process), default half the CPU cores capped at 4.
+        Sample: JobManager._worker_count(100) -> 4"""
+        if file_count < JobManager.PARALLEL_MIN_FILES:
+            return 1
+        try:
+            import config_store
+            configured = config_store.load_config().get("parallel_workers")
+        except Exception:  # noqa: BLE001
+            configured = None
+        try:
+            workers = int(configured) if configured not in (None, "") else None
+        except (TypeError, ValueError):
+            workers = None
+        if workers is None:
+            workers = min(4, max(1, (os.cpu_count() or 2) // 2))
+        return max(1, min(workers, file_count))
+
+    # The worker processes are created once and kept alive between runs: each
+    # one loads its own PaddleOCR + imports the whole extraction stack, which
+    # takes ~30 s - paid per run it would cost more than parallelism saves on
+    # a batch of born-digital PDFs (a few hundred ms each). app.py warms the
+    # pool at service start (warm_pool) so the first Start click is fast too.
+    _pool = None
+    _pool_workers = 0
+    _pool_lock = threading.Lock()
+
+    @classmethod
+    def _get_pool(cls, workers):
+        """The shared extraction pool with `workers` processes (created on
+        first use, rebuilt when the configured size changes)."""
+        with cls._pool_lock:
+            if cls._pool is not None and cls._pool_workers != workers:
+                cls._pool.shutdown(wait=False, cancel_futures=True)
+                cls._pool = None
+            if cls._pool is None:
+                threads = max(1, (os.cpu_count() or 2) // workers)
+                cls._pool = ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=extract_worker.init_worker,
+                    initargs=(threads,),
+                )
+                cls._pool_workers = workers
+            return cls._pool
+
+    @classmethod
+    def _discard_pool(cls, pool):
+        """Forget a pool that died (BrokenProcessPool) so the next run builds
+        a fresh one."""
+        with cls._pool_lock:
+            if cls._pool is pool:
+                cls._pool = None
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @classmethod
+    def warm_pool(cls):
+        """Start the extraction workers and have each one load its OCR engine
+        now, in the background, so the first run doesn't pay for it.
+        Sample: job_manager.warm_pool()"""
+        try:
+            workers = cls._worker_count(cls.PARALLEL_MIN_FILES)
+            if workers <= 1:
+                return
+            pool = cls._get_pool(workers)
+            for _ in range(workers):
+                pool.submit(extract_worker.warm)
+        except Exception:  # noqa: BLE001 - warming is best-effort
+            traceback.print_exc()
+
+    def _extract_stream(self, job, source_files, allow_fn):
+        """Yield (path, ocr_result_or_exception) for every file, IN ORDER,
+        extracting several files at once in worker processes.
+
+        Order matters downstream (the first of two identical invoices wins
+        the duplicate check), so results are consumed in submission order
+        while the workers race ahead. Progress is ticked the moment each
+        file's extraction completes - in whatever order - so the bar shows
+        the real parallel progress. If the pool can't start or dies, the
+        remaining files are extracted sequentially in this process instead.
+        Sample: for path, res in JobManager()._extract_stream(job, files, lambda p: False): ..."""
+
+        def tick(name):
+            with job._lock:
+                job.processed += 1
+                job.current_file = name
+
+        engine = []
+
+        def extract_here(path):
+            if not engine:
+                engine.append(OCREngine())
+            return engine[0].read_pdf(path, allow_scanned=allow_fn(path))
+
+        workers = self._worker_count(len(source_files))
+        pool = None
+        if workers > 1:
+            try:
+                pool = self._get_pool(workers)
+            except Exception:  # noqa: BLE001 - fall back to one process
+                traceback.print_exc()
+                pool = None
+
+        if pool is None:
+            for path in source_files:
+                try:
+                    result = extract_here(path)
+                except Exception as exc:  # noqa: BLE001 - reported per file
+                    result = exc
+                tick(os.path.basename(path))
+                yield path, result
+            return
+
+        futures = []
+        try:
+            # Submit the biggest files first: a scanned/photo PDF (large, OCR
+            # heavy) started last would leave the other workers idle while it
+            # finishes. Results are still consumed in file order below.
+            def _size(path):
+                try:
+                    return os.path.getsize(path)
+                except OSError:
+                    return 0
+
+            by_path = {}
+            for path in sorted(source_files, key=_size, reverse=True):
+                fut = pool.submit(extract_worker.extract_one, path, allow_fn(path))
+                fut.add_done_callback(lambda _f, name=os.path.basename(path): tick(name))
+                by_path[path] = fut
+            futures = [by_path[path] for path in source_files]
+
+            broken = False
+            for path, fut in zip(source_files, futures):
+                result = None
+                if not broken:
+                    try:
+                        kind, payload = fut.result()
+                        result = payload if kind == "ok" else RuntimeError(payload)
+                    except BrokenProcessPool:
+                        broken = True
+                        traceback.print_exc()
+                        self._discard_pool(pool)
+                    except Exception as exc:  # noqa: BLE001
+                        result = exc
+                if broken:
+                    # A worker died: finish the rest here rather than fail
+                    # the run (progress for these was already ticked by the
+                    # futures' own completion callbacks).
+                    try:
+                        result = extract_here(path)
+                    except Exception as exc:  # noqa: BLE001
+                        result = exc
+                yield path, result
+        finally:
+            # The pool stays alive for the next run; only work that was never
+            # started (an aborted run) is dropped.
+            for fut in futures:
+                fut.cancel()
 
     @staticmethod
     def _move(src_path, dest_folder):

@@ -209,7 +209,9 @@ class OCREngine:
 
             use_gpu=False,
 
-            cpu_threads=8,
+            # Parallel extraction workers set PIIPS_OCR_THREADS so N processes
+            # share the cores instead of each using all 8.
+            cpu_threads=int(os.environ.get("PIIPS_OCR_THREADS") or 8),
 
             enable_mkldnn=True,
 

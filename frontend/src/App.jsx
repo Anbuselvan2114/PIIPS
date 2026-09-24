@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Logo, AnnouncementBell } from "./components";
+import { Logo, AnnouncementBell, JobBanner } from "./components";
 import Dashboard from "./Dashboard";
 import Configuration from "./Configuration";
 import DatabaseConfig from "./DatabaseConfig";
@@ -324,6 +324,7 @@ export default function App() {
           </label>
         </header>
         <div className="content" style={{ flex: 1 }}>
+          <JobBanner hidden={activePage === "dashboard"} />
           {Active ? <Active user={user} onRoleMenusSaved={refreshRoleMenus} /> : null}
         </div>
         <div className="hint" style={{ textAlign: "center", padding: "14px 28px",

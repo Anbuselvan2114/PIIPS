@@ -5,7 +5,7 @@ import {
   getInvoicesByStatus, getInvoicesByBatch, setInvoiceExcluded,
   getInvoiceFieldCheck,
 } from "./api";
-import { DataTable, Modal, PdfModal } from "./components";
+import { DataTable, Modal, PdfModal, SegmentedProgress } from "./components";
 
 // Dark categorical palette — one fixed, distinct hue per tbl_status slot
 // (indexed by status_id). Sized past the number of statuses so colours never
@@ -115,6 +115,7 @@ export default function Dashboard({ user }) {
   const [fieldTab, setFieldTab] = useState("header");
   const [pdfFile, setPdfFile] = useState(null);
   const pollRef = useRef(null);
+  const polledRef = useRef(null);   // job id whose progress this screen is following
 
   const loadBatches = () =>
     getBatches().then((r) => setBatches(r.batches || [])).catch(() => {});
@@ -133,17 +134,30 @@ export default function Dashboard({ user }) {
       loadBatches();
       loadStatusCounts();
     })();
-    return () => clearInterval(pollRef.current);
+    // Only one process run can exist at a time, and it may have been started
+    // by ANY signed-in user: keep looking for one so everybody sees the same
+    // live bar (and a disabled Start) without reloading the page.
+    const watch = setInterval(async () => {
+      try {
+        const j = await getActiveJob("process", true);
+        if (j && (j.status === "running" || j.status === "pending") && polledRef.current !== j.job_id) {
+          setJob(j); setRunning(true); setError(null); poll(j.job_id);
+        }
+      } catch { /* server busy - try again next tick */ }
+    }, 2500);
+    return () => { clearInterval(pollRef.current); clearInterval(watch); };
   }, []);
 
   const poll = (jobId) => {
     clearInterval(pollRef.current);
+    polledRef.current = jobId;
     pollRef.current = setInterval(async () => {
       try {
-        const s = await getStatus(jobId);
+        const s = await getStatus(jobId, true);
         setJob(s);
         if (s.status === "completed" || s.status === "failed") {
           clearInterval(pollRef.current);
+          polledRef.current = null;
           setRunning(false);
           const full = await getResult(jobId);
           setResults(full.results || []);
@@ -152,7 +166,7 @@ export default function Dashboard({ user }) {
           setJob(null);
           if (s.status === "failed") setError(s.error || "Processing failed");
         }
-      } catch (e) { clearInterval(pollRef.current); setRunning(false); setError(e.message); }
+      } catch (e) { clearInterval(pollRef.current); polledRef.current = null; setRunning(false); setError(e.message); }
     }, 800);
   };
 
@@ -471,7 +485,10 @@ export default function Dashboard({ user }) {
               <h3>Process invoices</h3>
               <div style={{ flex: 1 }} />
               <button className="btn btn-primary btn-lg" onClick={onStart} disabled={running}>
-                {running ? "Processing…" : "▶  Start"}
+                {running
+                  ? (job?.started_by_name && job.started_by !== user?.user_id
+                      ? `Processing… (started by ${job.started_by_name})` : "Processing…")
+                  : "▶  Start"}
               </button>
             </div>
             <p className="hint" style={{ margin: 0 }}>
@@ -480,10 +497,16 @@ export default function Dashboard({ user }) {
             {running && job && (
               <div style={{ marginTop: 18 }}>
                 <div className="progress-meta">
-                  <span>{stageLabel}</span>
-                  <span>{job.processed}/{job.total} · {percent}%</span>
+                  <span>
+                    {job.started_by_name ? `Started by ${job.started_by_name} · ` : ""}{stageLabel}
+                  </span>
+                  <span>
+                    {Math.min(job.processed, job.file_total ?? job.total)}/{job.file_total ?? job.total} files
+                    {" · "}{job.processed >= job.total ? "done" : job.processed >= job.total - 1 ? "syncing" : "extracting"}
+                    {" · "}{percent}%
+                  </span>
                 </div>
-                <div className="progress"><div className="progress-bar" style={{ width: `${percent}%` }} /></div>
+                <SegmentedProgress total={job.total} done={job.processed} syncStep />
               </div>
             )}
             {error && <div className="alert alert-danger" style={{ marginTop: 12 }}>{error}</div>}

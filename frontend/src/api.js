@@ -205,11 +205,13 @@ export const getTrainFiles = () => request("/api/train/files");
 export const trainFileUrl = (name) =>
   withToken(`${API_BASE}/api/train/file?name=${encodeURIComponent(name)}`);
 
-export const getActiveJob = (mode) =>
-  request(`/api/job/active${mode ? `?mode=${mode}` : ""}`);
+// `brief` leaves out the per-file result list - use it for progress polling
+// (every signed-in user's screen polls while a run is going).
+export const getActiveJob = (mode, brief = false) =>
+  request(`/api/job/active?${mode ? `mode=${mode}&` : ""}${brief ? "brief=1" : ""}`);
 
-export const getStatus = (jobId) =>
-  request(`/api/process/status/${jobId}`);
+export const getStatus = (jobId, brief = false) =>
+  request(`/api/process/status/${jobId}${brief ? "?brief=1" : ""}`);
 
 export const getResult = (jobId) =>
   request(`/api/process/result/${jobId}`);
