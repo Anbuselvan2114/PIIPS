@@ -313,7 +313,9 @@ table.tbl tbody tr:hover { background: var(--surface-2); }
   border-radius: var(--radius-sm, 8px); padding: 10px 14px; margin-bottom: 16px; }
 
 /* one small bar per file (+ one for the final sync step), all identical */
-.seg-progress { display: grid; gap: 2px; height: 16px; }
+.seg-progress { display: grid; gap: 2px; height: 16px; width: 100%; }
+/* hundreds of pieces: no gaps or rounding - a thin light divider instead */
+.seg-dense .seg { border-radius: 0; box-shadow: inset -1px 0 0 rgba(255, 255, 255, .55); }
 .seg { position: relative; overflow: hidden; background: #e2e8f0; border-radius: 2px; min-width: 0; }
 .seg-fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--primary);
   transition: width .35s ease; }

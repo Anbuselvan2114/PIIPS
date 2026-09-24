@@ -321,7 +321,8 @@ export function SegmentedProgress({ total, done, segments, kinds, syncStep = fal
     );
   }
   return (
-    <div className="seg-progress" style={{ gridTemplateColumns: `repeat(${n}, 1fr)` }}
+    <div className={`seg-progress${n > 250 ? " seg-dense" : ""}`}
+         style={{ gridTemplateColumns: `repeat(${n}, minmax(0, 1fr))`, gap: n > 250 ? 0 : n > 110 ? 1 : 2 }}
          role="progressbar" aria-valuemin={0} aria-valuemax={n} aria-valuenow={filled}>
       {cells}
     </div>
