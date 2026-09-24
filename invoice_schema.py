@@ -1402,6 +1402,16 @@ def build_invoice_json(result, pdf_path=""):
         elif confidence == "doubtful":
             order_no = found
             buyer_order_doubtful = True
+        elif order_no:
+            # Whatever the anchor pass read as the "Buyer's Order No." is not a
+            # SPRPUR PO (a vendor's own "PO-2627-101042", a stray "MAIL" or "/").
+            # Only a value that at least STARTS like a PO is kept, flagged
+            # doubtful for a human to fix; anything else is not our PO number
+            # at all, so it is left MISSING instead of being saved as one.
+            if buyer_order.resembles_po(order_no):
+                buyer_order_doubtful = True
+            else:
+                order_no = ""
 
     # A PO number is a structured code, never genuinely containing internal
     # whitespace - an anchor-extracted value that already "looks like" a

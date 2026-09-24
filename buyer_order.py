@@ -110,6 +110,19 @@ def looks_like_po(value):
     return _is_strict(_normalise(value or ""))
 
 
+def resembles_po(value):
+    """True when `value` at least STARTS like a SPRPUR PO - a prefix word
+    resembling "SPRPUR" followed by a separator ("SPRPUR/2026/08/1",
+    "SPRPU/..."): a truncated/misread PO worth a human check, unlike an
+    unrelated reference ("PO-2627-101042", "MAIL", "/") that isn't a PO of
+    ours at all.
+    Sample: resembles_po('SPRPUR/2026/08/1') -> True; resembles_po('PO-2627-101042') -> False"""
+    m = re.match(r"\s*([A-Za-z0-9]{4,8})\s*[/\-]", value or "")
+    if not m:
+        return False
+    return difflib.SequenceMatcher(None, m.group(1).upper(), "SPRPUR").ratio() >= _PREFIX_MIN_RATIO
+
+
 def find_buyer_order_no(text):
     """
     Scan free OCR `text` for a SPRPUR buyer's order number.
