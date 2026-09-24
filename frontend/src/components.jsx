@@ -298,7 +298,7 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
 // really complete. `done` pieces are filled left to right; with files being
 // extracted in parallel the fill advances as each one finishes. The last
 // piece pulses while its step is running.
-export function SegmentedProgress({ total, done, segments, syncStep = false, failed = false }) {
+export function SegmentedProgress({ total, done, segments, kinds, syncStep = false, failed = false }) {
   const n = Math.max(0, total || 0);
   if (!n) return <div className="progress"><div className="progress-bar" style={{ width: "0%" }} /></div>;
   const filled = Math.min(done || 0, n);
@@ -309,10 +309,13 @@ export function SegmentedProgress({ total, done, segments, syncStep = false, fai
   const cells = [];
   for (let i = 0; i < n; i++) {
     const isSync = syncStep && i === n - 1;
+    const isPrep = syncStep && i === 0;
     const p = Math.max(0, Math.min(100, pct(i)));
+    const kindName = kinds && kinds.length === n ? ["original PDF", "scanned", "photographed"][kinds[i]] : "";
+    const what = isSync ? "Service First sync & save" : isPrep ? "Preparing"
+      : `File ${i} of ${n - 2}${kindName ? ` (${kindName})` : ""}`;
     cells.push(
-      <span key={i} className="seg"
-        title={`${isSync ? "Service First sync & save" : `File ${i + 1} of ${syncStep ? n - 1 : n}`} — ${p}%`}>
+      <span key={i} className="seg" title={`${what} — ${p}%`}>
         <span className={`seg-fill${failed ? " seg-failed" : ""}`} style={{ width: `${p}%` }} />
       </span>
     );
@@ -351,8 +354,7 @@ export function JobBanner({ hidden = false }) {
   }, []);
   if (!job || hidden) return null;
   const files = job.file_total ?? job.total;
-  const phase = job.processed >= job.total ? "finishing"
-    : job.processed >= job.total - 1 ? "syncing with Service First" : "extracting";
+  const phase = job.stage ? job.stage.toLowerCase() : "working";
   return (
     <div className="job-banner">
       <div className="progress-meta" style={{ marginBottom: 6 }}>
@@ -361,9 +363,10 @@ export function JobBanner({ hidden = false }) {
           {job.started_by_name ? ` — started by ${job.started_by_name}` : ""}
           {" · "}{phase}
         </span>
-        <span>{Math.min(job.processed, files)}/{files} files · {job.percent}%</span>
+        <span>{files ? `${Math.min(job.processed, files)}/${files} files · ` : ""}{job.percent}%</span>
       </div>
-      <SegmentedProgress total={job.total} done={job.processed} segments={job.segments} syncStep />
+      <SegmentedProgress total={job.total} done={job.processed} segments={job.segments}
+                         kinds={job.segment_kinds} syncStep />
     </div>
   );
 }

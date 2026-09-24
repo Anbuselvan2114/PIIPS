@@ -19,7 +19,6 @@ for _stream in (sys.stdout, sys.stderr):
 import cv2
 import numpy as np
 from pdf2image import convert_from_path
-from paddleocr import PaddleOCR
 
 try:
     import fitz  # PyMuPDF — read born-digital PDF text layers (fast path)
@@ -196,6 +195,12 @@ class OCREngine:
         if cls._ocr is not None:
             return
 
+        # Imported here, not at module level: importing PaddleOCR takes many
+        # seconds, and a born-digital PDF (text layer, no OCR) never needs it -
+        # so extraction workers start in ~1 s and only a run that actually
+        # meets a scanned page pays for it.
+        from paddleocr import PaddleOCR
+
         print("Loading PaddleOCR...")
 
         start = time.perf_counter()
@@ -222,14 +227,48 @@ class OCREngine:
             f"PaddleOCR Loaded in {time.perf_counter()-start:.2f} sec"
         )
     def __init__(self):
+        # PaddleOCR itself is loaded lazily, on the first page that needs OCR
+        # (see initialize / process_page) - constructing the engine is cheap.
+        pass
 
-        if OCREngine._ocr is None:
-            OCREngine.initialize()
     # Standalone image formats accepted in addition to PDF
     IMAGE_EXTS = (
         ".png", ".jpg", ".jpeg",
         ".tif", ".tiff", ".bmp", ".webp",
     )
+
+    # File kinds, in the order the progress bar draws them.
+    KIND_ORIGINAL, KIND_SCANNED, KIND_PHOTO = 0, 1, 2
+
+    def classify_file(self, path):
+        """Which kind of document `path` is, WITHOUT extracting it: 0 = an
+        original born-digital PDF (every page has a text layer), 1 = a scan /
+        photocopy (some page needs OCR), 2 = a photographed/blurry page or an
+        unreadable file. Mirrors the checks read_pdf itself makes.
+        Sample: OCREngine().classify_file('a.pdf') -> 0"""
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            image = None
+            if ext == ".pdf" and fitz is not None:
+                doc = fitz.open(path)
+                try:
+                    for page in doc:
+                        if not self._pdf_text_boxes(page):
+                            image = self._render_pdf_page(path, page.number + 1)
+                            break
+                finally:
+                    doc.close()
+                if image is None:
+                    return self.KIND_ORIGINAL
+            else:
+                image = cv2.imread(path)
+                if image is None:
+                    return self.KIND_PHOTO
+            if _looks_like_photo_page(image) or _looks_like_blurry_page(image):
+                return self.KIND_PHOTO
+            return self.KIND_SCANNED
+        except Exception:  # noqa: BLE001 - unreadable: last in line
+            return self.KIND_PHOTO
 
     def file_to_images(self, path):
         """
@@ -415,6 +454,7 @@ class OCREngine:
                     threading.Thread(target=_creep, daemon=True).start()
                 try:
                     with OCREngine._ocr_lock:
+                        OCREngine.initialize()
                         result = OCREngine._ocr.ocr(
                             image,
                             det=True,

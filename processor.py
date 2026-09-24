@@ -81,7 +81,14 @@ class ProcessingJob:
         self.started_at = datetime.now()
 
         self.status = "pending"          # pending | running | completed | failed
-        self.total = 0                   # steps: files (+1 sync step in process mode)
+        # Steps (each drawn as one piece of the progress bar): in process mode
+        # a leading "preparing" piece, one per file, and a final Service First
+        # sync / save piece; in train mode just one per file. Process mode
+        # starts at 1 so the bar exists the instant Start is clicked.
+        self.total = 1 if mode == "process" else 0
+        self.prep_progress = 0           # 0..100 of the leading "preparing" piece
+        self.scanned = False             # Input folder scanned -> file pieces known
+        self.file_kind = {}              # path -> 0 original / 1 scanned / 2 photo
         self.file_total = 0              # files only
         self.file_order = []             # source paths, in the order the pieces are drawn
         self.file_progress = {}          # path -> 0..100 (that file's own bar)
@@ -101,8 +108,10 @@ class ProcessingJob:
         """Per-piece progress, 0..100 each: one per file in order, then (process
         mode) the final sync piece. Caller holds the lock."""
         segs = [self.file_progress.get(p, 0) for p in self.file_order]
-        if self.mode == "process" and self.total > len(self.file_order):
-            segs.append(self.sync_progress)
+        if self.mode == "process":
+            segs.insert(0, self.prep_progress)
+            if self.scanned:
+                segs.append(self.sync_progress)
         return segs
 
     def _percent(self):
@@ -129,6 +138,26 @@ class ProcessingJob:
             if path in self.file_progress:
                 self.file_progress[path] = 100
 
+    def segment_kinds(self):
+        """Kind of every piece, aligned with _segments(): -1 preparing,
+        0 original PDF, 1 scanned, 2 photographed, -2 final sync. Caller
+        holds the lock."""
+        kinds = [self.file_kind.get(p, 0) for p in self.file_order]
+        if self.mode == "process":
+            kinds.insert(0, -1)
+            if self.scanned:
+                kinds.append(-2)
+        return kinds
+
+    def set_prep(self, pct, stage=None):
+        """Advance the leading "preparing" piece (and say what is happening).
+        Sample: job.set_prep(40, "Preparing (loading processed invoices)")"""
+        with self._lock:
+            self.prep_progress = max(self.prep_progress, min(int(pct), 100))
+            if stage:
+                self.stage = stage
+                self.current_file = ""
+
     def set_sync_progress(self, pct):
         with self._lock:
             self.sync_progress = max(self.sync_progress, min(int(pct), 100))
@@ -154,6 +183,9 @@ class ProcessingJob:
                 "percent": self._percent(),
                 # one 0..100 value per piece of the segmented bar
                 "segments": self._segments(),
+                # what each piece is: -1 preparing, 0 original, 1 scanned,
+                # 2 photo, -2 final sync (tooltips)
+                "segment_kinds": self.segment_kinds(),
                 "current_file": self.current_file,
                 "stage": self.stage,
                 "error": self.error,
@@ -297,6 +329,7 @@ class JobManager:
             # Process mode scans Input recursively (PDFs live in
             # <Input>/<entity>/<template>/ subfolders); train mode scans the
             # flat New_Format folder.
+            job.set_prep(3, "Preparing (scanning the Input folder)")
             source_files = []
             if job.mode == "process":
                 for root, _dirs, files in os.walk(job.source_folder):
@@ -309,13 +342,25 @@ class JobManager:
                         source_files.append(os.path.join(job.source_folder, f))
             source_files.sort()
 
+            kinds = {p: 0 for p in source_files}
             with job._lock:
-                job.file_order = list(source_files)
-                job.file_progress = {p: 0 for p in source_files}
                 job.file_total = len(source_files)
-                # Process mode has one extra, final step: the Service First
-                # sync + database save that follows the last extraction.
-                job.total = len(source_files) + (1 if job.mode == "process" else 0)
+                # Process mode has two extra steps: the leading "preparing"
+                # piece and the final Service First sync + database save.
+                job.total = len(source_files) + (2 if job.mode == "process" else 0)
+            if job.mode == "process":
+                job.set_prep(15, "Preparing (found %d files)" % len(source_files))
+                # Draw the pieces original PDFs first, then scanned, then
+                # photographed ones - and, inside each group, smallest file
+                # first (processing order itself is unchanged).
+                kinds = self._classify_files(job, source_files)
+            with job._lock:
+                job.file_order = sorted(
+                    source_files, key=lambda p: (kinds[p], self._file_size(p), p)
+                )
+                job.file_progress = {p: 0 for p in source_files}
+                job.file_kind = kinds
+                job.scanned = True
 
             os.makedirs(job.output_folder, exist_ok=True)
             if job.unknown_folder:
@@ -347,6 +392,7 @@ class JobManager:
 
             if job.mode == "process":
                 job.batch_name = "PIIPS_Batch_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+                job.set_prep(20, "Preparing (loading already-processed invoices)")
                 try:
                     import config_store
                     if (config_store.load_config().get("db_connection") or "").strip():
@@ -354,8 +400,11 @@ class JobManager:
                         invoice_map = database.get_processed_invoices()
                 except Exception:  # noqa: BLE001
                     traceback.print_exc()
+                job.set_prep(55, "Preparing (loading trained templates)")
 
             fmt_model = FormatModel()
+            if job.mode == "process":
+                job.set_prep(70, "Preparing (starting extraction workers)")
 
             # Super Admin toggles (config_store's "allow_scanned_pdfs_part"/
             # "_service") for whether a scanned/photocopied invoice of that
@@ -868,6 +917,7 @@ class JobManager:
             with job._lock:
                 # The final step (Service First sync + DB save) is done.
                 job.processed = job.total
+                job.prep_progress = 100
                 job.sync_progress = 100
                 job.status = "completed"
                 job.current_file = ""
@@ -880,6 +930,40 @@ class JobManager:
             with job._lock:
                 job.status = "failed"
                 job.error = str(exc)
+
+    # -- file ordering -----------------------------------------------------
+
+    @staticmethod
+    def _file_size(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _classify_files(job, source_files):
+        """{path: 0 original / 1 scanned / 2 photo} for every file, filling the
+        "preparing" piece (15 -> 50%) as it goes. A born-digital PDF is told
+        apart from a scan in milliseconds; only files without a text layer are
+        rendered, a few at a time.
+        Sample: JobManager._classify_files(job, files)"""
+        from concurrent.futures import ThreadPoolExecutor
+        engine = OCREngine()
+        job.set_prep(15, "Preparing (sorting files: original, scanned, photo)")
+        kinds = {}
+        total = max(1, len(source_files))
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for done, (path, kind) in enumerate(
+                    zip(source_files, pool.map(engine.classify_file, source_files)), start=1
+                ):
+                    kinds[path] = kind
+                    if done % 5 == 0 or done == total:
+                        job.set_prep(15 + 35 * done / total)
+        except Exception:  # noqa: BLE001 - ordering is cosmetic; never fail the run
+            traceback.print_exc()
+            kinds = {p: kinds.get(p, 0) for p in source_files}
+        return kinds
 
     # -- parallel extraction -----------------------------------------------
 
@@ -996,6 +1080,12 @@ class JobManager:
 
         JobManager._current_job = job
 
+        def extraction_started():
+            # Preparation is over the moment files are handed to workers.
+            with job._lock:
+                job.stage = "Extracting"
+            job.set_prep(100)
+
         def tick(path):
             job.finish_file(path)
             with job._lock:
@@ -1022,6 +1112,7 @@ class JobManager:
                 pool = None
 
         if pool is None:
+            extraction_started()
             for path in source_files:
                 try:
                     result = extract_here(path)
@@ -1048,6 +1139,7 @@ class JobManager:
                 fut.add_done_callback(lambda _f, p=path: tick(p))
                 by_path[path] = fut
             futures = [by_path[path] for path in source_files]
+            extraction_started()
 
             broken = False
             for path, fut in zip(source_files, futures):

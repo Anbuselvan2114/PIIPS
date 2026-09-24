@@ -172,7 +172,12 @@ export default function Dashboard({ user }) {
 
   const onStart = async () => {
     setError(null); setResults([]); setJob(null);
-    try { const { job_id } = await startProcessing(user?.user_id); setRunning(true); poll(job_id); }
+    // Show the bar at once (a "preparing" piece) instead of after the first
+    // poll comes back.
+    setRunning(true);
+    setJob({ status: "running", stage: "Preparing (starting)", total: 1, processed: 0, file_total: 0,
+             percent: 0, segments: [0], started_by_name: user?.username, started_by: user?.user_id });
+    try { const { job_id } = await startProcessing(user?.user_id); poll(job_id); }
     catch (e) { setError(e.message); }
   };
 
@@ -501,12 +506,12 @@ export default function Dashboard({ user }) {
                     {job.started_by_name ? `Started by ${job.started_by_name} · ` : ""}{stageLabel}
                   </span>
                   <span>
-                    {Math.min(job.processed, job.file_total ?? job.total)}/{job.file_total ?? job.total} files
-                    {" · "}{job.processed >= job.total ? "done" : job.processed >= job.total - 1 ? "syncing" : "extracting"}
-                    {" · "}{percent}%
+                    {job.file_total ? `${Math.min(job.processed, job.file_total)}/${job.file_total} files · ` : ""}
+                    {percent}%
                   </span>
                 </div>
-                <SegmentedProgress total={job.total} done={job.processed} segments={job.segments} syncStep />
+                <SegmentedProgress total={job.total} done={job.processed} segments={job.segments}
+                                   kinds={job.segment_kinds} syncStep />
               </div>
             )}
             {error && <div className="alert alert-danger" style={{ marginTop: 12 }}>{error}</div>}

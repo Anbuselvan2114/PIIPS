@@ -45,14 +45,22 @@ sub-versions.
   a single file stay in-process. After a service restart the workers need
   about a minute to finish loading; a run started in that window is just slower. If a worker dies the rest are extracted
   in-process instead of failing the run.
-- **Step-based progress.** A run of N files has N+1 steps - one per file plus
-  a final Service First sync / save step - shown as a bar split into N+1
-  pieces. Every piece is a small 0-100% bar of its own and all look the same:
-  files being extracted in parallel fill side by side (stage-by-stage, with a
-  smooth creep during a scanned page's OCR), and the last piece fills as the
-  Service First sync / save progresses. The Dashboard also lists the files
-  being extracted right now with their own percentages. The run reads 100% and
+- **Step-based progress.** A run of N files has N+2 pieces on the bar: a
+  leading "Preparing" piece (scanning the Input folder, sorting files,
+  loading already-processed invoices and trained templates, starting the
+  workers - the bar and what it is doing show the instant Start is clicked),
+  one piece per file, and a final Service First sync / save piece. Every
+  piece is a small 0-100% bar of its own and all look the same. File pieces
+  are ordered original PDFs first, then scanned, then photographed ones and,
+  inside each group, smallest file first (hover a piece for its name-less
+  position and kind). Files being extracted in parallel fill side by side
+  (stage by stage, with a smooth creep during a scanned page's OCR), and the
+  last piece fills as the sync / save progresses. The run reads 100% and
   "completed" only after the last piece is full.
+- **Faster start.** PaddleOCR is now loaded lazily (a born-digital PDF never
+  needs it) and preloaded in the background by each worker, so workers are
+  ready in about a second instead of ~30 s and born-digital files no longer
+  wait on the OCR engine.
 - **Shared visibility.** Only one process run can exist at a time (a second
   Start gets a clear "already running - started by <user>" message). Every
   signed-in user now sees the live bar: a strip at the top of every screen,

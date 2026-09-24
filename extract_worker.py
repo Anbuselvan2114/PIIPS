@@ -58,4 +58,18 @@ def warm():
     if _engine is None:
         from ocr_engine import OCREngine
         _engine = OCREngine()
+
+        def _load_ocr():
+            # PaddleOCR is loaded lazily (a born-digital page never needs it),
+            # but load it in the background NOW so the first scanned file of a
+            # run doesn't wait ~25 s for it. Same lock the page OCR takes, so
+            # a scan arriving mid-load simply waits for this one load.
+            try:
+                with OCREngine._ocr_lock:
+                    OCREngine.initialize()
+            except Exception:  # noqa: BLE001 - it will be retried on first use
+                pass
+
+        import threading
+        threading.Thread(target=_load_ocr, daemon=True).start()
     return os.getpid()
