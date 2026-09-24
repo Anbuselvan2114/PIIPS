@@ -186,6 +186,10 @@ class ProcessingJob:
                 # what each piece is: -1 preparing, 0 original, 1 scanned,
                 # 2 photo, -2 final sync (tooltips)
                 "segment_kinds": self.segment_kinds(),
+                # how many files are being extracted at this very moment
+                "active_files": sum(
+                    1 for v in self.file_progress.values() if 0 < v < 100
+                ),
                 "current_file": self.current_file,
                 "stage": self.stage,
                 "error": self.error,
@@ -1124,17 +1128,16 @@ class JobManager:
 
         futures = []
         try:
-            # Submit the biggest files first: a scanned/photo PDF (large, OCR
-            # heavy) started last would leave the other workers idle while it
-            # finishes. Results are still consumed in file order below.
-            def _size(path):
-                try:
-                    return os.path.getsize(path)
-                except OSError:
-                    return 0
-
+            # Hand files to the workers in the SAME order the progress bar draws
+            # them: original PDFs first (they finish in milliseconds), then
+            # scanned, then photographed, smallest first inside each group -
+            # so a few slow scans never make the quick originals queue behind
+            # them. (train mode has no such ordering: file order.) Results are
+            # still consumed in file order below.
+            wanted = set(source_files)
+            submit_order = [p for p in job.file_order if p in wanted] or list(source_files)
             by_path = {}
-            for path in sorted(source_files, key=_size, reverse=True):
+            for path in submit_order:
                 fut = pool.submit(extract_worker.extract_one, path, allow_fn(path))
                 fut.add_done_callback(lambda _f, p=path: tick(p))
                 by_path[path] = fut

@@ -5,7 +5,7 @@ import {
   getInvoicesByStatus, getInvoicesByBatch, setInvoiceExcluded,
   getInvoiceFieldCheck,
 } from "./api";
-import { DataTable, Modal, PdfModal, SegmentedProgress } from "./components";
+import { DataTable, Modal, PdfModal, RunBar, runPercent, isPreparing } from "./components";
 
 // Dark categorical palette — one fixed, distinct hue per tbl_status slot
 // (indexed by status_id). Sized past the number of statuses so colours never
@@ -269,9 +269,11 @@ export default function Dashboard({ user }) {
     } finally { setIncludingAll(false); }
   };
 
-  const percent = job?.percent ?? 0;
-  const stageLabel = job
-    ? `${job.stage || "Processing"}${job.current_file ? ` — ${job.current_file}` : ""} …` : "";
+  const percent = runPercent(job);
+  // Several files are extracted at once, so name the count - not one file.
+  const stageLabel = !job ? "" : job.stage === "Extracting"
+    ? `Extracting — ${Math.max(job.active_files || 0, 1)} ${(job.active_files || 0) > 1 ? "files at a time" : "file"} …`
+    : `${job.stage || "Processing"}${job.current_file ? ` — ${job.current_file}` : ""} …`;
 
   // Long, unbroken values (file names, batch names, invoice/vendor text
   // with no spaces to wrap at) would otherwise force the whole table wider
@@ -506,12 +508,11 @@ export default function Dashboard({ user }) {
                     {job.started_by_name ? `Started by ${job.started_by_name} · ` : ""}{stageLabel}
                   </span>
                   <span>
-                    {job.file_total ? `${Math.min(job.processed, job.file_total)}/${job.file_total} files · ` : ""}
+                    {job.file_total && !isPreparing(job) ? `${Math.min(job.processed, job.file_total)}/${job.file_total} files · ` : ""}
                     {percent}%
                   </span>
                 </div>
-                <SegmentedProgress total={job.total} done={job.processed} segments={job.segments}
-                                   kinds={job.segment_kinds} syncStep />
+                <RunBar job={job} />
               </div>
             )}
             {error && <div className="alert alert-danger" style={{ marginTop: 12 }}>{error}</div>}

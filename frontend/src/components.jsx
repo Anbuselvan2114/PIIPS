@@ -298,6 +298,45 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
 // really complete. `done` pieces are filled left to right; with files being
 // extracted in parallel the fill advances as each one finishes. The last
 // piece pulses while its step is running.
+// A run first PREPARES (scanning, sorting files, loading invoices and
+// templates, starting workers) - shown as its own full-width bar that stays at
+// the top - and then extracts: the per-file pieces bar below it.
+export const isPreparing = (job) => (job?.stage || "").startsWith("Preparing");
+export const runPercent = (job) => {
+  if (isPreparing(job)) return job?.segments?.[0] ?? 0;
+  const pieces = (job?.segments || []).slice(1);
+  return pieces.length > 1
+    ? Math.min(99, Math.round(pieces.reduce((s, v) => s + v, 0) / pieces.length))
+    : (job?.percent ?? 0);
+};
+
+export function RunBar({ job }) {
+  // Two stacked bars: the "sorting / preparing" bar stays FIRST (it fills
+  // 0-100% while the run prepares, and stays full), and below it the
+  // processing bar - one piece per file plus the final sync piece.
+  const prepPct = Math.max(0, Math.min(100, job?.segments?.[0] ?? 0));
+  const pieces = (job?.segments || []).slice(1);
+  const kinds = (job?.segment_kinds || []).slice(1);
+  const n = pieces.length;
+  return (
+    <div className="run-bars">
+      <div className="run-bar-caption">
+        <span>Sorting &amp; preparing files</span><span>{prepPct}%</span>
+      </div>
+      <div className="progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={prepPct}>
+        <div className="progress-bar" style={{ width: `${prepPct > 0 ? Math.max(prepPct, 2) : 0}%` }} />
+      </div>
+      <div className="run-bar-caption" style={{ marginTop: 12 }}>
+        <span>Processing files</span>
+        <span>{n > 1 ? `${Math.max(0, n - 1)} files + Service First sync` : ""}</span>
+      </div>
+      {n > 1
+        ? <SegmentedProgress total={n} done={job.processed} segments={pieces} kinds={kinds} syncStep />
+        : <div className="progress"><div className="progress-bar" style={{ width: "0%" }} /></div>}
+    </div>
+  );
+}
+
 export function SegmentedProgress({ total, done, segments, kinds, syncStep = false, failed = false }) {
   const n = Math.max(0, total || 0);
   if (!n) return <div className="progress"><div className="progress-bar" style={{ width: "0%" }} /></div>;
@@ -309,11 +348,10 @@ export function SegmentedProgress({ total, done, segments, kinds, syncStep = fal
   const cells = [];
   for (let i = 0; i < n; i++) {
     const isSync = syncStep && i === n - 1;
-    const isPrep = syncStep && i === 0;
     const p = Math.max(0, Math.min(100, pct(i)));
     const kindName = kinds && kinds.length === n ? ["original PDF", "scanned", "photographed"][kinds[i]] : "";
-    const what = isSync ? "Service First sync & save" : isPrep ? "Preparing"
-      : `File ${i} of ${n - 2}${kindName ? ` (${kindName})` : ""}`;
+    const what = isSync ? "Service First sync & save"
+      : `File ${i + 1} of ${syncStep ? n - 1 : n}${kindName ? ` (${kindName})` : ""}`;
     cells.push(
       <span key={i} className="seg" title={`${what} — ${p}%`}>
         <span className={`seg-fill${failed ? " seg-failed" : ""}`} style={{ width: `${p}%` }} />
@@ -364,10 +402,9 @@ export function JobBanner({ hidden = false }) {
           {job.started_by_name ? ` — started by ${job.started_by_name}` : ""}
           {" · "}{phase}
         </span>
-        <span>{files ? `${Math.min(job.processed, files)}/${files} files · ` : ""}{job.percent}%</span>
+        <span>{files && !isPreparing(job) ? `${Math.min(job.processed, files)}/${files} files · ` : ""}{runPercent(job)}%</span>
       </div>
-      <SegmentedProgress total={job.total} done={job.processed} segments={job.segments}
-                         kinds={job.segment_kinds} syncStep />
+      <RunBar job={job} />
     </div>
   );
 }

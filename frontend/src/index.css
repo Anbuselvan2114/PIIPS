@@ -313,6 +313,7 @@ table.tbl tbody tr:hover { background: var(--surface-2); }
   border-radius: var(--radius-sm, 8px); padding: 10px 14px; margin-bottom: 16px; }
 
 /* one small bar per file (+ one for the final sync step), all identical */
+.run-bar-caption { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 .seg-progress { display: grid; gap: 2px; height: 16px; width: 100%; }
 /* hundreds of pieces: no gaps or rounding - a thin light divider instead */
 .seg-dense .seg { border-radius: 0; box-shadow: inset -1px 0 0 rgba(255, 255, 255, .55); }
