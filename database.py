@@ -39,6 +39,7 @@ STATUS_VALUES = [
     "INITIATED",
     "EXTRACTED",
     "BUYER ORDER NO DOESN'T EXIST",
+    "NAV VENDOR CODE DOESN'T EXIST",
     "SF PROCESSED",
     "PENDING IN SF",
     "DATA MISMATCH",      # renamed from "INCOMPLETE DATA" - see migration below
@@ -257,6 +258,8 @@ def save_grouped(data, batch_name=None, tracker=None):
     filenames = tracker.get("filenames") or []
     formats = tracker.get("formats") or []
     invoice_types = tracker.get("invoice_types") or []
+    page_starts = tracker.get("page_starts") or []
+    page_ends = tracker.get("page_ends") or []
 
     counts = {"tbl_Purchase_Header": 0, "tbl_Purchase_Line": 0, "tbl_Reservation_Entry": 0}
 
@@ -281,6 +284,8 @@ def save_grouped(data, batch_name=None, tracker=None):
         header["_FileName"] = filenames[gid] if gid < len(filenames) else None
         header["_Format"] = formats[gid] if gid < len(formats) else None
         header["_InvoiceType"] = invoice_types[gid] if gid < len(invoice_types) else None
+        header["_PageStart"] = page_starts[gid] if gid < len(page_starts) else None
+        header["_PageEnd"] = page_ends[gid] if gid < len(page_ends) else None
         headers.append(header)
         for line in g["lines"]:
             row = {c: _norm(line.get(c)) for c in pl_cols}
@@ -504,6 +509,91 @@ def apply_manual_buyer_order(header_id, order_no, user_id=None):
 
     # Update the tracker PO / status / IsActive / IsSynced and the header column.
     res = set_buyer_order_no(header_id, order_no, verdict, user_id)
+    return {
+        "file_name": (res or {}).get("file_name", file_name),
+        "new_status": verdict["status"],
+        "is_active": verdict["is_active"],
+        "reason": verdict.get("reason", ""),
+    }
+
+
+def apply_manual_vendor_code(header_id, vendor_code, user_id=None):
+    """Set a manually-entered NAV vendor code on a parked SERVICE invoice
+    (Vendor Code Entry menu).
+    Sample: apply_manual_vendor_code(42, 'V00123', 7)
+
+    SERVICE invoices never call Service First at all (see service_api.py),
+    so unlike apply_manual_buyer_order there is nothing to re-enrich or any
+    reservation to rebuild - filling the code is itself sufficient to clear
+    the park. Reloads the invoice's extracted JSON, writes the code, and
+    updates the tracker status / IsActive so it becomes READY TO LOAD.
+    Returns {file_name, new_status, is_active, reason}, or None if the
+    invoice row is missing."""
+    vendor_code = (vendor_code or "").strip()
+    if not vendor_code:
+        return None
+    ensure_menu_schema()
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT SourceJson, FileName FROM dbo.tbl_Purchase_Tracker "
+            "WHERE Purchase_Header_ID = ?", header_id)
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    json_path, file_name = row[0], row[1]
+
+    data = None
+    if json_path and os.path.isfile(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except (OSError, json.JSONDecodeError):
+            data = None
+    if data is None:
+        return {"file_name": file_name, "new_status": None,
+                "is_active": False, "reason": "Extracted JSON not found"}
+
+    data["Nav_VendorCode"] = vendor_code
+    data["Pay_to_Vendor_No"] = vendor_code
+    try:
+        with open(json_path, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, indent=4, ensure_ascii=False)
+    except OSError:
+        pass
+
+    # Filling the code clears ITS OWN park, but this invoice may still be
+    # missing some other mandatory field entirely unrelated to the code
+    # (e.g. Ship-to Address unreadable on the same poor scan) - re-check
+    # the full mandatory-field set (the same one processor.py's own gate
+    # runs after a normal processing pass) rather than assuming complete,
+    # so a still-incomplete invoice is correctly re-parked at DATA MISMATCH
+    # instead of wrongly promoted straight to READY TO LOAD.
+    import excel_export
+    import template_store
+    output_folder = (config_store.folders(create=False) or {}).get("output", "")
+    static, _ = template_store.static_for_path(output_folder, json_path)
+    data["_static"] = static
+    field_mapping = excel_export.load_mapping()
+    grouped = excel_export.build_rows_grouped([data])
+    group = grouped["groups"][0] if grouped["groups"] else {"header": {}, "lines": [], "reservations": []}
+    header_for_check = dict(group.get("header", {}))
+    header_for_check["InvoiceNo"] = data.get("invoice_no", "")
+    missing = excel_export.missing_required_fields(
+        header_for_check, group.get("lines", []), group.get("reservations", []),
+        field_mapping, invoice_type="SERVICE",
+    )
+    missing_names = sorted({m["field"] for m in missing})
+    if missing_names:
+        verdict = {"status": "DATA MISMATCH", "is_active": False, "is_synced": False,
+                   "reason": "Missing required field(s): " + ", ".join(missing_names)}
+    else:
+        verdict = {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
+    res = set_nav_vendor_code(header_id, vendor_code, verdict, user_id)
     return {
         "file_name": (res or {}).get("file_name", file_name),
         "new_status": verdict["status"],
@@ -1634,6 +1724,21 @@ def _invoice_type_from_source_json(path):
     return parts[i + 2] if len(parts) > i + 2 else ""
 
 
+def _page_from_source_json(path):
+    """Best-effort 1-based page number from a SourceJson filename's "_N"
+    suffix (see processor.py's `suffix = f"_{ctx['group_idx'] + 1}"` at
+    save time) - used only as a LAST-RESORT fallback in _invoice_list when
+    a row predates the real PageStart/PageEnd tracker columns (NULL there).
+    group_idx is a group index, not necessarily a real page number once an
+    invoice can span multiple physical pages (see ocr_engine.py's
+    _merge_group) - a single-invoice file (no suffix) falls back to page 1."""
+    if not path:
+        return 1
+    stem = re.sub(r"\.json$", "", os.path.basename(path), flags=re.IGNORECASE)
+    m = re.search(r"_(\d+)$", stem)
+    return int(m.group(1)) if m else 1
+
+
 def _invoice_list(where_sql, params):
     """One row per tracked invoice matching `where_sql` (a few display columns
     for the dashboard pop-ups)."""
@@ -1647,6 +1752,7 @@ def _invoice_list(where_sql, params):
         gst = "h.[Vendor GST Reg. No.]" if _hdr_col(cur, "Vendor GST Reg. No.") else "CAST(NULL AS NVARCHAR(50))"
         ddate = "h.[Document Date]" if _hdr_col(cur, "Document Date") else "CAST(NULL AS NVARCHAR(50))"
         docno = "h.[No.]" if _hdr_col(cur, "No.") else "CAST(NULL AS NVARCHAR(50))"
+        vcode = "h.[Buy-from Vendor No.]" if _hdr_col(cur, "Buy-from Vendor No.") else "CAST(NULL AS NVARCHAR(50))"
         # NOLOCK: pure display (Dashboard pop-ups, Lifecycle page listings) -
         # never gates a write decision itself (advance_status/lifecycle_advance
         # re-check fresh data at submit time), so a dirty/stale read here is
@@ -1654,7 +1760,8 @@ def _invoice_list(where_sql, params):
         sql = (
             "SELECT h.Id, h.InvoiceNo, pt.BatchName, pt.FileName, pt.TemplateFormat, "
             "s.StatusName, pt.IsActive, pt.IsSynced, ISNULL(pt.IsExcluded, 0), "
-            f"{vendor}, {gst}, {ddate}, pt.Id, pt.SourceJson, {docno}, pt.RejectRemark "
+            f"{vendor}, {gst}, {ddate}, pt.Id, pt.SourceJson, {docno}, pt.RejectRemark, "
+            f"pt.PageStart, pt.PageEnd, {vcode} "
             "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
             "JOIN dbo.tbl_Purchase_Header h WITH (NOLOCK) ON h.Id = pt.Purchase_Header_ID "
             "LEFT JOIN dbo.tbl_status s WITH (NOLOCK) ON s.StatusId = pt.StatusID "
@@ -1663,6 +1770,11 @@ def _invoice_list(where_sql, params):
         cur.execute(sql, *params)
         out = []
         for r in cur.fetchall():
+            # PageStart/PageEnd are the real, stored page range (see
+            # ocr_engine.py's _merge_group) - a pre-migration row (both
+            # NULL) falls back to the old filename-suffix guess, best-effort.
+            page_start = r[16] if r[16] is not None else _page_from_source_json(r[13])
+            page_end = r[17] if r[17] is not None else page_start
             out.append({
                 "header_id": r[0], "invoice_no": r[1], "batch": r[2],
                 "file_name": r[3], "format": r[4], "status": r[5],
@@ -1673,8 +1785,17 @@ def _invoice_list(where_sql, params):
                 "doc_date": str(r[11]) if r[11] else "",
                 "tracker_id": r[12],
                 "invoice_type": _invoice_type_from_source_json(r[13]),
+                "page": page_start,
+                "page_start": page_start,
+                "page_end": page_end,
                 "navision_doc_no": r[14] or "",
                 "reject_remark": r[15] or "",
+                # Whatever PIIPS already extracted (possibly blank, possibly
+                # a doubtful best-guess - see vendor_code.py) - Vendor Code
+                # Entry pre-fills its input with this instead of starting
+                # blank, so confirming a value that's already correct is
+                # just Save, not retyping it from scratch.
+                "vendor_code": r[18] or "",
             })
         return out
     finally:
@@ -1730,12 +1851,12 @@ def invoices_by_statuses(status_names, active_only=False):
 # a one-time seed, not read on every request, so a stale key here only
 # matters for a brand new deployment's first run.
 _ROLE_MENU_DEFAULTS = {
-    "admin": ["dashboard", "input", "manual", "buyerorder", "partdescupdate",
+    "admin": ["dashboard", "input", "manual", "buyerorder", "vendorcode", "partdescupdate",
               "load", "post", "complete",
               "configuration", "apiconfig", "template", "createfield", "users"],
-    "user": ["dashboard", "input", "manual", "buyerorder", "partdescupdate", "load"],
+    "user": ["dashboard", "input", "manual", "buyerorder", "vendorcode", "partdescupdate", "load"],
     "accounts": ["dashboard", "input", "manual", "post", "complete"],
-    "viewer": ["dashboard", "input", "buyerorder", "partdescupdate", "load", "post", "complete"],
+    "viewer": ["dashboard", "input", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
 }
 
 
@@ -1969,12 +2090,29 @@ def get_invoice_field_check(header_id):
 
         field_mapping = excel_export.load_mapping()
 
+        # SERVICE invoices never call Service First at all (see processor.py's
+        # own invoice_type == "SERVICE" branch - it skips the SF calls
+        # entirely and goes straight to READY TO LOAD), so none of "No."
+        # (Nav Item No.), "SF Part Description" or the SF-confirmed side of
+        # "HSN/SAC Code" ever has anything to populate them for a SERVICE
+        # line - showing them as "Missing" here would flag a check that was
+        # never actually run as if it failed. Only PART invoices go through
+        # that lookup, so only PART gets these SF-sourced fields at all.
+        cur.execute(
+            "SELECT it.InvoiceTypeName FROM dbo.tbl_Purchase_Tracker pt "
+            "JOIN dbo.tbl_InvoiceType it ON it.InvoiceTypeId = pt.InvoiceTypeID "
+            "WHERE pt.Purchase_Header_ID = ?", header_id,
+        )
+        type_row = cur.fetchone()
+        is_service = ((type_row[0] if type_row else "") or "").strip().upper() == "SERVICE"
+
         def field_rows(sheet, names, values):
             rows = []
             for n in names:
                 v = values.get(n)
                 v = "" if v is None else str(v)
-                source = excel_export.field_source(sheet, n, field_mapping)
+                source = excel_export.field_source(
+                    sheet, n, field_mapping, "SERVICE" if is_service else None)
                 # field_source() calls any unmapped column "Template" since
                 # that's where a value for it *would* come from - but if no
                 # static value was actually ever set (this invoice's actual
@@ -2001,6 +2139,17 @@ def get_invoice_field_check(header_id):
                 row_out = {
                     "field": display_field, "value": v, "missing": missing,
                     "source": source,
+                    # SERVICE invoices never call Service First at all (see
+                    # is_service above) - ANY field whose only source is SF
+                    # can never be anything but permanently blank there, so
+                    # a MISSING one shows "Optional" instead of "Missing"
+                    # for every one of them, not just Buyer Order No. Only
+                    # when actually missing - a field that DOES have a
+                    # value (e.g. seeded from the PDF as a fallback even
+                    # though its primary source is SF) still shows "OK",
+                    # not downgraded to "Optional" just because of where it
+                    # would normally have come from.
+                    "optional": is_service and missing and source == "Service First",
                 }
                 # Purchase Line "No." (Nav Item No.) only ever comes from
                 # Service First's GetHSNDetails, keyed on an exact
@@ -2009,7 +2158,8 @@ def get_invoice_field_check(header_id):
                 # didn't recognize this line's description, not some other
                 # data problem. Surfacing the reason directly saves a trip
                 # into the API logs to find out why.
-                if sheet == "Purchase Line" and n == "No." and missing and source == "Service First":
+                if (sheet == "Purchase Line" and n == "No." and missing
+                        and source == "Service First" and not is_service):
                     row_out["reason"] = "Invoice Part Description and SF Part Description are different"
                 rows.append(row_out)
             return rows
@@ -2017,7 +2167,10 @@ def get_invoice_field_check(header_id):
         # REQUIRED_HEADER_FIELDS already ends with "InvoiceNo" - appending
         # it again here used to show it twice in the Fields popup.
         header_wanted = excel_export.REQUIRED_HEADER_FIELDS
-        header_cols = _existing_cols(cur, "tbl_Purchase_Header", header_wanted)
+        optional_address2 = excel_export.OPTIONAL_HEADER_FIELDS
+        header_cols = _existing_cols(
+            cur, "tbl_Purchase_Header",
+            header_wanted + list(optional_address2.values()))
         header_values = {}
         if header_cols:
             cur.execute(
@@ -2105,6 +2258,11 @@ def get_invoice_field_check(header_id):
                 pass
 
         def with_nav_part_description(ln, rows):
+            # SERVICE invoices never call Service First at all (see is_service
+            # above) - there's no SF Part Description to show or compare
+            # against, ever.
+            if is_service:
+                return rows
             # Freight Outward / Courier lines are "Charge (Item)" rows, not
             # "Item" - they're never looked up in GetHSNDetails at all (see
             # service_api._hsn_lookup_items/_apply_hsn_map skipping "_charge"
@@ -2145,10 +2303,15 @@ def get_invoice_field_check(header_id):
             # PDF's own extracted value instead - shown here under the SF
             # field names either way so both line types can be compared
             # against what Service First actually calls them.
-            source = "Service First" if ln.get("Type") == "Item" else "PDF"
+            # SERVICE invoices never call Service First (see is_service
+            # above) - "HSN/SAC Code" there is only ever whatever the PDF
+            # itself printed, with nothing to confirm/blank it, so it's
+            # shown as a plain PDF value and never flagged missing, same as
+            # the Charge-line case below.
+            source = "Service First" if (ln.get("Type") == "Item" and not is_service) else "PDF"
             product_no = str(ln.get("HSN/SAC Code") or "")
             missing = not product_no.strip()
-            if ln.get("Type") == "Item":
+            if ln.get("Type") == "Item" and not is_service:
                 # A blank result only counts as "missing" when the PDF
                 # itself actually had an HSN that SF failed to confirm - if
                 # the PDF never printed one either, there was nothing for SF
@@ -2203,17 +2366,74 @@ def get_invoice_field_check(header_id):
                                            _num_sort_key(rs.get("Entry No."))))
 
         header_rows_out = field_rows("Purchase Header", header_wanted, header_values)
+
+        # Address 2 rows, shown right under their mandatory Address row.
+        # Optional by nature (a short address fits entirely in Address 1),
+        # so blank reads "Optional", never "Missing"; a filled one is "OK".
+        # Display-only - the mandatory-field gate (excel_export.
+        # missing_required_fields) never looks at these.
+        with_address2 = []
+        for row in header_rows_out:
+            with_address2.append(row)
+            addr2 = optional_address2.get(row["field"])
+            if addr2 and addr2 in header_values:
+                v2 = header_values.get(addr2)
+                v2 = "" if v2 is None else str(v2)
+                blank2 = not v2.strip()
+                with_address2.append({
+                    "field": addr2, "value": v2, "missing": blank2,
+                    "source": excel_export.field_source("Purchase Header", addr2, field_mapping),
+                    "optional": blank2,
+                })
+        header_rows_out = with_address2
+        buyer_order_missing = not buyer_order_no.strip()
         buyer_order_row = {
             "field": "Buyer Order No", "value": buyer_order_no,
-            "missing": not buyer_order_no.strip(), "source": "PDF",
+            "missing": buyer_order_missing, "source": "PDF",
+            # SERVICE invoices never carry a Buyer's Order No. at all (see
+            # is_service above) - a blank one there isn't a data problem to
+            # flag, just this invoice type genuinely never having one.
+            # "missing" stays as computed (some callers may still key off
+            # it), but the popup shows "Optional" instead of "Missing" for
+            # this specific, expected case.
+            "optional": is_service and buyer_order_missing,
         }
+        # Vendor Code (Nav_VendorCode / "Buy-from Vendor No.") — mirrors
+        # Buyer Order No above but with the two invoice types swapped: for
+        # PART it's an ordinary Service-First-sourced field, so a blank one
+        # is nothing new to flag here; for SERVICE, which never calls SF at
+        # all, it's the one field hand-written onto the scanned PDF and
+        # required before Load (see processor.py's NAV VENDOR CODE DOESN'T
+        # EXIST status and the Vendor Code Entry menu) - a blank one there
+        # is a genuine, actionable "Missing", not "Optional".
+        vendor_code = ""
+        if _hdr_col(cur, "Buy-from Vendor No."):
+            cur.execute(
+                "SELECT [Buy-from Vendor No.] FROM dbo.tbl_Purchase_Header WITH (NOLOCK) WHERE Id = ?",
+                header_id,
+            )
+            vc_row = cur.fetchone()
+            vendor_code = (vc_row[0] if vc_row else "") or ""
+        vendor_code_missing = not vendor_code.strip()
+        vendor_code_row = {
+            "field": "Vendor Code", "value": vendor_code,
+            "missing": vendor_code_missing,
+            # PART gets it from Service First; SERVICE never calls SF at
+            # all, so its code is instead read straight off the scanned
+            # PDF (see anchor_extract.py's "Vendor Code" label / invoice_
+            # schema.py's vendor_code) - the popup should say so honestly.
+            "source": "PDF" if is_service else "Service First",
+            "optional": (not is_service) and vendor_code_missing,
+        }
+
         # Shown right before InvoiceNo (REQUIRED_HEADER_FIELDS' own last
-        # entry) so the two invoice-identifying fields sit together.
+        # entry) so the invoice-identifying fields sit together.
         invoiceno_idx = next(
             (i for i, r in enumerate(header_rows_out) if r["field"] == "InvoiceNo"), None)
+        extra_rows = [buyer_order_row, vendor_code_row]
         header_rows_out = (
-            header_rows_out[:invoiceno_idx] + [buyer_order_row] + header_rows_out[invoiceno_idx:]
-            if invoiceno_idx is not None else header_rows_out + [buyer_order_row]
+            header_rows_out[:invoiceno_idx] + extra_rows + header_rows_out[invoiceno_idx:]
+            if invoiceno_idx is not None else header_rows_out + extra_rows
         )
 
         return {
@@ -2225,7 +2445,12 @@ def get_invoice_field_check(header_id):
                  # mandatory-field gate) - with_hsn_fields below already
                  # adds this exact same column itself (with the missing-
                  # ness rule refined for a part's PDF-vs-SF comparison), so
-                 # including it here too would show the value twice.
+                 # including it here too would show the value twice. "No."
+                 # (Nav Item No.) is NOT excluded for a SERVICE invoice
+                 # (unlike before) - it only ever comes from Service First,
+                 # which SERVICE never calls, but field_rows' own "optional"
+                 # flag above now shows that honestly as "Optional" rather
+                 # than hiding the row outright.
                  "fields": with_hsn_fields(ln, with_nav_part_description(ln, field_rows(
                      "Purchase Line",
                      [f for f in excel_export.required_fields_for_line_type(ln.get("Type"))
@@ -2296,6 +2521,159 @@ def set_buyer_order_no(header_id, order_no, verdict, user_id=None):
             user_id, header_id)
         conn.commit()
         return {"file_name": file_name, "new_status": status_name}
+    finally:
+        conn.close()
+
+
+def set_nav_vendor_code(header_id, vendor_code, verdict, user_id=None):
+    """Persist a manually-keyed NAV vendor code and the recomputed verdict
+    for one SERVICE invoice (Vendor Code Entry menu).
+    Sample: set_nav_vendor_code(42, 'V00123',
+            {'status': 'READY TO LOAD', 'is_active': True, 'is_synced': False}, 7)
+    Updates the header's "Buy-from Vendor No." AND "Pay-to Vendor No."
+    columns (when present - both always carry the same value, same as
+    Service First writes for PART, see service_api.py's field map) and the
+    tracker's StatusID / IsActive / IsSynced / SyncedDatetime.
+    Returns {file_name, new_status}."""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT FileName FROM dbo.tbl_Purchase_Tracker WHERE Purchase_Header_ID = ?",
+            header_id)
+        row = cur.fetchone()
+        if not row:
+            return None
+        file_name = row[0]
+
+        # Header columns only exist when the field mapping produced them.
+        if _hdr_col(cur, "Buy-from Vendor No."):
+            cur.execute(
+                "UPDATE dbo.tbl_Purchase_Header SET [Buy-from Vendor No.] = ? WHERE Id = ?",
+                vendor_code, header_id)
+        if _hdr_col(cur, "Pay-to Vendor No."):
+            cur.execute(
+                "UPDATE dbo.tbl_Purchase_Header SET [Pay-to Vendor No.] = ? WHERE Id = ?",
+                vendor_code, header_id)
+
+        status_name = (verdict or {}).get("status")
+        is_active = 1 if (verdict or {}).get("is_active") else 0
+        is_synced = 1 if (verdict or {}).get("is_synced") else 0
+
+        cur.execute(
+            "UPDATE dbo.tbl_Purchase_Tracker "
+            "SET StatusID = ISNULL((SELECT StatusId FROM dbo.tbl_status "
+            "                       WHERE StatusName = ?), StatusID), "
+            "    IsActive = ?, IsSynced = ?, "
+            "    SyncedDatetime = CASE WHEN ? = 1 THEN GETDATE() ELSE SyncedDatetime END, "
+            "    LastModifiedById = ?, LastModifiedDatetime = GETDATE() "
+            "WHERE Purchase_Header_ID = ?",
+            status_name, is_active, is_synced, is_synced,
+            user_id, header_id)
+        conn.commit()
+        return {"file_name": file_name, "new_status": status_name}
+    finally:
+        conn.close()
+
+
+def upsert_vendor_master(header_ids):
+    """Record/refresh one vendor-master row per NAV vendor code for the
+    given headers - called from advance_status() only on the transition
+    TO 'LOADED' (see tbl_Vendor_Master's own schema comment for why that
+    point specifically). Reads whatever the header row already has (every
+    field here was itself extracted from the PDF or calculated during
+    processing - never looked up or guessed here), keyed by Nav_VendorCode
+    ("Buy-from Vendor No."); a header with no code at all contributes
+    nothing (nothing to key it by). A vendor code seen again on a later
+    invoice OVERWRITES its row - always the latest extraction, not the
+    first - so a vendor whose name/address reads more completely on a
+    later invoice self-heals instead of being stuck with an earlier,
+    thinner read.
+    Sample: upsert_vendor_master([12, 13])"""
+    ids = [int(h) for h in (header_ids or [])]
+    if not ids:
+        return 0
+
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+
+        def col(name, cast="NVARCHAR(400)"):
+            return f"h.{_q(name)}" if _hdr_col(cur, name) else f"CAST(NULL AS {cast})"
+
+        id_ph = ", ".join("?" for _ in ids)
+        cur.execute(
+            "SELECT h.Id, "
+            f"{col('Buy-from Vendor No.', 'NVARCHAR(50)')}, "
+            f"{col('Buy-from Vendor Name')}, "
+            f"{col('Buy-from Address', 'NVARCHAR(100)')}, "
+            f"{col('Buy-from Address 2', 'NVARCHAR(100)')}, "
+            f"{col('Buy-from Post Code', 'NVARCHAR(20)')}, "
+            f"{col('State', 'NVARCHAR(100)')}, "
+            f"{col('GST Order Address State', 'NVARCHAR(10)')}, "
+            f"{col('Vendor GST Reg. No.', 'NVARCHAR(20)')}, "
+            f"{col('GST Vendor Type', 'NVARCHAR(50)')}, "
+            f"{col('Pay-to Vendor No.', 'NVARCHAR(50)')}, "
+            f"{col('Pay-to Name')}, "
+            f"{col('Pay-to Address', 'NVARCHAR(100)')}, "
+            f"{col('Pay-to Address 2', 'NVARCHAR(100)')}, "
+            f"{col('Pay-to City', 'NVARCHAR(100)')}, "
+            f"{col('Pay-to Post Code', 'NVARCHAR(20)')}, "
+            f"{col('InvoiceNo', 'NVARCHAR(200)')} "
+            "FROM dbo.tbl_Purchase_Header h "
+            f"WHERE h.Id IN ({id_ph})",
+            *ids)
+        rows = cur.fetchall()
+
+        it_col = "it.InvoiceTypeName" if _table_exists(cur, "tbl_InvoiceType") else "NULL"
+        invoice_types = {}
+        if rows:
+            hid_ph = ", ".join("?" for _ in rows)
+            cur.execute(
+                f"SELECT pt.Purchase_Header_ID, {it_col} FROM dbo.tbl_Purchase_Tracker pt "
+                "LEFT JOIN dbo.tbl_InvoiceType it ON it.InvoiceTypeId = pt.InvoiceTypeID "
+                f"WHERE pt.Purchase_Header_ID IN ({hid_ph})",
+                *[r[0] for r in rows])
+            invoice_types = {hid: it for hid, it in cur.fetchall()}
+
+        count = 0
+        for (hid, vcode, name, addr1, addr2, pin, state, state_code, gstin,
+             gst_type, pay_vcode, pay_name, pay_addr1, pay_addr2, pay_city,
+             pay_pin, invoice_no) in rows:
+            vcode = (vcode or "").strip()
+            if not vcode:
+                continue
+            cur.execute(
+                "IF EXISTS (SELECT 1 FROM dbo.tbl_Vendor_Master WHERE Nav_VendorCode = ?) "
+                "UPDATE dbo.tbl_Vendor_Master SET "
+                "    Vendor_Name = ?, Vendor_Address1 = ?, Vendor_Address2 = ?, "
+                "    Vendor_Pincode = ?, Vendor_State = ?, Vendor_State_Code = ?, "
+                "    Vendor_GSTIN = ?, GST_Vendor_Type = ?, Pay_to_Vendor_No = ?, "
+                "    Pay_to_Name = ?, Pay_to_Address1 = ?, Pay_to_Address2 = ?, "
+                "    Pay_to_City = ?, Pay_to_Post_Code = ?, Invoice_Type = ?, "
+                "    Last_Invoice_No = ?, Last_Header_ID = ?, LastModifiedDatetime = GETDATE() "
+                "WHERE Nav_VendorCode = ? "
+                "ELSE "
+                "INSERT INTO dbo.tbl_Vendor_Master "
+                "   (Nav_VendorCode, Vendor_Name, Vendor_Address1, Vendor_Address2, "
+                "    Vendor_Pincode, Vendor_State, Vendor_State_Code, Vendor_GSTIN, "
+                "    GST_Vendor_Type, Pay_to_Vendor_No, Pay_to_Name, Pay_to_Address1, "
+                "    Pay_to_Address2, Pay_to_City, Pay_to_Post_Code, Invoice_Type, "
+                "    Last_Invoice_No, Last_Header_ID, LastModifiedDatetime) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE())",
+                vcode, name, addr1, addr2, pin, state, state_code, gstin,
+                gst_type, pay_vcode, pay_name, pay_addr1, pay_addr2, pay_city,
+                pay_pin, invoice_types.get(hid), invoice_no, hid, vcode,
+                vcode, name, addr1, addr2, pin, state, state_code, gstin,
+                gst_type, pay_vcode, pay_name, pay_addr1, pay_addr2, pay_city,
+                pay_pin, invoice_types.get(hid), invoice_no, hid,
+            )
+            count += 1
+        conn.commit()
+        return count
     finally:
         conn.close()
 
@@ -2383,10 +2761,25 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
             count = cur.rowcount if cur.rowcount is not None else len(files)
 
         conn.commit()
-        return {"count": count, "files": files, "header_ids": qualifying_ids,
-                "duplicate_no": duplicate_no}
     finally:
         conn.close()
+
+    # Record/refresh each qualifying vendor's own details the moment its
+    # invoice actually reaches LOADED (see tbl_Vendor_Master's own schema
+    # comment for why this exact point, not Ready to Load or Completed) -
+    # own connection/transaction, after the tracker update above has
+    # already committed, so a failure here (a vendor-master write is
+    # best-effort reference data) can never roll back or block the real
+    # status advance itself.
+    if to_status == "LOADED" and qualifying_ids:
+        try:
+            upsert_vendor_master(qualifying_ids)
+        except Exception:  # noqa: BLE001 - best-effort, never blocks Load
+            import traceback
+            traceback.print_exc()
+
+    return {"count": count, "files": files, "header_ids": qualifying_ids,
+            "duplicate_no": duplicate_no}
 
 
 def reject_invoice(header_id, remark, user_id=None):
@@ -2776,6 +3169,8 @@ _MENU_TABLE_DDL = [
         IsSynced             BIT NULL,           -- part received in SF (1) or not (0)
         FileName             NVARCHAR(400) NULL,  -- source PDF file name
         TemplateFormat       NVARCHAR(100) NULL,  -- matched format / template name
+        PageStart            INT NULL,  -- 1-based inclusive range of the source
+        PageEnd              INT NULL,  -- PDF's own pages this invoice came from
         InvoiceTypeID        INT NULL
             CONSTRAINT FK_Purchase_Tracker_InvoiceType REFERENCES tbl_InvoiceType(InvoiceTypeId),
         CreatedById          INT NULL,
@@ -2877,6 +3272,43 @@ _MENU_TABLE_DDL = [
         RoleName NVARCHAR(50) NOT NULL,
         MenuKey  NVARCHAR(50) NOT NULL,
         CONSTRAINT UQ_RoleMenu UNIQUE (RoleName, MenuKey)
+    )
+    """,
+    # ---- Vendor master (one row per NAV vendor code, kept up to date as
+    # invoices are Loaded) - a reference lookup of every vendor's own
+    # extracted/calculated details, most valuable for SERVICE (which has
+    # no Service First vendor master to fall back on at all) but populated
+    # for PART too for a single consistent source. See
+    # database.upsert_vendor_master, called from advance_status() only on
+    # the READY TO LOAD -> LOADED transition (not Ready to Load itself,
+    # not Completed - a user could still reject a Loaded invoice back out,
+    # but by "Loaded" the extracted data has already passed the mandatory-
+    # field gate, so it's trustworthy enough to record for future
+    # reference without waiting for Post/Complete too).
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'tbl_Vendor_Master')
+    CREATE TABLE tbl_Vendor_Master (
+        Id                   INT IDENTITY(1,1) PRIMARY KEY,
+        Nav_VendorCode       NVARCHAR(50) NOT NULL UNIQUE,
+        Vendor_Name          NVARCHAR(400) NULL,
+        Vendor_Address1      NVARCHAR(100) NULL,
+        Vendor_Address2      NVARCHAR(100) NULL,
+        Vendor_Pincode       NVARCHAR(20) NULL,
+        Vendor_State         NVARCHAR(100) NULL,
+        Vendor_State_Code    NVARCHAR(10) NULL,
+        Vendor_GSTIN         NVARCHAR(20) NULL,
+        GST_Vendor_Type      NVARCHAR(50) NULL,
+        Pay_to_Vendor_No     NVARCHAR(50) NULL,
+        Pay_to_Name          NVARCHAR(400) NULL,
+        Pay_to_Address1      NVARCHAR(100) NULL,
+        Pay_to_Address2      NVARCHAR(100) NULL,
+        Pay_to_City          NVARCHAR(100) NULL,
+        Pay_to_Post_Code     NVARCHAR(20) NULL,
+        Invoice_Type         NVARCHAR(20) NULL,
+        Last_Invoice_No      NVARCHAR(200) NULL,
+        Last_Header_ID       INT NULL,
+        FirstSeenDatetime    DATETIME NOT NULL DEFAULT GETDATE(),
+        LastModifiedDatetime DATETIME NULL
     )
     """,
 ]
@@ -3132,7 +3564,7 @@ _MENU_PROC_DDL = [
                 (Purchase_Header_ID, InitiatedByID, InitiatedDatetime,
                  StartedByID, StartedDatetime, BatchName, StatusID, IsActive,
                  SyncedByID, SyncedDatetime, IsSynced, FileName, TemplateFormat,
-                 InvoiceTypeID, BuyerOrderNo, SourceJson,
+                 InvoiceTypeID, BuyerOrderNo, SourceJson, PageStart, PageEnd,
                  CreatedById, CreatedDatetime, LastModifiedById, LastModifiedDatetime)
             SELECT m.HeaderId, s._InitById, s._InitAt,
                    @StartedByID, @StartedDatetime, s._BatchName,
@@ -3141,7 +3573,7 @@ _MENU_PROC_DDL = [
                    CASE WHEN ISNULL(s._Synced, 0) = 1 THEN GETDATE() ELSE NULL END,
                    ISNULL(s._Synced, 0),
                    s._FileName, s._Format,
-                   it.InvoiceTypeId, s._BuyerOrderNo, s._SourceJson,
+                   it.InvoiceTypeId, s._BuyerOrderNo, s._SourceJson, s._PageStart, s._PageEnd,
                    @StartedByID, GETDATE(), @StartedByID, GETDATE()
             FROM OPENJSON(@Headers)
                  WITH ([_gid] INT '$._gid',
@@ -3155,7 +3587,9 @@ _MENU_PROC_DDL = [
                        [_Format] NVARCHAR(100) '$._Format',
                        [_InvoiceType] NVARCHAR(20) '$._InvoiceType',
                        [_BuyerOrderNo] NVARCHAR(200) '$._BuyerOrderNo',
-                       [_SourceJson] NVARCHAR(1000) '$._SourceJson') s
+                       [_SourceJson] NVARCHAR(1000) '$._SourceJson',
+                       [_PageStart] INT '$._PageStart',
+                       [_PageEnd] INT '$._PageEnd') s
             JOIN #hmap m ON m._gid = s.[_gid]
             LEFT JOIN dbo.tbl_status st
                    ON st.StatusName = ISNULL(s._StatusName, @StatusName)
@@ -3272,7 +3706,8 @@ _MENU_PROC_DDL = [
         INSERT INTO @StaleIds
         SELECT StatusId FROM dbo.tbl_status
          WHERE StatusName IN ('DATA MISMATCH', 'EXCLUDED', 'NEW TEMPLATE',
-                               'BUYER ORDER NO DOESN''T EXIST');
+                               'BUYER ORDER NO DOESN''T EXIST',
+                               'NAV VENDOR CODE DOESN''T EXIST');
         DECLARE @ManuallyUpdatedId INT = (SELECT StatusId FROM dbo.tbl_status WHERE StatusName = 'MANUALLY UPDATED');
         IF NOT EXISTS (SELECT 1 FROM @StaleIds) OR @ManuallyUpdatedId IS NULL
         BEGIN
@@ -4005,6 +4440,12 @@ _RENAME_MIGRATIONS = [
     "IF OBJECT_ID('dbo.tbl_UserType') IS NOT NULL "
     "UPDATE dbo.tbl_UserType SET UserTypeName = 'Super Admin' "
     "WHERE UserTypeName = 'Developer'",
+    # Add the page-range columns to the purchase tracker (which of the
+    # source PDF's own pages each invoice actually came from - see
+    # ocr_engine.py's _merge_group).
+    "IF OBJECT_ID('dbo.tbl_Purchase_Tracker') IS NOT NULL "
+    "AND COL_LENGTH('dbo.tbl_Purchase_Tracker', 'PageStart') IS NULL "
+    "ALTER TABLE dbo.tbl_Purchase_Tracker ADD PageStart INT NULL, PageEnd INT NULL",
 ]
 
 

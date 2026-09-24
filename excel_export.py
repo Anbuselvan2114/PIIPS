@@ -383,6 +383,17 @@ REQUIRED_HEADER_FIELDS = [
     "InvoiceNo",
 ]
 
+# Shown in the Dashboard's Fields popup right under their mandatory
+# counterpart, but NEVER part of the mandatory-field gate: a short address
+# fits entirely in "Address", so a blank "Address 2" is expected and only
+# ever displays as "Optional" (see database.get_invoice_field_check). Keyed
+# by the required field each one follows.
+OPTIONAL_HEADER_FIELDS = {
+    "Pay-to Address": "Pay-to Address 2",
+    "Buy-from Address": "Buy-from Address 2",
+    "Ship-to Address": "Ship-to Address 2",
+}
+
 REQUIRED_LINE_FIELDS = [
     "Line No.", "Type", "Location Code", "Description",
     "Quantity", "Direct Unit Cost", "Line Amount", "TDS Nature of Deduction",
@@ -433,7 +444,7 @@ _SF_HEADER_FIELDS = {
     "Gen_Bus_Posting_Group", "PaymentTermsName",
 }
 _SF_LINE_FIELDS = {
-    "Nav_Item_No", "ProductNo", "PartSpecification", "HSN_Type",
+    "Nav_Item_No", "ProductNo", "PartSpecification",
     "HSN_Percentage_Description", "TaxPercentage", "GST_%", "Nav_Part_Description",
 }
 
@@ -441,8 +452,17 @@ _SF_LINE_FIELDS = {
 # being a plain passthrough of any single source (payment_terms_code/
 # Due_Date combine PaymentTermsName (SF) with a PDF/default fallback through
 # resolve_payment_terms()/add_days_to_date() - neither SF nor PDF alone
-# determines the final value, the app's rule does).
-_SYSTEM_COMPUTED_FIELDS = {"payment_terms_code", "Due_Date"}
+# determines the final value, the app's rule does). HSN_Type is seeded as
+# the literal constant "Goods" for every line (see invoice_schema.py) -
+# service_api._apply_hsn_map CAN overwrite it if Service First's own
+# response happens to carry a different HSN_Type, so it's not a pure
+# constant in the strictest sense, but that override has never actually
+# been observed to fire across the full sample corpus - in practice it's
+# always just "Goods", so "System" is the honest, useful label for what a
+# Dashboard user would see, not "Service First" (which correctly implies
+# "this can be permanently blank without SF" - not true here, it always
+# has a value).
+_SYSTEM_COMPUTED_FIELDS = {"payment_terms_code", "Due_Date", "HSN_Type"}
 
 # Columns whose value is a computed relationship key (see _link_override)
 # rather than a mapped JSON field or template static value — classified by
@@ -467,7 +487,15 @@ _LINK_OVERRIDE_SOURCE = {
 }
 
 
-def field_source(sheet, col, mapping=None):
+# Columns whose value the app derives itself (from the PDF's own stated GST
+# rate) for a SERVICE invoice, in place of the Service First lookup a PART
+# invoice gets them from - "System" like any other computed column, and
+# required (SERVICE never calls Service First, so it can't just be waved
+# through as "Service First-sourced, so blank is fine").
+_SERVICE_SYSTEM_FIELDS = {("Purchase Line", "GST Group Code")}
+
+
+def field_source(sheet, col, mapping=None, invoice_type=None):
     """'Service First' / 'Template' / 'PDF' / 'System' / 'None' — where a
     Purchase Header/Line/Reservation Entry column's value comes from, for
     the Dashboard's Fields drill-down popup and the Template screen.
@@ -485,6 +513,9 @@ def field_source(sheet, col, mapping=None):
     Sample: field_source('Purchase Header', 'Location Code')"""
     if col == "InvoiceNo":
         return "PDF"
+
+    if (invoice_type or "").strip().upper() == "SERVICE" and (sheet, col) in _SERVICE_SYSTEM_FIELDS:
+        return "System"
 
     override_source = _LINK_OVERRIDE_SOURCE.get((sheet, col))
     if override_source:
@@ -525,7 +556,7 @@ def _is_none_source(sheet, col, mapping):
     return field_source(sheet, col, mapping) == "Template"
 
 
-def _line_missing_fields(line, mapping=None):
+def _line_missing_fields(line, mapping=None, invoice_type=None):
     missing = set()
     for f in required_fields_for_line_type(line.get("Type")):
         if not _is_blank(line.get(f)):
@@ -540,11 +571,23 @@ def _line_missing_fields(line, mapping=None):
         # confirm in the first place, so it's not a real data problem.
         if f == "HSN/SAC Code" and _is_blank(line.get("_pdf_hsn")):
             continue
+        # A SERVICE invoice never calls Service First at all (see
+        # processor.py's own invoice_type == "SERVICE" branch - it skips
+        # the SF calls entirely) - so any field whose only source is SF
+        # (e.g. "No." / Nav Item No., keyed on a PO that SERVICE invoices
+        # never carry to begin with) can never be anything but permanently
+        # blank there. Same exemption already applied to the Dashboard's
+        # Fields popup (see database.get_invoice_field_check's is_service),
+        # now applied to the actual verdict gate too so it doesn't keep a
+        # SERVICE invoice parked in DATA MISMATCH forever over a check
+        # that was never actually run.
+        if invoice_type == "SERVICE" and field_source("Purchase Line", f, mapping, invoice_type) == "Service First":
+            continue
         missing.add(f)
     return missing
 
 
-def missing_required_fields(header, lines, reservations=None, mapping=None):
+def missing_required_fields(header, lines, reservations=None, mapping=None, invoice_type=None):
     """{"field", "sheet", "source"} dicts, one per mandatory Purchase
     Header/Line/Reservation Entry column that's empty/null for this
     invoice (the header row, every line item row, and every reservation
@@ -562,17 +605,24 @@ def missing_required_fields(header, lines, reservations=None, mapping=None):
     defaults to none checked — invoices with no reservation rows at all
     (e.g. NON-GRN, which never syncs with Service First) aren't penalized
     for having none. `mapping` is the field mapping (load_mapping()'s
-    result); loaded fresh if not passed in."""
+    result); loaded fresh if not passed in. `invoice_type` - pass "SERVICE"
+    to also exempt any Service-First-sourced field (header or line): a
+    SERVICE invoice never calls SF at all (see processor.py), so a field
+    only SF could ever have filled (e.g. Location Code, Vendor Posting
+    Group, Purchase Line "No.") would otherwise park it in DATA MISMATCH
+    forever over a check that was never actually run for it."""
     mapping = mapping if mapping is not None else load_mapping()
     found = []
     for f in REQUIRED_HEADER_FIELDS:
+        if invoice_type == "SERVICE" and field_source("Purchase Header", f, mapping, invoice_type) == "Service First":
+            continue
         if _is_blank(header.get(f)) and not _is_none_source("Purchase Header", f, mapping):
             found.append({"field": f, "sheet": "Purchase Header",
-                          "source": field_source("Purchase Header", f, mapping)})
+                          "source": field_source("Purchase Header", f, mapping, invoice_type)})
     for line in lines:
-        for f in _line_missing_fields(line, mapping):
+        for f in _line_missing_fields(line, mapping, invoice_type):
             found.append({"field": f, "sheet": "Purchase Line",
-                          "source": field_source("Purchase Line", f, mapping)})
+                          "source": field_source("Purchase Line", f, mapping, invoice_type)})
     for res in (reservations or []):
         for f in REQUIRED_RESERVATION_FIELDS:
             if _is_blank(res.get(f)) and not _is_none_source("Reservation Entry", f, mapping):

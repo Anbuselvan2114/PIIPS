@@ -11,6 +11,7 @@ import Mapping from "./Mapping";
 import Template from "./Template";
 import UserManagement from "./UserManagement";
 import BuyerOrderEntry from "./BuyerOrderEntry";
+import VendorCodeEntry from "./VendorCodeEntry";
 import PartDescriptionUpdate from "./PartDescriptionUpdate";
 import RoleMenuAccess from "./RoleMenuAccess";
 import Lifecycle from "./Lifecycle";
@@ -21,7 +22,7 @@ import MailSettings from "./MailSettings";
 import Announcement from "./Announcement";
 import Manuals from "./Manuals";
 import Publish from "./Publish";
-import { getConfig, getVersion, getRoleMenus } from "./api";
+import { getConfig, getVersion, getRoleMenus, setToken, getToken } from "./api";
 import { MENU } from "./menuConfig";
 
 // Fallback used until /api/role-menus answers (and if it ever fails) - also
@@ -31,18 +32,18 @@ import { MENU } from "./menuConfig";
 // every menu (MENU.map below), enforced here regardless of what the Screen
 // Access menu's own table might ever contain.
 const DEFAULT_ROLE_MENUS = {
-  admin: ["dashboard", "input", "manual", "buyerorder", "partdescupdate",
+  admin: ["dashboard", "input", "manual", "buyerorder", "vendorcode", "partdescupdate",
           "load", "post", "complete",
           "configuration", "apiconfig", "template", "createfield", "users"],
-  // Users process invoices, fix Buyer Order Nos, and Load them.
-  user: ["dashboard", "input", "manual", "buyerorder", "partdescupdate", "load"],
+  // Users process invoices, fix Buyer Order Nos / NAV Vendor Codes, and Load them.
+  user: ["dashboard", "input", "manual", "buyerorder", "vendorcode", "partdescupdate", "load"],
   // Accounts run the downstream Post / Complete steps.
   accounts: ["dashboard", "input", "manual", "post", "complete"],
   // Viewer sees invoice-processing data read-only (every mutating action is
   // blocked server-side too, app.py's _require_not_viewer) but not the
   // Setup/Mapping/Admin screens - those configure the app itself rather
   // than show data, and aren't meant for this role.
-  viewer: ["dashboard", "input", "buyerorder", "partdescupdate", "load", "post", "complete"],
+  viewer: ["dashboard", "input", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
 };
 
 // Load / Post / Complete are one component parameterised by stage.
@@ -55,6 +56,7 @@ const PAGES = {
   training: Training, createfield: CreateField, mapping: Mapping,
   template: Template, users: UserManagement, dbconfig: DatabaseConfig,
   apiconfig: ApiConfiguration, buyerorder: BuyerOrderEntry,
+  vendorcode: VendorCodeEntry,
   partdescupdate: PartDescriptionUpdate,
   load: Load, post: Post, complete: Complete, manual: Manuals,
   publish: Publish, mailsettings: MailSettings, announcement: Announcement,
@@ -69,11 +71,15 @@ const loadUser = () => {
   const params = new URLSearchParams(window.location.search);
   if (params.get("signout") === "1") {
     localStorage.removeItem("piips_user");
+    setToken("");
     params.delete("signout");
     const rest = params.toString();
     window.history.replaceState({}, "", window.location.pathname + (rest ? `?${rest}` : ""));
     return null;
   }
+  // A stored user with no session token (signed in before tokens existed,
+  // or the token was cleared) can't call the API - make them sign in again.
+  if (!getToken()) { localStorage.removeItem("piips_user"); return null; }
   try { return JSON.parse(localStorage.getItem("piips_user")); } catch { return null; }
 };
 
@@ -223,7 +229,7 @@ export default function App() {
         />;
   }
 
-  const logout = () => { localStorage.removeItem("piips_user"); setUser(null); setAuthView("login"); };
+  const logout = () => { localStorage.removeItem("piips_user"); setToken(""); setUser(null); setAuthView("login"); };
 
   // A freshly-created account, or one that just went through Forgot
   // password, must set its own password before doing anything else.

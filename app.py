@@ -3,24 +3,31 @@ from typing import List, Literal, Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import os
 import re
 import shutil
+import traceback
 import uuid
 from datetime import datetime
 from urllib.parse import quote
 
 import config_store
+import security
 from processor import job_manager
 from format_model import FormatModel
 
 ACCEPTED_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 
+# The interactive API docs / OpenAPI schema are switched off: they publish
+# every route (including the admin ones) to anyone who can reach the site.
 app = FastAPI(
     title="Precision Intelligent Invoice Processing Suite",
-    version="2.2.1"
+    version="2.3",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
@@ -32,6 +39,11 @@ app = FastAPI(
 # request body/query, not a cookie/session), so allow_origins=["*"] +
 # allow_credentials=True was a spec-disallowed combination protecting
 # nothing.
+# Token authentication + role/menu authorisation for every /api route (see
+# security.py). Added BEFORE CORS so CORS stays outermost and answers
+# preflights / decorates 401-403 responses itself.
+app.add_middleware(security.AuthMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -197,8 +209,9 @@ class ConfigModel(BaseModel):
 
 def _public_config(cfg):
     """Config safe to send to the browser: never expose the connection
-    string (it carries the DB password). Report only whether one is set."""
-    public = {k: v for k, v in cfg.items() if k != "db_connection"}
+    string (it carries the DB password) or the token-signing secret. Report
+    only whether a connection is set."""
+    public = {k: v for k, v in cfg.items() if k not in ("db_connection", "auth_secret")}
     public["db_configured"] = bool((cfg.get("db_connection") or "").strip())
     return public
 
@@ -776,17 +789,62 @@ def _inline_content_disposition(filename):
 
 
 @app.get("/api/invoices/pdf")
-def invoice_pdf(file: str):
+def invoice_pdf(file: str, page: Optional[int] = None, page_end: Optional[int] = None):
     """Serve an invoice's PDF/image inline (clicking an invoice no./file
     name anywhere in the app opens it in the shared PdfModal viewer, which
     all route through this one endpoint). Located by file name across the
     Folder Path. The real file name is always what gets used if the user
-    downloads/saves it from the viewer - see _inline_content_disposition."""
+    downloads/saves it from the viewer - see _inline_content_disposition.
+
+    `page` (1-based, start of the range) and `page_end` (1-based,
+    inclusive end - defaults to `page` when omitted) are passed whenever
+    the caller knows which of the source PDF's own pages this specific
+    invoice came from (see database._invoice_list's page_start/page_end,
+    stored from ocr_engine.py's _merge_group). A single uploaded PDF can
+    either print more than one invoice (e.g. 2 invoices, 1 per page,
+    sharing one file_name) or one invoice spanning several pages - without
+    this every one of those invoices' rows would open/download the
+    identical full multi-page file starting at page 1, regardless of which
+    invoice was actually clicked, or would only show that invoice's FIRST
+    page and silently drop the rest of a genuine multi-page invoice. When
+    given (and the file is a real multi-page PDF, not a single-page scan/
+    image), that page range is extracted into its own PDF and served
+    instead of the whole file - both viewing and downloading then show/
+    save only that invoice's own pages."""
     path = config_store.find_pdf(file)
     if not path or not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="File not found")
     media = _VIEW_MEDIA.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
     name = os.path.basename(path)
+
+    # No "page > 1" shortcut here: a file with 2+ invoices packed in still
+    # needs page 1 isolated from page 2 onward just as much as any later
+    # page does - skipping extraction specifically for page 1 was the bug
+    # (every OTHER invoice in the file stayed visible/downloadable from
+    # the "page 1" view). Only skips when the file turns out to have just
+    # the one page total, where extracting would just reproduce the same
+    # pages the full-file response already serves.
+    if page and media == "application/pdf":
+        end = page_end if (page_end and page_end >= page) else page
+        try:
+            import fitz  # pymupdf
+            with fitz.open(path) as src:
+                end = min(end, src.page_count)
+                if src.page_count > 1 and 1 <= page <= src.page_count:
+                    extracted = fitz.open()
+                    extracted.insert_pdf(src, from_page=page - 1, to_page=end - 1)
+                    data = extracted.tobytes()
+                    extracted.close()
+                    stem, ext = os.path.splitext(name)
+                    page_label = f"page {page}" if end == page else f"pages {page}-{end}"
+                    page_name = f"{stem} ({page_label}){ext}"
+                    return Response(
+                        content=data, media_type=media,
+                        headers={"content-disposition": _inline_content_disposition(page_name)},
+                    )
+        except Exception:  # noqa: BLE001 - extraction is a nice-to-have; fall through to the full file
+            traceback.print_exc()
+
     return FileResponse(
         path, media_type=media,
         headers={"content-disposition": _inline_content_disposition(name)},
@@ -846,6 +904,18 @@ def invoices_buyer_order_missing():
     try:
         return {"invoices": database.invoices_by_statuses(
             ["BUYER ORDER NO DOESN'T EXIST"])}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/invoices/vendor-code-missing")
+def invoices_vendor_code_missing():
+    """SERVICE invoices parked at 'NAV VENDOR CODE DOESN'T EXIST' (missing
+    from the scanned PDF) for the Vendor Code Entry menu."""
+    import database
+    try:
+        return {"invoices": database.invoices_by_statuses(
+            ["NAV VENDOR CODE DOESN'T EXIST"])}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
@@ -1034,6 +1104,42 @@ def invoices_set_buyer_order(payload: BuyerOrderModel):
             "moved_to": moved}
 
 
+class VendorCodeModel(BaseModel):
+    header_id: int
+    vendor_code: str
+    user_id: Optional[int] = None
+
+
+@app.post("/api/invoices/vendor-code")
+def invoices_set_vendor_code(payload: VendorCodeModel):
+    """Manually set the NAV vendor code on a parked SERVICE invoice. Unlike
+    Buyer Order (which re-runs Service First), SERVICE never calls SF at
+    all, so filling the code is itself sufficient to become READY TO LOAD;
+    the PDF moves to the new status folder."""
+    import database
+    _require_not_viewer(payload.user_id)
+    vendor_code = (payload.vendor_code or "").strip()
+    if not vendor_code:
+        raise HTTPException(status_code=400, detail="Vendor code is required")
+    try:
+        res = database.apply_manual_vendor_code(
+            payload.header_id, vendor_code, payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not res:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    moved = ""
+    if res.get("file_name") and res.get("new_status"):
+        try:
+            moved = config_store.move_pdf_to_status(res["file_name"], res["new_status"])
+        except Exception:  # noqa: BLE001 - file move is best-effort
+            import traceback
+            traceback.print_exc()
+    return {"ok": True, "new_status": res.get("new_status"),
+            "is_active": res.get("is_active"), "reason": res.get("reason", ""),
+            "moved_to": moved}
+
+
 @app.get("/api/role-menus")
 def get_role_menus():
     """Which menu keys each configurable role (admin/user/accounts/viewer)
@@ -1062,7 +1168,9 @@ def save_role_menus(payload: RoleMenusModel):
     import database
     _require_developer(payload.user_id)
     try:
-        return {"mapping": database.save_role_menus(payload.mapping, payload.user_id)}
+        result = {"mapping": database.save_role_menus(payload.mapping, payload.user_id)}
+        security.forget_user()
+        return result
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
@@ -1888,11 +1996,23 @@ def _base_url(request: Request):
     return str(request.base_url).rstrip("/")
 
 
+def _client_ip(request: Request):
+    return (request.client.host if request.client else "") or "unknown"
+
+
 @app.post("/api/login")
-def api_login(payload: LoginModel):
+def api_login(payload: LoginModel, request: Request):
     import database
+    username = (payload.username or "").strip()
+    # Slow password guessing: 10 attempts / 15 min per client + username.
+    throttle_key = f"login:{_client_ip(request)}:{username.lower()}"
+    if security.throttled(throttle_key, 10, 15 * 60):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many sign-in attempts. Please wait a few minutes and try again.",
+        )
     try:
-        user = database.authenticate((payload.username or "").strip(), payload.password or "")
+        user = database.authenticate(username, payload.password or "")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
     if not user:
@@ -1900,7 +2020,8 @@ def api_login(payload: LoginModel):
             status_code=401,
             detail="Invalid username or password, or the account is inactive.",
         )
-    return user
+    security.clear_attempts(throttle_key)
+    return {**user, "token": security.issue_token(user["user_id"])}
 
 
 @app.post("/api/forgot-password")
@@ -1916,6 +2037,14 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
     generic = {"ok": True, "message": "If that account exists, a new password has been emailed to it."}
     if not name_or_email:
         return generic
+    # Nobody may keep resetting (and mailing) other people's passwords:
+    # 5 requests / hour per client, and 3 / hour per target account.
+    if (security.throttled(f"forgot:{_client_ip(request)}", 5, 3600)
+            or security.throttled(f"forgot-target:{name_or_email.lower()}", 3, 3600)):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many password-reset requests. Please try again later.",
+        )
 
     try:
         user = database.get_user_by_email(name_or_email) if "@" in name_or_email \
@@ -2102,6 +2231,7 @@ def api_set_user_active(payload: UserActiveModel, request: Request):
         database.set_user_active(payload.user_id, payload.is_active, payload.modified_by)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    security.forget_user(payload.user_id)
 
     # A Viewer account is set up by a Super Admin directly (no email on
     # file is even required for one - see api_create_user), so there's no
@@ -2229,6 +2359,7 @@ def api_admin_change_user_type(payload: UserChangeTypeModel):
         database.set_user_type(payload.target_user_id, payload.new_user_type_id, payload.user_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    security.forget_user(payload.target_user_id)
 
     return {"ok": True, "user_type_name": types[payload.new_user_type_id]}
 
@@ -2319,6 +2450,7 @@ def api_list_announcements(user_id: Optional[int] = None):
 
 @app.post("/api/announcements")
 def api_create_announcement(
+    request: Request,
     title: str = Form(...),
     body_text: str = Form(""),
     video_url: str = Form(""),
@@ -2333,6 +2465,9 @@ def api_create_announcement(
     or a Super Admin stops it early."""
     import database
 
+    # Multipart forms aren't inspected by the auth middleware - take the
+    # acting user from the verified token instead of the client-sent field.
+    user_id = request.scope["state"]["user_id"]
     _require_developer(user_id)
 
     title = title.strip()

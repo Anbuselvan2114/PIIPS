@@ -513,6 +513,21 @@ class JobManager:
                                 job.source_folder, src_path
                             )
 
+                            # SERVICE never has a genuine Buyer's Order No.
+                            # at all (see the SERVICE branch further down -
+                            # no SF/PO-driven verdict logic runs for it) -
+                            # build_invoice_json still reads whatever text
+                            # happened to match the "Buyer's Order No."
+                            # label/SPRPUR pattern regardless of invoice
+                            # type (it has no type awareness of its own),
+                            # so a PART-style label appearing incidentally
+                            # on a SERVICE vendor's template (or a stray
+                            # OCR misread) can leave a bogus value behind -
+                            # always force it blank here instead.
+                            if invoice_type == "SERVICE":
+                                data["buyer_order_no"] = ""
+                                data["buyer_order_doubtful"] = False
+
                             # ---- BC relationship key (Header/Line/Reservation) ----
                             # PO_Number_Format is resolved live from the
                             # template at download time now (see
@@ -647,8 +662,30 @@ class JobManager:
                                 # SERVICE invoices never carry a Buyer Order
                                 # No. and have no Service First / reservation
                                 # concept — skip the SF calls and the
-                                # PO-driven verdict logic; ready for Load as-is.
-                                verdict = {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
+                                # PO-driven verdict logic. Service First is
+                                # never called for SERVICE, so the NAV vendor
+                                # code has no automatic source either — it's
+                                # hand-written onto the scanned PDF instead
+                                # (see anchor_extract.py's "Vendor Code"
+                                # field) and, like a missing Buyer Order No.
+                                # on a PART invoice, parks the invoice in its
+                                # own manual-entry workflow when absent.
+                                # A garbled handwritten reading (see
+                                # vendor_code.py) is filled in with its best
+                                # guess but flagged doubtful - park it in the
+                                # same review queue as a genuinely missing
+                                # code so a user can confirm it, same as a
+                                # doubtful SPRPUR PO does for PART.
+                                if not str(data.get("Nav_VendorCode") or "").strip():
+                                    verdict = {"status": "NAV VENDOR CODE DOESN'T EXIST",
+                                               "is_active": False, "is_synced": False,
+                                               "reason": "Nav vendor code is empty in pdf"}
+                                elif data.get("vendor_code_doubtful"):
+                                    verdict = {"status": "NAV VENDOR CODE DOESN'T EXIST",
+                                               "is_active": False, "is_synced": False,
+                                               "reason": "Nav vendor code format is doubtful — please verify"}
+                                else:
+                                    verdict = {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
                                 records.append(_finish_group(ctx, verdict))
                             else:
                                 # Don't call Service First per invoice -
@@ -860,12 +897,21 @@ class JobManager:
                 "filenames": [r.get("file") for r in matched],
                 "formats": [r.get("format") for r in matched],
                 "invoice_types": [r.get("_invoice_type") for r in matched],
+                # Which of the source PDF's own physical pages this invoice
+                # came from (see ocr_engine.py's _merge_group /
+                # invoice_schema.py's _page_start/_page_end) - so the PDF
+                # viewer/download shows this invoice's whole span, not just
+                # a single (possibly wrong) page.
+                "page_starts": [(r.get("data") or {}).get("_page_start") for r in matched],
+                "page_ends": [(r.get("data") or {}).get("_page_end") for r in matched],
             }
 
             # Final data-completeness gate, checked for every invoice except
             # BUYER ORDER NO DOESN'T EXIST (that one has its own manual-entry
             # workflow — Buyer Order Entry — and can't have real Reservation
             # Entry data without a PO to look up in SF in the first place),
+            # NAV VENDOR CODE DOESN'T EXIST (same idea for SERVICE — its own
+            # manual-entry workflow, Vendor Code Entry),
             # NEW TEMPLATE (unrecognized format — nothing to check until
             # it's trained), and DUPLICATE (already-processed invoice,
             # parked purely for visibility - its own data completeness is
@@ -897,7 +943,8 @@ class JobManager:
             field_mapping = excel_export.load_mapping()
             for i, group in enumerate(grouped["groups"]):
                 if tracker["statuses"][i] in (
-                    "BUYER ORDER NO DOESN'T EXIST", "NEW TEMPLATE", "DUPLICATE",
+                    "BUYER ORDER NO DOESN'T EXIST", "NAV VENDOR CODE DOESN'T EXIST",
+                    "NEW TEMPLATE", "DUPLICATE",
                 ):
                     continue
                 # InvoiceNo is a mandatory column but lives outside the
@@ -906,7 +953,8 @@ class JobManager:
                 header_for_check = dict(group["header"])
                 header_for_check["InvoiceNo"] = group.get("invoice_no", "")
                 missing = excel_export.missing_required_fields(
-                    header_for_check, group["lines"], group["reservations"], field_mapping
+                    header_for_check, group["lines"], group["reservations"], field_mapping,
+                    invoice_type=matched[i].get("_invoice_type"),
                 )
                 missing_names = sorted({m["field"] for m in missing})
                 pdf_missing = sorted({m["field"] for m in missing if m["source"] == "PDF"})

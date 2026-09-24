@@ -312,11 +312,22 @@ export function Modal({ title, onClose, children, width = 1000 }) {
 }
 
 // PDF/image viewer pop-up (opened by clicking an invoice number).
-export function PdfModal({ file, onClose }) {
+export function PdfModal({ file, page, pageEnd, onClose }) {
+  // A vendor can print more than one invoice in a single PDF (e.g. 2
+  // invoices, 1 per page, all sharing one uploaded file), or one invoice
+  // can itself span several pages - every row for the SAME file_name
+  // otherwise looks identical, so without a page (range) the viewer would
+  // always open at page 1 (and a save/download from it would include
+  // every page, or miss the invoice's own later pages) regardless of
+  // which invoice's row was actually clicked. Passing `page`/`pageEnd`
+  // through to invoicePdfUrl has the backend extract and serve just that
+  // page range instead of the whole file (see app.py's invoice_pdf) - so
+  // both viewing and downloading are already scoped to the right
+  // invoice, no client-side page-jump needed.
   return (
     <Modal title={file} onClose={onClose} width={1100}>
       <div style={{ height: "75vh" }}>
-        <iframe title={file} src={invoicePdfUrl(file)}
+        <iframe title={file} src={invoicePdfUrl(file, page, pageEnd)}
                 style={{ width: "100%", height: "100%", border: "none", borderRadius: 8 }} />
       </div>
     </Modal>

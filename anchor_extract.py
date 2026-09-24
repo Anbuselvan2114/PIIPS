@@ -12,6 +12,7 @@ Returns a dict using the same field keys that invoice_schema.build_invoice_json
 consumes (Invoice No., Dated, Buyer Name, Buyer GSTIN/UIN, ...).
 """
 
+import difflib
 import re
 
 
@@ -23,6 +24,7 @@ RIGHT_FIELDS = {
         "invoice :",  # some vendors label it bare "Invoice :" with no "No."/"No" at all
         "invoice#",  # a vendor template with no space before the "#" - "invoice #" above doesn't substring-match this
         "invno",  # a vendor template glues "Inv" and "No." together with no space - "inv no" above doesn't substring-match this
+        "billing doc. no", "billing doc no",  # HPE's own template labels it "Billing Doc. No." instead of any "Invoice ..." phrase - the fuller phrase (not just "billing doc") is needed so the anchor consumes the WHOLE label including its own trailing "No.", not just "Doc." with "No." left dangling as if it were the value's first word
     ],
     "Dated": ["dated", "invoice date", "date"],
     "Buyer's Order No.": [
@@ -38,6 +40,12 @@ RIGHT_FIELDS = {
     # phrases are specific enough not to collide with that section marker.
     "Buyer Name": ["customer name"],
     "Seller Name": ["vendor name"],
+    # SERVICE invoices never go through Service First, so there is no
+    # automatic source for the NAV vendor code at all - it is instead
+    # hand-written onto the scanned PDF itself (the operational parallel
+    # to a hand-written SPRPUR buyer's order no. on a PART invoice, see
+    # buyer_order.py), so it's read here as an ordinary labelled field.
+    "Vendor Code": ["nav vendor code", "vendor code", "vendor no"],
 }
 
 # Left-column section markers -> which party the following lines describe.
@@ -81,21 +89,76 @@ LABEL_WORDS = [
     # returns that label text itself as the (wrong) Invoice No. value.
     "date",
     "p.o. no", "po no", "buyer's order", "order no", "purchase order",
+    "nav vendor code", "vendor code", "vendor no",
     "reference no", "other references", "mode/terms", "terms of payment",
     "gstin", "uin", "state name", "state code", "hsn", "sac", "description",
     "qty", "quantity", "rate", "amount", "unit", "price", "code", "tax invoice",
+    # A GST-metadata caption ("Document Type Code:INV") that can land left
+    # of an unusually wide page's own divider, gluing onto an unrelated
+    # 2-line letterhead's own 2nd line the same way "TAX INVOICE" glues
+    # onto its 1st (see the Seller Name continuation-merge in _party_pass) -
+    # checked ahead of the bare "code" entry above so it wins the earliest-
+    # position tie-break and the whole caption is stripped, not just "code".
+    "document type",
+    # PAN (Permanent Account Number) is standard GST-invoice metadata,
+    # printed on many vendor letterheads right alongside GSTIN - never
+    # address content, but with no label recognition here it silently
+    # became a trailing Address line (e.g. "...Nehru\nTPMGuru\nPAN No.
+    # AAHCT7371D" for TPM Guru's own letterhead).
+    "pan no", "pan:",
     # Other generic GST document-type titles besides "Tax Invoice" (e.g. a
     # combined invoice/dispatch document) - a document-type label, not a
     # company name, wherever it prints as the page's own top line.
     "commercial invoice", "delivery challan",
+    # A bare "INVOICE" document-title word with no "Tax"/"Commercial"
+    # prefix at all (e.g. a simple non-GST vendor template's own top-right
+    # "INVOICE" banner, sharing a row with the seller's letterhead name on
+    # the left) - same category as "tax invoice" above, just the shorter
+    # form some templates use.
+    "invoice",
     # GST goods invoices print 3 copies captioned "Original"/"Duplicate"/
     # "Triplicate" (for Recipient/Transporter/Supplier respectively) - all
     # 3 are document-copy markers, never company name/address content,
     # wherever they print as the page's own top line. "duplicate" and
     # "triplicate" alone were already here; "original" (not just the
     # "original copy" phrase) was the missing third.
-    "original", "original copy", "duplicate", "triplicate", "contect person",
-    "contact person", "shipping addres", "shipping address", "billing address", "address",
+    #
+    # These 3 are usually printed with their own "for <role>" qualifier
+    # right after ("ORIGINAL FOR RECIPIENT", "DUPLICATE FOR TRANSPORTER",
+    # "TRIPLICATE FOR SUPPLIER") - the combined phrases are listed FIRST so
+    # _label_span's earliest-position tie-break (first match wins a tied
+    # start) strips the whole caption in one pass; without them, only the
+    # bare "original"/"duplicate"/"triplicate" word gets stripped and
+    # leaves the "for <role>" half behind, e.g. "FOR RECIPIENT" wrongly
+    # read as a standalone company name when it happens to fall on the
+    # page's own top line with no genuine letterhead text otherwise
+    # recognized there.
+    "original for recipient", "duplicate for transporter",
+    "triplicate for supplier",
+    "original", "original copy", "duplicate", "triplicate",
+    "contect person",
+    "contact person", "shipping addres", "shipping address", "billing address",
+    # "Shipped From:" / "Ship From:" captions the seller's own block (the
+    # company name follows on the next line) - a label, not a name.
+    "shipped from", "ship from",
+    # A generic small-business invoice template ("Customer Name:"/"Street
+    # Address:"/"City/Prov/Postal:", one field per row) labels its address
+    # lines this way rather than a bare "Address:" - matched here, ahead of
+    # the shorter bare "address" below, so _label_span's earliest-position
+    # rule picks the FULL "street address"/"city/prov/postal" phrase
+    # instead of just the trailing "address" fragment (which would
+    # otherwise treat "Street" as real content preceding a noise suffix,
+    # the opposite of what's actually happening here - "Street Address:"
+    # IS the label, "Street" is not separate content).
+    "street address", "city/prov/postal",
+    # Same template's "Email Address:" row ties with the bare "email"
+    # phrase below at the same starting position (both start at char 0) -
+    # _label_span's earliest-position rule only breaks ties by whichever
+    # phrase it reaches FIRST in this list, so "email address" must be
+    # listed ahead of plain "email"/"e-mail" to win that tie and strip the
+    # whole label instead of leaving a dangling "Address: NA".
+    "email address",
+    "address",
     # A "Seller Details" section caption (a "Buyer Details"/"Bill To"
     # counterpart with no dedicated marker of its own, since Seller is
     # already the default starting section - nothing switches INTO it,
@@ -108,6 +171,12 @@ LABEL_WORDS = [
     # "Seller Details" above (recognized as a label so it isn't taken as
     # the Seller Name itself), just different vendor-template wording.
     "sold by",
+    # A generic "Details Of Receiver :" template labels its own Buyer Name
+    # line "Client name :" rather than any of the Tally-style phrasings
+    # above - without this it glues onto the front of the real name
+    # ("Client name : Precision Techserve Pvt. Ltd" instead of just the
+    # name).
+    "client name",
     "party details", "consignee", "bill to", "ship to", "s.n.", "sl.no",
     "e-mail", "email", "tel", "phone", "msme", "bank", "ifsc", "terms",
     "declaration", "authorised", "authorized", "signatory", "grand total",
@@ -149,7 +218,13 @@ LABEL_WORDS = [
     "irn", "ack no", "ack date",
 ]
 
-GSTIN_RE = re.compile(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9])\b")
+# The 14th character of a GSTIN is always the literal "Z" (a fixed part of
+# the numbering scheme, not vendor-specific data) - "2" is accepted there
+# too since poor handwriting/scan quality OCRs it that way often enough in
+# practice (the same Z<->2 confusion vendor_code.py's own confusion table
+# already tracks for a different field); _gstin_from_text normalizes it
+# back to "Z" in its result either way.
+GSTIN_RE = re.compile(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9][Z2][A-Z0-9])\b")
 DATE_RE = re.compile(r"\d{1,2}[-/][A-Za-z0-9]{2,}[-/]\d{2,4}")
 
 
@@ -170,13 +245,16 @@ def _gstin_from_text(text):
     "GSTIN/UIN  AABCP8005C2ZZ 33")."""
     g = GSTIN_RE.search(text) or GSTIN_RE.search(text.replace(" ", ""))
     if g:
-        return g.group(1)
+        val = g.group(1)
+        return val[:13] + "Z" + val[14:]  # the 14th char is always literal "Z" - see GSTIN_RE's own note
     alnum = re.sub(r"[^A-Z0-9]", "", text.upper()).replace("GSTIN", "").replace("UIN", "")
-    core = re.search(r"[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]", alnum)
+    core = re.search(r"[A-Z]{5}\d{4}[A-Z][A-Z0-9][Z2][A-Z0-9]", alnum)
     if core:
+        val = core.group(0)
+        val = val[:11] + "Z" + val[12:]  # same fixed "Z" position within the 13-char core
         rest = alnum.replace(core.group(0), "")
         st = re.search(r"\d{2}", rest)
-        return (st.group(0) if st else "") + core.group(0)
+        return (st.group(0) if st else "") + val
     return ""
 
 
@@ -202,21 +280,86 @@ def _row_text_with_spans(row):
     return " ".join(parts), spans
 
 
+def _is_garbled_tax_invoice_title(low):
+    """A poor scan's OCR-garbled "Tax Invoice" title banner ("Tax
+    Involco", "Tax Involce") - none of LABEL_WORDS' literal "tax invoice"
+    substring-matches it, so the banner was taken as the seller's own name
+    (pushing the real name down into the address). Only a short line that
+    STARTS with "tax" and is still very close to the real phrase counts, so
+    an ordinary company name is never mistaken for one."""
+    low = low.strip()
+    return (
+        len(low) <= 14
+        and low.startswith("tax")
+        and difflib.SequenceMatcher(None, low, "tax invoice").ratio() >= 0.8
+    )
+
+
+_TITLE_WORDS = {
+    "tax", "invoice", "bill", "of", "supply", "cash", "memo", "challan",
+    "delivery", "cum", "original", "duplicate", "triplicate", "for",
+    "recipient", "transporter", "supplier", "copy", "proforma", "credit",
+    "debit", "note", "e", "and", "the", "retail", "sales", "service",
+}
+_TITLE_ANCHOR_WORDS = {"invoice", "challan", "bill", "memo", "proforma", "note"}
+
+
+def _is_document_title(text):
+    """A line made up ONLY of document-title vocabulary ("Invoice Cum
+    Delivery Challan", "Tax Invoice / Bill of Supply", "Cash Memo") - a
+    title banner, never a company name. Needs at least one strong title
+    word so a name that merely contains "Service" or "Sales" isn't caught."""
+    words = re.findall(r"[a-z]+", (text or "").lower())
+    return (bool(words)
+            and all(w in _TITLE_WORDS for w in words)
+            and any(w in _TITLE_ANCHOR_WORDS for w in words))
+
+
+def _restore_garbled_invoice_label(low):
+    """A poor scan reads the "Invoice" of "Invoice No." as some other
+    seven-letter word ("Involce No.", "InvoIce No.") so the literal "invoice
+    no" phrase never appears. Any 7-letter word right before "no" that is
+    still very close to "invoice" is put back - same length, so every
+    character position later matched against the ORIGINAL row text stays
+    valid."""
+    def fix(m):
+        w = m.group(1)
+        if w != "invoice" and difflib.SequenceMatcher(None, w, "invoice").ratio() >= 0.75:
+            return "invoice" + m.group(2)
+        return m.group(0)
+    return re.sub(r"\b([a-z]{7})(\s+no\b)", fix, low)
+
+
 def _is_label(text):
     low = text.lower()
-    return any(lbl in low for lbl in LABEL_WORDS)
+    return (any(lbl in low for lbl in LABEL_WORDS)
+            or _is_garbled_tax_invoice_title(low)
+            or _is_document_title(low))
 
 
 def _label_span(text):
     """(start, end) of the earliest LABEL_WORDS phrase in `text`
     (case-insensitive), or None if none is present."""
     low = text.lower()
+    # "PIN Code 382424" is part of the ADDRESS, not the bare "code" label
+    # (LABEL_WORDS' own "code" entry) - masked to the same length first so
+    # the positions stay valid, otherwise the row is cut right after "PIN"
+    # and the pincode itself is lost.
+    low = re.sub(r"(\bpin\s*)code\b", lambda m: m.group(1) + "xxxx", low)
     best = None
     for lbl in LABEL_WORDS:
         i = low.find(lbl)
+        # A label found in the MIDDLE of a word ("rate" inside "Corporate",
+        # cutting "Swastik Disa Corporate Park" down to "Corpo") is just
+        # part of that word - keep searching for one that starts a word.
+        while i > 0 and low[i - 1].isalpha() and lbl[0].isalpha():
+            i = low.find(lbl, i + 1)
         if i != -1 and (best is None or i < best[0]):
             best = (i, i + len(lbl))
     return best
+
+
+_ENDS_WITH_CITY_PINCODE_RE = re.compile(r"[A-Za-z]{3,}\s+\d{6}$")
 
 
 def _looks_like_phone_line(text):
@@ -225,7 +368,27 @@ def _looks_like_phone_line(text):
     punctuation rather than real name/address text. A genuine address line
     with a pincode has far more letters than digits, so requiring digits to
     both meet a phone-length minimum AND outnumber letters keeps this from
-    matching normal address text."""
+    matching normal address text - except a SHORT address line that's
+    little more than a building number plus "<City> <6-digit-PIN>" (e.g.
+    "93 Noida 201301") can still tip digits > letters despite genuinely
+    being an address, not a phone number - a bare phone number is never
+    shaped like "<word> <exactly 6 digits>" at its own end, so that shape
+    is excluded regardless of the digit/letter ratio."""
+    if _ENDS_WITH_CITY_PINCODE_RE.search(text.strip()):
+        return False
+    # "Mumbai-400086. Ph.: 25009000" - a city + exactly-6-digit PIN with the
+    # letterhead's phone number trailing on the same line is still an
+    # address line (the phone gets trimmed off later as a label).
+    if re.search(r"[A-Za-z]{3,}[\s\-,.]*(?<!\d)\d{6}(?!\d)", text):
+        return False
+    # A door/plot/survey number ("HO: 17/2/1/286", "1417/38-N") is a string
+    # of short digit groups split by "/" or "-" - a real phone number
+    # always has at least one substantial unbroken run (even a landline's
+    # "044-45015154" has 8, a spaced mobile's groups are 5 each), so a
+    # line whose longest digit run is only 1-3 digits can't be one.
+    runs = re.findall(r"\d+", text)
+    if not runs or max(len(r) for r in runs) < 4:
+        return False
     digits = sum(1 for c in text if c.isdigit())
     letters = sum(1 for c in text if c.isalpha())
     return digits >= 7 and digits > letters
@@ -289,11 +452,33 @@ def _anchor_glued_value(anchor_word, offset):
     return _clean_value(text[offset:])
 
 
-def _value_right_or_below(rows, ri, anchor_word, offset):
+_BARE_DATE_RE = re.compile(
+    r"^\s*(\d{1,2})\s*[-/. ]\s*(\d{1,2}|[A-Za-z]{3,9})\s*[-/. ]\s*(\d{4}|\d{2})\s*$"
+)
+_MONTH_ABBRS = {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"}
+
+
+def _is_bare_date(text):
+    """A value that is nothing but a REAL date ("0-Jul-20", "13/08/2026").
+    Day/month ranges are checked so an invoice number that merely has date
+    shape ("26/27/195", "69/26-27") is never mistaken for one."""
+    m = _BARE_DATE_RE.match(text or "")
+    if not m:
+        return False
+    day, mon = m.group(1), m.group(2)
+    if mon.isdigit():
+        return 1 <= int(day) <= 31 and 1 <= int(mon) <= 12
+    return int(day) <= 31 and mon[:3].lower() in _MONTH_ABBRS
+
+
+def _value_right_or_below(rows, ri, anchor_word, offset, reject=None):
     """
     Given the row index and the anchor word that matched, return the value:
     tokens to the right on the same row (minus another label), else tokens in
-    the same column band on the next few rows.
+    the same column band on the next few rows. `reject`, when given, is a
+    predicate a same-row candidate must NOT satisfy to be accepted - it then
+    falls through to the value below instead (an Invoice No. label whose
+    right-hand neighbour is really the DATE column's own value).
     """
 
     row = sorted(rows[ri], key=lambda w: w["x"])
@@ -332,7 +517,7 @@ def _value_right_or_below(rows, ri, anchor_word, offset):
             break
         collected.append(w["text"])
     right_text = _clean_value(" ".join(collected))
-    if right_text:
+    if right_text and not (reject and reject(right_text)):
         return right_text
 
     # --- value below, in the same (bounded) column band ---
@@ -349,6 +534,19 @@ def _value_right_or_below(rows, ri, anchor_word, offset):
         cell = [w for w in nrow if band_lo <= w["x"] <= band_hi]
         text = _clean_value(" ".join(w["text"] for w in cell))
         if not text:
+            # Label column and value column printed a full column apart on
+            # staggered rows ("Invoice No. :" one row, its value
+            # "2627PSI26040069" on the NEXT row, out in the value column
+            # 350px to the right, with nothing under the label itself):
+            # a single non-label word just past the band on the very next
+            # row is that value.
+            if nri == ri + 1:
+                far = [w for w in nrow if band_hi < w["x"] <= ax + 700
+                       and w["text"].strip()]
+                if len(far) == 1 and not _is_label(far[0]["text"]):
+                    far_text = _clean_value(far[0]["text"])
+                    if far_text and not (reject and reject(far_text)):
+                        return far_text
             continue
         if _is_label(text):
             break
@@ -630,12 +828,27 @@ def extract(header_rows, footer_rows, page_width):
     three_col = _split_three_column_header(header_rows)
     if three_col is not None:
         marker_ri, bill_rows, ship_rows, detail_rows, bill_x, ship_x = three_col
+        # The marker row itself can carry real content of its own to the
+        # LEFT of the Bill To column - e.g. "Invoice Date : 13/08/2026
+        # Bill to: Ship To :", the date squeezed onto the same row as the
+        # 3-column markers rather than its own line above them. None of
+        # bill_rows/ship_rows/detail_rows cover it (all 3 are narrowed to
+        # their own column's x-range, starting at bill_x or later), and
+        # slicing header_rows[:marker_ri] excludes the marker row entirely
+        # - so without this, that leading text is silently dropped. Kept
+        # as its own row, positioned right where the marker row itself
+        # was, so the ordinary right-field anchor scan below still finds it.
+        marker_leading = [w for w in header_rows[marker_ri] if w["x"] < bill_x]
         # Invoice Details' own words, isolated from Bill To/Ship To, feed
         # the ordinary right-field anchor scan below exactly like a normal
         # single-column layout would - including _merge_wrapped_labels
         # picking up an "Invoice"/"No. :" 2-line wrap that's now a clean,
         # uninterleaved sequence.
-        rows = _merge_wrapped_labels(header_rows[:marker_ri] + _merge_wrapped_values(detail_rows))
+        rows = _merge_wrapped_labels(
+            header_rows[:marker_ri]
+            + ([marker_leading] if marker_leading else [])
+            + _merge_wrapped_values(detail_rows)
+        )
         stacked = None
     else:
         rows = _merge_wrapped_labels(header_rows)
@@ -675,7 +888,7 @@ def extract(header_rows, footer_rows, page_width):
         if not srow:
             continue
         row_text, spans = _row_text_with_spans(row)
-        low = row_text.lower()
+        low = _restore_garbled_invoice_label(row_text.lower())
         # Skip the GST e-Invoice QR-code block (IRN/Ack No./Ack Date) here
         # too, same as the party-block pass below — "Ack Date : Aug 6,
         # 2026, 6:01:00 PM" contains "date" (one of "Dated"'s own RIGHT_
@@ -684,6 +897,26 @@ def extract(header_rows, footer_rows, page_width):
         # Dated row is ever reached.
         if low.startswith(("irn", "ack no", "ack date", "e-invoice")):
             continue
+        # A vendor template that labels the invoice number with a bare "#"
+        # (e.g. "# : 25077") rather than any recognized phrase - unlike
+        # "P.O.#"/"Invoice#" etc. (already matched via their own longer,
+        # unambiguous RIGHT_FIELDS phrases), a standalone "#" is only safe
+        # to treat as this label when it's the row's OWN first character -
+        # a blanket substring match would also fire on "P.O.#" (which
+        # contains "#" too, several characters in) and steal its value
+        # instead of Buyer's Order No.'s.
+        # ...as its own label ("#", "# :", "#: 25077") - never a street/
+        # unit number that merely starts with "#" ("#7087th FLOOR CTC PARK
+        # LANE"), which used to be taken for the label and steal the NEXT
+        # line ("SECUNDERABAD-500003") as the Invoice No.
+        if ("Invoice No." not in fields
+                and (srow[0]["text"].strip() == "#" or re.match(r"^#\s*:", low))):
+            val = _value_right_or_below(rows, ri, srow[0], len(srow[0]["text"]))
+            if val:
+                fields["Invoice No."] = val
+                right_field_rows.add(ri)
+                if srow[0]["x"] < divider:
+                    claimed_rows.add(ri)
         for field, phrases in RIGHT_FIELDS.items():
             if field in fields:
                 continue
@@ -707,8 +940,11 @@ def extract(header_rows, footer_rows, page_width):
                     else:
                         anchor = srow[0]
                         offset = None
-                    val = _value_right_or_below(rows, ri, anchor, offset)
-                    if val:
+                    val = _value_right_or_below(
+                        rows, ri, anchor, offset,
+                        reject=_is_bare_date if field == "Invoice No." else None,
+                    )
+                    if val and not (field == "Invoice No." and _is_bare_date(val)):
                         fields[field] = val
                         right_field_rows.add(ri)
                         if anchor["x"] < divider:
@@ -749,6 +985,23 @@ def extract(header_rows, footer_rows, page_width):
                 fields["Dated"] = m.group(0)
                 break
 
+    # "DT" short-form Date label, glued directly to its value with no space
+    # (e.g. an informal freelancer invoice's own "DT14July.26") - not
+    # joined into RIGHT_FIELDS' "Dated" phrase list above because that's a
+    # plain substring search, and bare "dt" is too easy to false-match
+    # inside ordinary words ("width", "breadth"); matched here instead
+    # with a proper word-boundary regex, scoped to every row (not just
+    # meta_row, since this label's own row may not be the one carrying
+    # "Invoice No.").
+    if "Dated" not in fields:
+        m = re.search(
+            r"\bDT\s*[:\-]?\s*(\d{1,2}\s*[A-Za-z]{3,9}\.?\s*\d{2,4})\b",
+            "\n".join(_row_text(row) for row in rows),
+            re.IGNORECASE,
+        )
+        if m:
+            fields["Dated"] = m.group(1).strip()
+
     # Seller Name fallback: some letterheads put the company's own brand
     # name as the very first line of the page wherever the logo sits
     # (often right-aligned/centered), outside the left-column address
@@ -761,8 +1014,24 @@ def extract(header_rows, footer_rows, page_width):
     # party-block pass below so that pass treats the true first address
     # line as Address, not a second (silently dropped) Name.
     if rows:
-        first_text = _row_text(rows[0])
+        # Prefer the LEFT-of-divider slice of row 0, not the whole
+        # unsliced row: a company name that's genuinely left-aligned (the
+        # common case) can share its row with an unrelated right-side
+        # document-title word ("BABA INFOTECH SOLUTION" ... "INVOICE") that
+        # isn't a recognized label phrase on its own and so wouldn't be
+        # caught by the _is_label check below - using the full row text
+        # would glue that title word onto the real company name. Only
+        # falls back to the full row when the left side is empty, so a
+        # genuinely right/center-aligned letterhead (e.g. Printer World,
+        # where the company name itself sits well past the divider) is
+        # still found.
+        left0 = [w for w in rows[0] if w["x"] < divider]
+        first_text = _row_text(left0) if left0 else _row_text(rows[0])
         if (first_text and not _is_label(first_text)
+                # The slice left of the divider can be just the tail of a
+                # longer title ("Invoice" | "Cum Delivery Challan") - judge
+                # the whole row too.
+                and not _is_document_title(_row_text(rows[0]))
                 and not _looks_like_phone_line(first_text)
                 and not _looks_like_url_line(first_text)
                 and len(first_text.split()) <= 4
@@ -773,6 +1042,27 @@ def extract(header_rows, footer_rows, page_width):
                 # the page's very first line) passes every other check
                 # here and wins the Seller Name outright.
                 and any(c.isalpha() for c in first_text)):
+            # Some 2-line logos stack the company name across rows 0 and 1
+            # (e.g. "Hewlett Packard" / "Enterprise" - the actual two-line
+            # HPE wordmark) - same left-aligned/centered spot, same short
+            # plain-text shape as row 0's own check, so tried again against
+            # row 1 immediately below it. Row 1 stays party-block content
+            # otherwise (a genuine next line of it might be the real
+            # street address instead), so this only actually fires when
+            # BOTH checks pass. Claiming it here (not just appending the
+            # text) keeps the party-block pass below from ALSO treating it
+            # as the first line of Seller Address once "Name" is set.
+            if len(rows) > 1 and 1 not in claimed_rows:
+                left1 = [w for w in rows[1] if w["x"] < divider]
+                second_text = _row_text(left1) if left1 else _row_text(rows[1])
+                if (second_text and not _is_label(second_text)
+                        and not _looks_like_phone_line(second_text)
+                        and not _looks_like_url_line(second_text)
+                        and len(second_text.split()) <= 2
+                        and not any(c.isdigit() for c in second_text)
+                        and any(c.isalpha() for c in second_text)):
+                    first_text = f"{first_text} {second_text}"
+                    claimed_rows.add(1)
             fields.setdefault("Seller Name", first_text)
 
     # ------------------------------------------------------------------
@@ -806,7 +1096,20 @@ def extract(header_rows, footer_rows, page_width):
         pending_switch = None
 
         scan_rows = rows_override if rows_override is not None else rows
+        # A row consumed as the PREVIOUS row's own Name continuation (see
+        # the 2-line-logo merge below) - unlike claimed_rows (which indexes
+        # the real page's own `rows`/`header_rows` and so is only
+        # meaningful when rows_override is None), this indexes whichever
+        # sequence THIS call is actually scanning, so it applies the same
+        # way regardless of rows_override.
+        consumed_as_continuation = set()
+        # x-position of each section's own company/person name row, used
+        # below to recognize logo artwork printed far to the left of the
+        # letterhead's real text column.
+        name_x = {}
         for ri, row in enumerate(scan_rows):
+                if ri in consumed_as_continuation:
+                    continue
                 if rows_override is None and ri in claimed_rows:
                     continue
 
@@ -832,6 +1135,14 @@ def extract(header_rows, footer_rows, page_width):
                 if ri == 0 and section == "Seller":
                     whole = _row_text(row)
                     if not named["Seller"]:
+                        # A row that is nothing but a document title
+                        # ("Invoice Cum Delivery Challan (ORIGINAL FOR
+                        # RECIPIENT)") - skipped outright; stripping just
+                        # the one label phrase it happens to contain would
+                        # leave the rest ("Cum Delivery Challan") behind to
+                        # be taken as the Seller Name.
+                        if whole and _is_document_title(re.sub(r"\([^)]*\)", "", whole)):
+                            continue
                         if whole and _is_label(whole):
                             # The label can sit ENTIRELY in the right half
                             # of this same row (already excluded from
@@ -878,6 +1189,66 @@ def extract(header_rows, footer_rows, page_width):
                     sorted(row, key=lambda w: w["x"]) if rows_override is not None
                     else sorted([w for w in row if w["x"] < divider], key=lambda w: w["x"])
                 )
+                # A company logo's own stylised text (OCR'd as short garbled
+                # fragments - "Sw", "Sureworhs", "info systen") often sits
+                # far to the LEFT of the letterhead's real text column,
+                # sharing rows with genuine address lines, and gets glued
+                # onto the front of them ("Sw HO: 17/2/1/286",
+                # "Sureworhs Bengaluru 560062"). Once this section's own
+                # name row fixed where that column starts, a short word
+                # sitting well left of it is artwork, not address text.
+                # Skipped on a section-marker line, whose caption
+                # ("Consignee (Ship to)") legitimately starts further left.
+                if (rows_override is None and section == "Seller"
+                        and section in name_x and left):
+                    row_low = " ".join(w["text"] for w in left).lower()
+                    if not any(m in row_low for _n, marks in SECTION_MARKERS for m in marks):
+                        # Only a leading run that is short, sits well left
+                        # of the name column AND is set apart from the rest
+                        # of the row by a wide gap - a centered letterhead's
+                        # long line also starts left of a short name line,
+                        # but its words run on contiguously.
+                        k = 0
+                        while (k < len(left)
+                               and left[k]["x"] < name_x[section] - 150
+                               and len(left[k]["text"].strip()) <= 12
+                               and not _is_label(left[k]["text"])):
+                            k += 1
+                        if 0 < k < len(left):
+                            last = left[k - 1]
+                            gap = left[k]["x"] - last.get("right", last["x"] + 60)
+                            if gap >= 40:
+                                left = left[k:]
+                # A lone single LETTER set well apart from the rest of its row
+                # ("R      Flat No.1417/38-N ...") is a stray logo/bullet
+                # artifact, never the start of a real address line - real
+                # single-letter starts ("C-202", "A 12") are glued or close.
+                if rows_override is None and len(left) >= 2:
+                    w0, w1 = left[0], left[1]
+                    t0 = w0["text"].strip()
+                    if (len(t0) == 1 and t0.isalpha()
+                            and w1["x"] - w0.get("right", w0["x"] + 20) >= 25):
+                        left = left[1:]
+                # A right-aligned letterhead whose logo artwork ("TPMGuru")
+                # sits alone left of the divider on the same row as a real
+                # address line ("Place,New Delhi-110019") that starts right
+                # of it: the divider slice keeps only the logo word, losing
+                # the address tail (and its PIN) entirely. Take the row's
+                # right-hand text instead when the left part is just that
+                # short, widely-separated artwork word.
+                logo_rest_used = False
+                if (rows_override is None and section == "Seller" and left
+                        and not any_switch and ri != 0 and ri not in right_field_rows
+                        and len(left) == 1 and len(left[0]["text"].strip()) <= 12
+                        and not _is_label(left[0]["text"])):
+                    rest = sorted([w for w in row if w["x"] >= divider], key=lambda w: w["x"])
+                    rest_text = " ".join(w["text"].strip() for w in rest)
+                    if (rest and re.search(r"[A-Za-z]{3,}", rest_text)
+                            and not _is_label(rest_text)
+                            and re.search(r"\b\d{3}\s?\d{3}\b", rest_text)
+                            and rest[0]["x"] - left[0].get("right", left[0]["x"] + 60) >= 40):
+                        left = rest
+                        logo_rest_used = True
                 if (not left and rows_override is None and section == "Seller"
                         and not any_switch and ri != 0 and ri not in right_field_rows):
                     # Row 0 is deliberately excluded - it already went through
@@ -907,6 +1278,16 @@ def extract(header_rows, footer_rows, page_width):
                     used_letterhead_fallback = True
                 else:
                     used_letterhead_fallback = False
+                # The same stray-letter rule again for a row that only
+                # reached `left` through the letterhead fallback just above
+                # (TPM Guru's "R   Flat No.1417/38-N ..." sits entirely
+                # right of the divider).
+                if used_letterhead_fallback and len(left) >= 2:
+                    w0, w1 = left[0], left[1]
+                    t0 = w0["text"].strip()
+                    if (len(t0) == 1 and t0.isalpha()
+                            and w1["x"] - w0.get("right", w0["x"] + 20) >= 25):
+                        left = left[1:]
                 if not left:
                     continue
                 text = " ".join(w["text"].strip() for w in left).strip()
@@ -933,6 +1314,17 @@ def extract(header_rows, footer_rows, page_width):
                         pos = low.find(m)
                         if pos != -1 and (best_pos is None or pos < best_pos):
                             best_pos, best_name, best_marker = pos, name, m
+                # A Seller-block row can carry the seller's own GSTIN on its
+                # left and the NEXT block's caption further right on the same
+                # line ("GSTIN No. 33AAGCS1406H1ZR   Ship to-"): the GSTIN
+                # belongs to the block being left, not the one starting.
+                if best_name is not None and best_pos and section == "Seller":
+                    lead_gstin = _gstin_from_text(text[:best_pos])
+                    if lead_gstin:
+                        out.setdefault("Seller GSTIN/UIN", lead_gstin)
+                        text = text[best_pos:]
+                        low = text.lower()
+                        best_pos = 0
                 if best_name is not None:
                     section = best_name
                     switched = True
@@ -977,7 +1369,23 @@ def extract(header_rows, footer_rows, page_width):
                     if paren:
                         remainder = remainder[paren.end():].strip(" :,-.")
                     if not remainder or not any(c.isalpha() for c in remainder):
-                        continue
+                        # Nothing usable after the marker - some layouts
+                        # print it the other way round instead, the row's
+                        # real content FIRST and the caption trailing after
+                        # it (e.g. "M/s.Precision Techserve Pvt Ltd., Buyer
+                        # (Bill to)" - the same company's name introducing
+                        # its own "Buyer" caption, not a blank marker-only
+                        # row). Whatever sits before the marker match is
+                        # this new section's own content in that case, not
+                        # the old section's trailing data - the marker
+                        # match itself already means "everything from here
+                        # is the new section", so use it instead of
+                        # discarding the row outright.
+                        before = text[:best_pos].strip(" :,-.")
+                        if before and any(c.isalpha() for c in before):
+                            remainder = before
+                        else:
+                            continue
                     text = remainder
                     low = text.lower()
 
@@ -992,8 +1400,8 @@ def extract(header_rows, footer_rows, page_width):
                 # switched here, so THIS row's own left-side text - which
                 # may still genuinely belong to the OLD section - keeps its
                 # normal classification below.
-                if rows_override is None and not used_letterhead_fallback:
-                    right_only = [w for w in row if w["x"] >= divider]
+                if rows_override is None and not used_letterhead_fallback and not logo_rest_used:
+                    right_only =[w for w in row if w["x"] >= divider]
                     if right_only:
                         right_low = " ".join(w["text"].strip() for w in right_only).strip().lower()
                         for name, marks in _RIGHT_SIDE_SECTION_MARKERS:
@@ -1012,8 +1420,8 @@ def extract(header_rows, footer_rows, page_width):
                 # Seller-block metadata row has (those pair a left LABEL
                 # with a right VALUE, never identical text on both sides).
                 if (rows_override is None and section == "Seller" and named["Seller"]
-                        and not used_letterhead_fallback):
-                    right = sorted([w for w in row if w["x"] >= divider], key=lambda w: w["x"])
+                        and not used_letterhead_fallback and not logo_rest_used):
+                    right =sorted([w for w in row if w["x"] >= divider], key=lambda w: w["x"])
                     right_text = " ".join(w["text"].strip() for w in right).strip()
                     if right_text and re.sub(r"\s+", "", low) == re.sub(r"\s+", "", right_text.lower()):
                         section = "Buyer"
@@ -1098,8 +1506,25 @@ def extract(header_rows, footer_rows, page_width):
                 # content, so nothing after these labels should be kept either.
                 # Same for "Reverse Charge : N" / "Credit Days : 0" — standard
                 # Tally/GST metadata captions, never part of the seller's address.
+                # Same again for PAN (Permanent Account Number) - its value is
+                # its own piece of metadata, not a continuation of the address
+                # the way "Address:123 Main St" glued together would be.
                 if low.startswith(("irn", "ack no", "ack date", "e-invoice",
-                                    "reverse charge", "credit days")):
+                                    "reverse charge", "credit days",
+                                    "pan no", "pan:", "pan ")):
+                    continue
+                # CIN (Corporate Identity Number) - registration metadata,
+                # "CIN: U72200DL2001PTC110044" / "CIN#U72200..." - never address.
+                if re.match(r"cin\s*[:#\-]", low):
+                    continue
+
+                # A multi-page invoice's own "(Page 1 of 3)" pagination
+                # marker, printed on its own line near a corner - never
+                # name/address content, wherever it happens to land relative
+                # to the real letterhead (e.g. it can sit right above the
+                # genuine Seller Name, becoming the wrongly-picked "first
+                # unclaimed line" for that section instead).
+                if re.fullmatch(r"\(?\s*page\s+\d+\s+of\s+\d+\s*\)?", low):
                     continue
 
                 # Skip pure labels / titles / contact lines. A label phrase can
@@ -1116,7 +1541,16 @@ def extract(header_rows, footer_rows, page_width):
                 if span is not None:
                     start, end = span
                     if start == 0:
+                        # "Contact Person.: Mr.Ramesh 9940681023" - a person to
+                        # call, not part of the party's name or address.
+                        if low[start:end] in ("contact person", "contect person"):
+                            continue
                         text = text[end:].lstrip(" :,-.")
+                        # "Shipped From:" (label) sharing its row with the right
+                        # column's "IRN No : <hash>" leaves the IRN line as
+                        # the "remainder" - registration metadata, not a value.
+                        if re.match(r"(?i)(irn|ack)\b", text):
+                            continue
                         # A glued "<label>: <value>" row (nothing before the
                         # label to keep) whose value is a BARE date - e.g. a
                         # redundant "Invoice Date : 24.07.2026" repeated
@@ -1141,6 +1575,30 @@ def extract(header_rows, footer_rows, page_width):
                         continue
                     low = text.lower()
 
+                # The item table's own column captions ("SN | CGST | SGST",
+                # "Qty Rate Amount") can sit in a header row right below the
+                # party block and, once sliced by the divider, leave a line
+                # made of nothing but those caption words - never address
+                # text ("22, 1st Floor, Habibullah Road T.Nagar / CGST SGST").
+                if re.fullmatch(
+                    r"(?i)[\W_]*(?:(?:s\.?\s*n\.?o?|sl\.?|cgst|sgst|igst|utgst|gst|"
+                    r"qty|rate|amt|amount|tax|hsn|sac|item|description|total|%)[\W_]*)+",
+                    text,
+                ):
+                    continue
+
+                # An e-invoice's "IRN No : <hash>" / "Ack No : ..." registration
+                # line is metadata wherever it ends up (here it can be left
+                # over once a "Shipped From:" caption sharing its row is
+                # stripped) - never a party name or address line.
+                if re.match(r"(?i)(irn|ack)\b", text):
+                    continue
+
+                # A bare customer/account code ("Bill To- C000568") captions the
+                # block but is not the company name - the name follows.
+                if not named[section] and re.fullmatch(r"[A-Za-z]{1,3}\d{4,10}", text.strip()):
+                    continue
+
                 # First non-label line = party name; rest = address
                 if not named[section]:
                     if not any(c.isalpha() for c in text):
@@ -1155,7 +1613,81 @@ def extract(header_rows, footer_rows, page_width):
                         continue
                     out.setdefault(f"{section} Name", text)
                     named[section] = True
+                    name_x[section] = left[0]["x"]
+                    # Some 2-line logos stack the company name across two
+                    # consecutive rows (e.g. "Hewlett Packard" / "Enterprise"
+                    # - the actual two-line HPE wordmark, or "Anakage
+                    # Technologies Private" / "Limited"), each independently
+                    # sharing its own row with unrelated right-column
+                    # metadata that happens to also land left of THIS
+                    # page's own (unusually wide) divider - "Document Type
+                    # Code:INV" glued onto "Enterprise" the same way "TAX
+                    # INVOICE" glued onto "Hewlett Packard" above. Peeking at
+                    # the very next row and applying the identical left-
+                    # slice + mid-row-label-truncation this row itself just
+                    # went through catches it - a short, plain, label-free
+                    # result is a name continuation, not the real address
+                    # (which starts on whichever row comes after that).
+                    # Uses consumed_as_continuation (not claimed_rows) to
+                    # skip that row on its own turn below - this runs the
+                    # same way whether or not rows_override is set (a
+                    # 3-column document's own Seller-block scan runs
+                    # THROUGH rows_override too, via _side_by_side_party_rows
+                    # below, so gating this on rows_override is None would
+                    # silently skip every 3-column document).
+                    nxt_ri = ri + 1
+                    if nxt_ri < len(scan_rows) and nxt_ri not in consumed_as_continuation:
+                        nxt_left = sorted(
+                            [w for w in scan_rows[nxt_ri] if w["x"] < divider],
+                            key=lambda w: w["x"],
+                        )
+                        nxt_text = _row_text(nxt_left) if nxt_left else ""
+                        nxt_span = _label_span(nxt_text)
+                        if nxt_span is not None:
+                            nxt_text = nxt_text[:nxt_span[0]].rstrip(" ,;:-") if nxt_span[0] > 0 else ""
+                        if (nxt_text and not _is_label(nxt_text)
+                                and not _looks_like_phone_line(nxt_text)
+                                and not _looks_like_url_line(nxt_text)
+                                and len(nxt_text.split()) <= 2
+                                # A genuine continuation word is a real,
+                                # recognizable word ("Enterprise", "Limited")
+                                # - a bare short fragment (e.g. "JE", an
+                                # unrelated 2-character OCR artifact seen
+                                # sitting on its own line above a Zaco
+                                # invoice's real address) is far more often
+                                # OCR noise than a real word this short.
+                                and len(nxt_text) >= 4
+                                and not any(c.isdigit() for c in nxt_text)
+                                and any(c.isalpha() for c in nxt_text)):
+                            out[f"{section} Name"] = f"{out[f'{section} Name']} {nxt_text}"
+                            consumed_as_continuation.add(nxt_ri)
+                            if rows_override is None:
+                                claimed_rows.add(nxt_ri)
                 else:
+                    # A right/center-aligned letterhead sometimes repeats
+                    # its own name as a small separate logo/watermark line,
+                    # positioned well apart from the real flowing address
+                    # text (e.g. TPM Guru's own "TPMGuru" sitting at the
+                    # page's far left margin while the actual letterhead
+                    # block sits centered well to the right) - never real
+                    # address content, but with nothing else to catch it,
+                    # it silently became a trailing Address line. A genuine
+                    # address line never exactly reproduces (whitespace
+                    # aside) a piece of the company's own already-captured
+                    # Name, so that's the signal used here instead of
+                    # position, which isn't available this far downstream.
+                    name_compact = re.sub(r"\s+", "", out.get(f"{section} Name", "")).lower()
+                    text_compact = re.sub(r"\s+", "", text).lower()
+                    if text_compact and name_compact and text_compact in name_compact:
+                        continue
+                    # A bare 1-2 letter fragment with nothing else on its own
+                    # line (e.g. Zaco's own "JE", sitting alone just above
+                    # its real address - purpose unclear, but too short to
+                    # be genuine address content on its own) - real address
+                    # lines this short only ever appear as PART of a longer
+                    # line, never as the row's entire content.
+                    if len(text) <= 2 and text.isalpha():
+                        continue
                     key = f"{section} Address"
                     out[key] = (out.get(key, "") + "\n" + text).strip() if out.get(key) else text
 
@@ -1220,10 +1752,24 @@ def extract(header_rows, footer_rows, page_width):
         party_fields, any_switch = _party_pass(rows_override=stacked_rows)
     else:
         party_fields, any_switch = _party_pass()
-    if not any_switch and not party_fields.get("Buyer Name") and meta_row is not None:
+    if not any_switch and not party_fields.get("Buyer Address") and meta_row is not None:
         # No textual or structural section marker fired anywhere in this
         # document - retry once, using the invoice-metadata row as the
         # seller/buyer boundary instead.
+        #
+        # Checked against "Buyer Address", not "Buyer Name": a template
+        # whose Buyer Name label also happens to match a RIGHT_FIELDS
+        # phrase (e.g. "Buyer Name": ["customer name"] matching "Customer
+        # Name:") gets that ONE field claimed and set directly in `fields`
+        # by the anchor pass above, entirely independent of whether the
+        # party-block section ever actually switched - _party_pass seeds
+        # its own working copy from `fields`, so party_fields.get("Buyer
+        # Name") comes back truthy even though the switch that would also
+        # capture the Buyer's real Address/GSTIN/State never happened,
+        # silently losing all of it into the Seller's own block instead
+        # (see SHWETMANI ENTERPRISES's "Customer Name:" template). Buyer
+        # Address only ever comes from that switch, never from a
+        # RIGHT_FIELDS anchor, so it's the reliable signal here.
         party_fields, _ = _party_pass(forced_switch_row=meta_row)
     fields.update(party_fields)
 
@@ -1256,7 +1802,57 @@ def extract(header_rows, footer_rows, page_width):
                 break
 
     # "Place of Supply" implies the buyer's state when not stated separately.
+    # ...but only when it doesn't contradict the buyer's OWN GSTIN: a
+    # GSTIN's first two digits ARE its state code, and a vendor's "Place of
+    # Supply" can carry a different state entirely (At Sales-1125: "Jammu
+    # and Kashmir (01)" against a buyer GSTIN starting 33) - the GSTIN
+    # then decides, via the ordinary GSTIN-derived fallback downstream.
     if not fields.get("Buyer State Name") and fields.get("Place of Supply"):
-        fields["Buyer State Name"] = fields["Place of Supply"]
+        pos = fields["Place of Supply"]
+        code = re.search(r"\((\d{2})\)|code\s*:?\s*(\d{2})|\b(\d{2})\s*-", pos, re.IGNORECASE)
+        bg = re.sub(r"[^0-9A-Z]", "", str(fields.get("Buyer GSTIN/UIN") or "").upper())
+        pos_code = next((g for g in code.groups() if g), "") if code else ""
+        if not (pos_code and len(bg) >= 2 and bg[:2].isdigit() and bg[:2] != pos_code):
+            fields["Buyer State Name"] = pos
+
+    _split_embedded_buyer_block(fields)
 
     return fields
+
+
+_PIN_LINE_RE = re.compile(r"\b\d{6}\b")
+
+
+def _split_embedded_buyer_block(fields):
+    """A letterhead-only layout with no "Bill To"/"Buyer" caption at all
+    (Printer World: the seller's centered letterhead, then the buyer's
+    company name and address printed at the left margin below it) leaves
+    the buyer's whole block glued onto the end of the SELLER's address,
+    with nothing left for Buyer Name / Buyer Address. A postal address ends
+    at the line carrying its PIN code, so a SECOND PIN-terminated block
+    after the first one, with no buyer/consignee address found anywhere
+    else, is that missing buyer block. Only ever fires when the seller
+    address holds two PIN codes and no Buyer/Consignee Address exists."""
+    if fields.get("Buyer Address") or fields.get("Consignee Address"):
+        return
+    lines = [ln for ln in (fields.get("Seller Address") or "").split("\n") if ln.strip()]
+    pin_rows = [i for i, ln in enumerate(lines) if _PIN_LINE_RE.search(ln)]
+    if len(pin_rows) < 2:
+        return
+    first = pin_rows[0]
+    # Contact lines trailing the seller's own PIN line ("Email: ...") belong
+    # to the seller, not the buyer block that follows.
+    j = first + 1
+    while j < len(lines) and ("@" in lines[j] or _looks_like_url_line(lines[j])
+                              or _looks_like_phone_line(lines[j])):
+        j += 1
+    tail = lines[j:]
+    if len(tail) < 2:
+        return
+    buyer_name = ""
+    if not any(c.isdigit() for c in tail[0]) and any(c.isalpha() for c in tail[0]):
+        buyer_name, tail = tail[0], tail[1:]
+    fields["Seller Address"] = "\n".join(lines[:j])
+    if buyer_name and not fields.get("Buyer Name"):
+        fields["Buyer Name"] = buyer_name
+    fields["Buyer Address"] = "\n".join(tail)

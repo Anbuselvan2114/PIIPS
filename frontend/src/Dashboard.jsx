@@ -111,6 +111,8 @@ export default function Dashboard({ user }) {
   const [statusCounts, setStatusCounts] = useState([]);
   const [modal, setModal] = useState(null);
   const [fieldModal, setFieldModal] = useState(null);
+  // Which of the Fields popup's three tabs is showing: "header" | "lines" | "reservations".
+  const [fieldTab, setFieldTab] = useState("header");
   const [pdfFile, setPdfFile] = useState(null);
   const pollRef = useRef(null);
 
@@ -184,10 +186,15 @@ export default function Dashboard({ user }) {
 
   const openFieldCheck = async (row) => {
     if (!row.header_id) return;
-    setFieldModal({ title: `Fields — ${row.invoice_no || row.file_name}`, loading: true });
+    const title = `Fields — ${row.invoice_no || row.file_name}${row.invoice_type ? ` (${row.invoice_type})` : ""}`;
+    setFieldTab("header");
+    // A SERVICE invoice never calls Service First, so it never has any
+    // Reservation Entry rows - that tab isn't offered for it at all.
+    const isService = (row.invoice_type || "").trim().toUpperCase() === "SERVICE";
+    setFieldModal({ title, loading: true, isService });
     try {
       const r = await getInvoiceFieldCheck(row.header_id);
-      setFieldModal({ title: `Fields — ${row.invoice_no || row.file_name}`, loading: false, data: r });
+      setFieldModal({ title, loading: false, data: r, isService });
     } catch (e) {
       setFieldModal({ title: "Fields", loading: false, error: e.message });
     }
@@ -256,7 +263,7 @@ export default function Dashboard({ user }) {
   // clickable invoice-number cell (opens the PDF viewer)
   const invoiceCell = (row) => (
     row.file_name ? (
-      <button className="btn-link" onClick={() => setPdfFile(row.file_name)}
+      <button className="btn-link" onClick={() => setPdfFile({ file: row.file_name, page: row.page_start ?? row.page, pageEnd: row.page_end })}
               style={{ background: "none", border: "none", padding: 0, color: "var(--primary)",
                        cursor: "pointer", textDecoration: "underline", font: "inherit",
                        ...wrapCellStyle }}>
@@ -273,8 +280,8 @@ export default function Dashboard({ user }) {
     { key: "missing", label: "Status",
       render: (r) => (
         <div>
-          <span className={`badge ${r.missing ? "badge-warning" : "badge-success"}`}>
-            {r.missing ? "Missing" : "OK"}
+          <span className={`badge ${r.optional ? "badge-muted" : r.missing ? "badge-warning" : "badge-success"}`}>
+            {r.optional ? "Optional" : r.missing ? "Missing" : "OK"}
           </span>
           {r.reason && (
             <div className="hint" style={{ marginTop: 3 }}>{r.reason}</div>
@@ -572,37 +579,65 @@ export default function Dashboard({ user }) {
           {fieldModal.error && <div className="alert alert-danger">{fieldModal.error}</div>}
           {fieldModal.loading ? <div className="empty">Loading…</div> : fieldModal.data && (
             <>
-              <h3 style={{ marginTop: 0 }}>Purchase Header</h3>
-              <DataTable columns={fieldCheckColumns}
-                         rows={fieldModal.data.header.map((f) => ({ ...f, _key: f.field }))}
-                         searchKeys={["field"]} pageSize={50} empty="No header data." />
+              <div className="pills">
+                {[
+                  ["header", "Purchase Header", null],
+                  ["lines", "Purchase Line", fieldModal.data.lines.length],
+                  ...(fieldModal.isService ? [] : [
+                    ["reservations", "Reservation Entry", fieldModal.data.reservations.length],
+                  ]),
+                ].map(([key, label, count]) => (
+                  <div key={key}
+                       className={`pill${fieldTab === key ? " active" : ""}`}
+                       onClick={() => setFieldTab(key)}>
+                    {label}{count != null ? ` (${count})` : ""}
+                  </div>
+                ))}
+              </div>
 
-              {fieldModal.data.lines.map((line, i) => (
-                <div key={`line-${i}`}>
-                  <h3>Purchase Line — {line.label}</h3>
-                  <DataTable columns={fieldCheckColumns}
-                             rows={line.fields.map((f) => ({ ...f, _key: f.field }))}
-                             searchKeys={["field"]} pageSize={50} empty="No line data." />
-                </div>
-              ))}
-              {!fieldModal.data.lines.length && (
-                <p className="hint">No Purchase Line rows saved for this invoice.</p>
+              {fieldTab === "header" && (
+                <DataTable columns={fieldCheckColumns}
+                           rows={fieldModal.data.header.map((f) => ({ ...f, _key: f.field }))}
+                           searchKeys={["field"]} pageSize={50} empty="No header data." />
               )}
 
-              {fieldModal.data.reservations.map((res, i) => (
-                <div key={`res-${i}`}>
-                  <h3>Reservation Entry — {res.label}</h3>
-                  <DataTable columns={fieldCheckColumns}
-                             rows={res.fields.map((f) => ({ ...f, _key: f.field }))}
-                             searchKeys={["field"]} pageSize={50} empty="No reservation data." />
-                </div>
-              ))}
+              {fieldTab === "lines" && (
+                <>
+                  {fieldModal.data.lines.map((line, i) => (
+                    <div key={`line-${i}`}>
+                      <h3 style={i === 0 ? { marginTop: 0 } : undefined}>Purchase Line — {line.label}</h3>
+                      <DataTable columns={fieldCheckColumns}
+                                 rows={line.fields.map((f) => ({ ...f, _key: f.field }))}
+                                 searchKeys={["field"]} pageSize={50} empty="No line data." />
+                    </div>
+                  ))}
+                  {!fieldModal.data.lines.length && (
+                    <p className="hint">No Purchase Line rows saved for this invoice.</p>
+                  )}
+                </>
+              )}
+
+              {fieldTab === "reservations" && !fieldModal.isService && (
+                <>
+                  {fieldModal.data.reservations.map((res, i) => (
+                    <div key={`res-${i}`}>
+                      <h3 style={i === 0 ? { marginTop: 0 } : undefined}>Reservation Entry — {res.label}</h3>
+                      <DataTable columns={fieldCheckColumns}
+                                 rows={res.fields.map((f) => ({ ...f, _key: f.field }))}
+                                 searchKeys={["field"]} pageSize={50} empty="No reservation data." />
+                    </div>
+                  ))}
+                  {!fieldModal.data.reservations.length && (
+                    <p className="hint">No Reservation Entry rows for this invoice.</p>
+                  )}
+                </>
+              )}
             </>
           )}
         </Modal>
       )}
 
-      {pdfFile && <PdfModal file={pdfFile} onClose={() => setPdfFile(null)} />}
+      {pdfFile && <PdfModal file={pdfFile.file} page={pdfFile.page} pageEnd={pdfFile.pageEnd} onClose={() => setPdfFile(null)} />}
     </div>
   );
 }

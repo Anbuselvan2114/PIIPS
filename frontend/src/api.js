@@ -7,6 +7,40 @@
 
 const API_BASE = import.meta?.env?.VITE_API_BASE ?? "";
 
+// Session token issued by /api/login. Every API call sends it as a Bearer
+// header; direct-navigation URLs (PDF iframe, downloads) carry it as
+// ?access_token= since a browser can't attach headers to those.
+const TOKEN_KEY = "piips_token";
+export const getToken = () => {
+  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+};
+export const setToken = (t) => {
+  try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
+};
+export const clearSession = () => {
+  setToken("");
+  try { localStorage.removeItem("piips_user"); } catch { /* ignore */ }
+};
+const authHeaders = () => {
+  const t = getToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+};
+const withToken = (url) => {
+  const t = getToken();
+  return t ? `${url}${url.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(t)}` : url;
+};
+
+// An expired/invalid session (401 while a token was being sent) sends the
+// user back to the sign-in screen instead of leaving a dead page.
+let sessionEnding = false;
+const endSessionIfExpired = (res, sentToken) => {
+  if (res.status === 401 && sentToken && !sessionEnding) {
+    sessionEnding = true;
+    clearSession();
+    window.location.reload();
+  }
+};
+
 // Shared by request() and downloadBatchFile(): pull a clean message out of
 // a non-ok response's {"detail": ...} body (FastAPI's error shape).
 async function errorMessageFor(res) {
@@ -27,8 +61,8 @@ async function request(path, options = {}) {
   let res;
   try {
     res = await fetch(API_BASE + path, {
-      headers: { "Content-Type": "application/json" },
       ...options,
+      headers: { "Content-Type": "application/json", ...authHeaders(), ...(options.headers || {}) },
     });
   } catch {
     // fetch() itself throwing (not the server returning an error status)
@@ -38,6 +72,7 @@ async function request(path, options = {}) {
   }
 
   if (!res.ok) {
+    if (path !== "/api/login") endSessionIfExpired(res, !!getToken());
     const err = new Error(await errorMessageFor(res));
     // Status is attached (not just the message) so a caller can tell a
     // real database/server failure (5xx) apart from a normal rejection
@@ -85,8 +120,11 @@ export const getInvoicesByBatch = (batch) =>
 export const getInvoiceFieldCheck = (headerId) =>
   request(`/api/invoices/${encodeURIComponent(headerId)}/fields`);
 
-export const invoicePdfUrl = (file) =>
-  `${API_BASE}/api/invoices/pdf?file=${encodeURIComponent(file)}`;
+export const invoicePdfUrl = (file, page, pageEnd) =>
+  withToken(
+    `${API_BASE}/api/invoices/pdf?file=${encodeURIComponent(file)}` +
+    (page ? `&page=${encodeURIComponent(page)}` : "") +
+    (pageEnd && pageEnd !== page ? `&page_end=${encodeURIComponent(pageEnd)}` : ""));
 
 export const setInvoiceExcluded = (header_id, exclude, user_id) =>
   request("/api/invoices/exclude", {
@@ -101,6 +139,15 @@ export const setBuyerOrder = (header_id, buyer_order_no, user_id) =>
   request("/api/invoices/buyer-order", {
     method: "POST",
     body: JSON.stringify({ header_id, buyer_order_no, user_id }),
+  });
+
+export const getVendorCodeMissing = () =>
+  request("/api/invoices/vendor-code-missing");
+
+export const setVendorCode = (header_id, vendor_code, user_id) =>
+  request("/api/invoices/vendor-code", {
+    method: "POST",
+    body: JSON.stringify({ header_id, vendor_code, user_id }),
   });
 
 export const getRoleMenus = () => request("/api/role-menus");
@@ -156,7 +203,7 @@ export const startTraining = (user_id) =>
 export const getTrainFiles = () => request("/api/train/files");
 
 export const trainFileUrl = (name) =>
-  `${API_BASE}/api/train/file?name=${encodeURIComponent(name)}`;
+  withToken(`${API_BASE}/api/train/file?name=${encodeURIComponent(name)}`);
 
 export const getActiveJob = (mode) =>
   request(`/api/job/active${mode ? `?mode=${mode}` : ""}`);
@@ -170,13 +217,13 @@ export const getResult = (jobId) =>
 export const getBatches = () => request("/api/batches");
 
 export const manualDownloadUrl = (userId, kind = "user") =>
-  `${API_BASE}/api/manual/download?user_id=${encodeURIComponent(userId)}&kind=${kind}`;
+  withToken(`${API_BASE}/api/manual/download?user_id=${encodeURIComponent(userId)}&kind=${kind}`);
 
 export const batchDownloadUrl = (batch, docNo, entryNo) => {
   let url = `${API_BASE}/api/batches/download?batch=${encodeURIComponent(batch)}`;
   if (docNo) url += `&doc_no=${encodeURIComponent(docNo)}`;
   if (entryNo) url += `&entry_no=${encodeURIComponent(entryNo)}`;
-  return url;
+  return withToken(url);
 };
 
 // A plain <a href> to this URL can't show a clean error - a failed
@@ -186,11 +233,14 @@ export const batchDownloadUrl = (batch, docNo, entryNo) => {
 export const downloadBatchFile = async (batch, docNo, entryNo) => {
   let res;
   try {
-    res = await fetch(batchDownloadUrl(batch, docNo, entryNo));
+    res = await fetch(batchDownloadUrl(batch, docNo, entryNo), { headers: authHeaders() });
   } catch {
     throw new Error("Could not reach the server. Check your connection and try again.");
   }
-  if (!res.ok) throw new Error(await errorMessageFor(res));
+  if (!res.ok) {
+    endSessionIfExpired(res, !!getToken());
+    throw new Error(await errorMessageFor(res));
+  }
 
   const blob = await res.blob();
   const disposition = res.headers.get("Content-Disposition") || "";
@@ -230,11 +280,16 @@ export const deleteTemplate = (key, user_id) =>
     body: JSON.stringify({ key, user_id }),
   });
 
-export const login = (username, password) =>
-  request("/api/login", {
+export const login = async (username, password) => {
+  const user = await request("/api/login", {
     method: "POST",
     body: JSON.stringify({ username, password }),
   });
+  // The token is kept apart from the user record App.jsx persists.
+  const { token, ...rest } = user;
+  setToken(token);
+  return rest;
+};
 
 export const forgotPassword = (username_or_email) =>
   request("/api/forgot-password", {
@@ -299,11 +354,12 @@ export const createAnnouncement = async ({ title, body_text, video_url, end_date
 
   let res;
   try {
-    res = await fetch(API_BASE + "/api/announcements", { method: "POST", body: form });
+    res = await fetch(API_BASE + "/api/announcements", { method: "POST", body: form, headers: authHeaders() });
   } catch {
     throw new Error("Could not reach the server. Check your connection and try again.");
   }
   if (!res.ok) {
+    endSessionIfExpired(res, !!getToken());
     let detail;
     try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
     throw new Error((typeof detail === "string" ? detail : detail?.message) || `Request failed (${res.status})`);
@@ -342,12 +398,14 @@ export const uploadInputFiles = async (fileList, subpath = "", user_id) => {
     res = await fetch(API_BASE + url, {
       method: "POST",
       body: form, // let the browser set the multipart Content-Type/boundary
+      headers: authHeaders(),
     });
   } catch {
     throw new Error("Could not reach the server. Check your connection and try again.");
   }
 
   if (!res.ok) {
+    endSessionIfExpired(res, !!getToken());
     let detail;
     try {
       detail = (await res.json()).detail;
