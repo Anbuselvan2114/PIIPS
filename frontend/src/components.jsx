@@ -298,70 +298,67 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
 // really complete. `done` pieces are filled left to right; with files being
 // extracted in parallel the fill advances as each one finishes. The last
 // piece pulses while its step is running.
-// A run first PREPARES (scanning, sorting files, loading invoices and
-// templates, starting workers) - shown as its own full-width bar that stays at
-// the top - and then extracts: the per-file pieces bar below it.
+// ONE bar for the whole run, split into pieces: a first piece for "Sorting &
+// preparing files" (scanning, sorting original/scanned/photo, loading invoices
+// and templates, starting workers), one piece per file, and a last piece for
+// the Service First sync / save. Every piece is a small 0-100% bar of its own
+// and they all look the same; the first and last just get a wider slot on a
+// long run so their progress is visible next to hundreds of 1-2 px file pieces.
+const EDGE_SHARE = 0.05;                       // each end piece's share of a long bar
 export const isPreparing = (job) => (job?.stage || "").startsWith("Preparing");
-export const runPercent = (job) => {
-  if (isPreparing(job)) return job?.segments?.[0] ?? 0;
-  const pieces = (job?.segments || []).slice(1);
-  return pieces.length > 1
-    ? Math.min(99, Math.round(pieces.reduce((s, v) => s + v, 0) / pieces.length))
-    : (job?.percent ?? 0);
-};
+
+export function runPercent(job) {
+  const segs = job?.segments || [];
+  if (segs.length < 3) return job?.percent ?? 0;
+  const mid = segs.slice(1, -1);
+  const w = segs.length > 22 ? EDGE_SHARE : 1 / segs.length;
+  const avg = mid.reduce((s, v) => s + v, 0) / mid.length;
+  const pct = Math.round(w * segs[0] + (1 - 2 * w) * avg + w * segs[segs.length - 1]);
+  return job?.status === "completed" ? 100 : Math.min(pct, 99);
+}
 
 export function RunBar({ job }) {
-  // Two stacked bars: the "sorting / preparing" bar stays FIRST (it fills
-  // 0-100% while the run prepares, and stays full), and below it the
-  // processing bar - one piece per file plus the final sync piece.
-  const prepPct = Math.max(0, Math.min(100, job?.segments?.[0] ?? 0));
-  const pieces = (job?.segments || []).slice(1);
-  const kinds = (job?.segment_kinds || []).slice(1);
-  const n = pieces.length;
+  const segs = job?.segments || [];
+  const n = segs.length;
   return (
     <div className="run-bars">
-      <div className="run-bar-caption">
-        <span>Sorting &amp; preparing files</span><span>{prepPct}%</span>
-      </div>
-      <div className="progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={prepPct}>
-        <div className="progress-bar" style={{ width: `${prepPct > 0 ? Math.max(prepPct, 2) : 0}%` }} />
-      </div>
-      <div className="run-bar-caption" style={{ marginTop: 12 }}>
-        <span>Processing files</span>
-        <span>{n > 1 ? `${Math.max(0, n - 1)} files + Service First sync` : ""}</span>
-      </div>
-      {n > 1
-        ? <SegmentedProgress total={n} done={job.processed} segments={pieces} kinds={kinds} syncStep />
-        : <div className="progress"><div className="progress-bar" style={{ width: "0%" }} /></div>}
+      {n >= 3
+        ? <SegmentedProgress total={n} done={job.processed} segments={segs}
+                             kinds={job.segment_kinds} syncStep />
+        : <SegmentedProgress total={1} done={0} segments={[segs[0] ?? 0]} syncStep={false} />}
     </div>
   );
 }
 
+// One small bar per piece: 0..100% each. Files extracted in parallel fill side
+// by side; the whole bar fills left to right. Pieces all look identical.
 export function SegmentedProgress({ total, done, segments, kinds, syncStep = false, failed = false }) {
   const n = Math.max(0, total || 0);
   if (!n) return <div className="progress"><div className="progress-bar" style={{ width: "0%" }} /></div>;
-  const filled = Math.min(done || 0, n);
-  // Each piece is a small bar of its own: 0..100% for its file (files being
-  // extracted in parallel fill side by side), the last one for the sync step.
-  // Every piece looks the same - only its fill differs.
-  const pct = (i) => (segments && segments.length === n ? segments[i] : (i < filled ? 100 : 0));
+  const pct = (i) => (segments && segments.length === n ? segments[i] : 0);
   const cells = [];
   for (let i = 0; i < n; i++) {
-    const isSync = syncStep && i === n - 1;
     const p = Math.max(0, Math.min(100, pct(i)));
     const kindName = kinds && kinds.length === n ? ["original PDF", "scanned", "photographed"][kinds[i]] : "";
-    const what = isSync ? "Service First sync & save"
-      : `File ${i + 1} of ${syncStep ? n - 1 : n}${kindName ? ` (${kindName})` : ""}`;
+    const what = !syncStep ? "Sorting & preparing files"
+      : i === 0 ? "Sorting & preparing files"
+      : i === n - 1 ? "Service First sync & save"
+      : `File ${i} of ${n - 2}${kindName ? ` (${kindName})` : ""}`;
     cells.push(
       <span key={i} className="seg" title={`${what} — ${p}%`}>
         <span className={`seg-fill${failed ? " seg-failed" : ""}`} style={{ width: `${p}%` }} />
       </span>
     );
   }
+  const edge = syncStep && n > 22 ? `${EDGE_SHARE * 100}% ` : "";
+  const cols = edge
+    ? `${edge}repeat(${n - 2}, minmax(0, 1fr)) ${edge.trim()}`
+    : `repeat(${n}, minmax(0, 1fr))`;
+  const gap = n > 250 ? 0 : n > 110 ? 1 : 2;
   return (
     <div className={`seg-progress${n > 250 ? " seg-dense" : ""}`}
-         style={{ gridTemplateColumns: `repeat(${n}, minmax(0, 1fr))`, gap: n > 250 ? 0 : n > 110 ? 1 : 2 }}
-         role="progressbar" aria-valuemin={0} aria-valuemax={n} aria-valuenow={filled}>
+         style={{ gridTemplateColumns: cols, gap }}
+         role="progressbar" aria-valuemin={0} aria-valuemax={100}>
       {cells}
     </div>
   );
