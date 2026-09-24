@@ -154,12 +154,6 @@ class ProcessingJob:
                 "percent": self._percent(),
                 # one 0..100 value per piece of the segmented bar
                 "segments": self._segments(),
-                # the files being extracted right now, each with its own %
-                "running_files": [
-                    {"name": os.path.basename(p), "pct": self.file_progress[p]}
-                    for p in self.file_order
-                    if 0 < self.file_progress.get(p, 0) < 100
-                ],
                 "current_file": self.current_file,
                 "stage": self.stage,
                 "error": self.error,

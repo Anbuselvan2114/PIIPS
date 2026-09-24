@@ -507,17 +507,6 @@ export default function Dashboard({ user }) {
                   </span>
                 </div>
                 <SegmentedProgress total={job.total} done={job.processed} segments={job.segments} syncStep />
-                {(job.running_files || []).length > 0 && (
-                  <div className="running-files">
-                    {job.running_files.map((f) => (
-                      <div className="running-file" key={f.name}>
-                        <span className="running-file-name" title={f.name}>{f.name}</span>
-                        <span className="running-file-bar"><span style={{ width: `${f.pct}%` }} /></span>
-                        <span className="running-file-pct">{f.pct}%</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
             )}
             {error && <div className="alert alert-danger" style={{ marginTop: 12 }}>{error}</div>}

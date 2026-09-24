@@ -319,14 +319,6 @@ table.tbl tbody tr:hover { background: var(--surface-2); }
   transition: width .35s ease; }
 .seg-fill.seg-failed { background: var(--danger); }
 
-/* the files being extracted right now, each with its own 0-100% bar */
-.running-files { margin-top: 12px; display: grid; gap: 6px; }
-.running-file { display: grid; grid-template-columns: minmax(120px, 260px) 1fr 44px; align-items: center; gap: 10px;
-  font-size: 12.5px; color: var(--muted); }
-.running-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.running-file-bar { height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
-.running-file-bar > span { display: block; height: 100%; background: var(--primary); transition: width .35s ease; }
-.running-file-pct { text-align: right; font-variant-numeric: tabular-nums; }
 .progress-meta { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
 
 /* ---- dropzone ---- */
