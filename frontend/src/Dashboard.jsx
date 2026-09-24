@@ -5,7 +5,7 @@ import {
   getInvoicesByStatus, getInvoicesByBatch, setInvoiceExcluded,
   getInvoiceFieldCheck,
 } from "./api";
-import { DataTable, Modal, PdfModal } from "./components";
+import { DataTable, Modal, PdfModal, RunBar, runPercent, isPreparing } from "./components";
 
 // Dark categorical palette — one fixed, distinct hue per tbl_status slot
 // (indexed by status_id). Sized past the number of statuses so colours never
@@ -111,8 +111,11 @@ export default function Dashboard({ user }) {
   const [statusCounts, setStatusCounts] = useState([]);
   const [modal, setModal] = useState(null);
   const [fieldModal, setFieldModal] = useState(null);
+  // Which of the Fields popup's three tabs is showing: "header" | "lines" | "reservations".
+  const [fieldTab, setFieldTab] = useState("header");
   const [pdfFile, setPdfFile] = useState(null);
   const pollRef = useRef(null);
+  const polledRef = useRef(null);   // job id whose progress this screen is following
 
   const loadBatches = () =>
     getBatches().then((r) => setBatches(r.batches || [])).catch(() => {});
@@ -131,17 +134,30 @@ export default function Dashboard({ user }) {
       loadBatches();
       loadStatusCounts();
     })();
-    return () => clearInterval(pollRef.current);
+    // Only one process run can exist at a time, and it may have been started
+    // by ANY signed-in user: keep looking for one so everybody sees the same
+    // live bar (and a disabled Start) without reloading the page.
+    const watch = setInterval(async () => {
+      try {
+        const j = await getActiveJob("process", true);
+        if (j && (j.status === "running" || j.status === "pending") && polledRef.current !== j.job_id) {
+          setJob(j); setRunning(true); setError(null); poll(j.job_id);
+        }
+      } catch { /* server busy - try again next tick */ }
+    }, 2500);
+    return () => { clearInterval(pollRef.current); clearInterval(watch); };
   }, []);
 
   const poll = (jobId) => {
     clearInterval(pollRef.current);
+    polledRef.current = jobId;
     pollRef.current = setInterval(async () => {
       try {
-        const s = await getStatus(jobId);
+        const s = await getStatus(jobId, true);
         setJob(s);
         if (s.status === "completed" || s.status === "failed") {
           clearInterval(pollRef.current);
+          polledRef.current = null;
           setRunning(false);
           const full = await getResult(jobId);
           setResults(full.results || []);
@@ -150,13 +166,18 @@ export default function Dashboard({ user }) {
           setJob(null);
           if (s.status === "failed") setError(s.error || "Processing failed");
         }
-      } catch (e) { clearInterval(pollRef.current); setRunning(false); setError(e.message); }
+      } catch (e) { clearInterval(pollRef.current); polledRef.current = null; setRunning(false); setError(e.message); }
     }, 800);
   };
 
   const onStart = async () => {
     setError(null); setResults([]); setJob(null);
-    try { const { job_id } = await startProcessing(user?.user_id); setRunning(true); poll(job_id); }
+    // Show the bar at once (a "preparing" piece) instead of after the first
+    // poll comes back.
+    setRunning(true);
+    setJob({ status: "running", stage: "Preparing (starting)", total: 1, processed: 0, file_total: 0,
+             percent: 0, segments: [0], started_by_name: user?.username, started_by: user?.user_id });
+    try { const { job_id } = await startProcessing(user?.user_id); poll(job_id); }
     catch (e) { setError(e.message); }
   };
 
@@ -184,10 +205,15 @@ export default function Dashboard({ user }) {
 
   const openFieldCheck = async (row) => {
     if (!row.header_id) return;
-    setFieldModal({ title: `Fields — ${row.invoice_no || row.file_name}`, loading: true });
+    const title = `Fields — ${row.invoice_no || row.file_name}${row.invoice_type ? ` (${row.invoice_type})` : ""}`;
+    setFieldTab("header");
+    // A SERVICE invoice never calls Service First, so it never has any
+    // Reservation Entry rows - that tab isn't offered for it at all.
+    const isService = (row.invoice_type || "").trim().toUpperCase() === "SERVICE";
+    setFieldModal({ title, loading: true, isService });
     try {
       const r = await getInvoiceFieldCheck(row.header_id);
-      setFieldModal({ title: `Fields — ${row.invoice_no || row.file_name}`, loading: false, data: r });
+      setFieldModal({ title, loading: false, data: r, isService });
     } catch (e) {
       setFieldModal({ title: "Fields", loading: false, error: e.message });
     }
@@ -243,9 +269,11 @@ export default function Dashboard({ user }) {
     } finally { setIncludingAll(false); }
   };
 
-  const percent = job?.percent ?? 0;
-  const stageLabel = job
-    ? `${job.stage || "Processing"}${job.current_file ? ` — ${job.current_file}` : ""} …` : "";
+  const percent = runPercent(job);
+  // Several files are extracted at once, so name the count - not one file.
+  const stageLabel = !job ? "" : job.stage === "Extracting"
+    ? `Extracting — ${Math.max(job.active_files || 0, 1)} ${(job.active_files || 0) > 1 ? "files at a time" : "file"} …`
+    : `${job.stage || "Processing"}${job.current_file ? ` — ${job.current_file}` : ""} …`;
 
   // Long, unbroken values (file names, batch names, invoice/vendor text
   // with no spaces to wrap at) would otherwise force the whole table wider
@@ -256,7 +284,7 @@ export default function Dashboard({ user }) {
   // clickable invoice-number cell (opens the PDF viewer)
   const invoiceCell = (row) => (
     row.file_name ? (
-      <button className="btn-link" onClick={() => setPdfFile(row.file_name)}
+      <button className="btn-link" onClick={() => setPdfFile({ file: row.file_name, page: row.page_start ?? row.page, pageEnd: row.page_end })}
               style={{ background: "none", border: "none", padding: 0, color: "var(--primary)",
                        cursor: "pointer", textDecoration: "underline", font: "inherit",
                        ...wrapCellStyle }}>
@@ -273,8 +301,8 @@ export default function Dashboard({ user }) {
     { key: "missing", label: "Status",
       render: (r) => (
         <div>
-          <span className={`badge ${r.missing ? "badge-warning" : "badge-success"}`}>
-            {r.missing ? "Missing" : "OK"}
+          <span className={`badge ${r.optional ? "badge-muted" : r.missing ? "badge-warning" : "badge-success"}`}>
+            {r.optional ? "Optional" : r.missing ? "Missing" : "OK"}
           </span>
           {r.reason && (
             <div className="hint" style={{ marginTop: 3 }}>{r.reason}</div>
@@ -464,7 +492,10 @@ export default function Dashboard({ user }) {
               <h3>Process invoices</h3>
               <div style={{ flex: 1 }} />
               <button className="btn btn-primary btn-lg" onClick={onStart} disabled={running}>
-                {running ? "Processing…" : "▶  Start"}
+                {running
+                  ? (job?.started_by_name && job.started_by !== user?.user_id
+                      ? `Processing… (started by ${job.started_by_name})` : "Processing…")
+                  : "▶  Start"}
               </button>
             </div>
             <p className="hint" style={{ margin: 0 }}>
@@ -473,10 +504,15 @@ export default function Dashboard({ user }) {
             {running && job && (
               <div style={{ marginTop: 18 }}>
                 <div className="progress-meta">
-                  <span>{stageLabel}</span>
-                  <span>{job.processed}/{job.total} · {percent}%</span>
+                  <span>
+                    {job.started_by_name ? `Started by ${job.started_by_name} · ` : ""}{stageLabel}
+                  </span>
+                  <span>
+                    {job.file_total && !isPreparing(job) ? `${Math.min(job.processed, job.file_total)}/${job.file_total} files · ` : ""}
+                    {percent}%
+                  </span>
                 </div>
-                <div className="progress"><div className="progress-bar" style={{ width: `${percent}%` }} /></div>
+                <RunBar job={job} />
               </div>
             )}
             {error && <div className="alert alert-danger" style={{ marginTop: 12 }}>{error}</div>}
@@ -572,37 +608,65 @@ export default function Dashboard({ user }) {
           {fieldModal.error && <div className="alert alert-danger">{fieldModal.error}</div>}
           {fieldModal.loading ? <div className="empty">Loading…</div> : fieldModal.data && (
             <>
-              <h3 style={{ marginTop: 0 }}>Purchase Header</h3>
-              <DataTable columns={fieldCheckColumns}
-                         rows={fieldModal.data.header.map((f) => ({ ...f, _key: f.field }))}
-                         searchKeys={["field"]} pageSize={50} empty="No header data." />
+              <div className="pills">
+                {[
+                  ["header", "Purchase Header", null],
+                  ["lines", "Purchase Line", fieldModal.data.lines.length],
+                  ...(fieldModal.isService ? [] : [
+                    ["reservations", "Reservation Entry", fieldModal.data.reservations.length],
+                  ]),
+                ].map(([key, label, count]) => (
+                  <div key={key}
+                       className={`pill${fieldTab === key ? " active" : ""}`}
+                       onClick={() => setFieldTab(key)}>
+                    {label}{count != null ? ` (${count})` : ""}
+                  </div>
+                ))}
+              </div>
 
-              {fieldModal.data.lines.map((line, i) => (
-                <div key={`line-${i}`}>
-                  <h3>Purchase Line — {line.label}</h3>
-                  <DataTable columns={fieldCheckColumns}
-                             rows={line.fields.map((f) => ({ ...f, _key: f.field }))}
-                             searchKeys={["field"]} pageSize={50} empty="No line data." />
-                </div>
-              ))}
-              {!fieldModal.data.lines.length && (
-                <p className="hint">No Purchase Line rows saved for this invoice.</p>
+              {fieldTab === "header" && (
+                <DataTable columns={fieldCheckColumns}
+                           rows={fieldModal.data.header.map((f) => ({ ...f, _key: f.field }))}
+                           searchKeys={["field"]} pageSize={50} empty="No header data." />
               )}
 
-              {fieldModal.data.reservations.map((res, i) => (
-                <div key={`res-${i}`}>
-                  <h3>Reservation Entry — {res.label}</h3>
-                  <DataTable columns={fieldCheckColumns}
-                             rows={res.fields.map((f) => ({ ...f, _key: f.field }))}
-                             searchKeys={["field"]} pageSize={50} empty="No reservation data." />
-                </div>
-              ))}
+              {fieldTab === "lines" && (
+                <>
+                  {fieldModal.data.lines.map((line, i) => (
+                    <div key={`line-${i}`}>
+                      <h3 style={i === 0 ? { marginTop: 0 } : undefined}>Purchase Line — {line.label}</h3>
+                      <DataTable columns={fieldCheckColumns}
+                                 rows={line.fields.map((f) => ({ ...f, _key: f.field }))}
+                                 searchKeys={["field"]} pageSize={50} empty="No line data." />
+                    </div>
+                  ))}
+                  {!fieldModal.data.lines.length && (
+                    <p className="hint">No Purchase Line rows saved for this invoice.</p>
+                  )}
+                </>
+              )}
+
+              {fieldTab === "reservations" && !fieldModal.isService && (
+                <>
+                  {fieldModal.data.reservations.map((res, i) => (
+                    <div key={`res-${i}`}>
+                      <h3 style={i === 0 ? { marginTop: 0 } : undefined}>Reservation Entry — {res.label}</h3>
+                      <DataTable columns={fieldCheckColumns}
+                                 rows={res.fields.map((f) => ({ ...f, _key: f.field }))}
+                                 searchKeys={["field"]} pageSize={50} empty="No reservation data." />
+                    </div>
+                  ))}
+                  {!fieldModal.data.reservations.length && (
+                    <p className="hint">No Reservation Entry rows for this invoice.</p>
+                  )}
+                </>
+              )}
             </>
           )}
         </Modal>
       )}
 
-      {pdfFile && <PdfModal file={pdfFile} onClose={() => setPdfFile(null)} />}
+      {pdfFile && <PdfModal file={pdfFile.file} page={pdfFile.page} pageEnd={pdfFile.pageEnd} onClose={() => setPdfFile(null)} />}
     </div>
   );
 }

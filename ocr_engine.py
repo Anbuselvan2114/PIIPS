@@ -19,7 +19,6 @@ for _stream in (sys.stdout, sys.stderr):
 import cv2
 import numpy as np
 from pdf2image import convert_from_path
-from paddleocr import PaddleOCR
 
 try:
     import fitz  # PyMuPDF — read born-digital PDF text layers (fast path)
@@ -118,8 +117,42 @@ def _looks_like_blurry_page(image):
     return cv2.Laplacian(gray, cv2.CV_64F).var() < _BLUR_VARIANCE_MIN
 
 
-# Indian GSTIN: 2-digit state code + 10-char PAN + entity/check chars (15 total).
-_GSTIN_RE = re.compile(r"\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]{2}")
+# "|" is a vertical-stroke glyph OCR genuinely confuses for "I" (read as
+# "I" on one page's scan of the SAME invoice, correctly as "|" on
+# another) - canonicalized away before comparing two pages' own "Invoice
+# No." readings, so this specific noise never fragments one multi-page
+# invoice into several phantom ones. NOT a general fuzzy/similarity match
+# (deliberately) - two genuinely different, similarly-formatted invoice
+# numbers (e.g. sequential "...541" vs "...542") must still compare as
+# different, so only this exact narrow confusion is normalized, nothing
+# broader (extend the translate table if/when another such pair turns up).
+_INVOICE_NO_CANON = str.maketrans({"|": "I"})
+
+
+def _invoice_no_differs(a, b):
+    """True when two pages' own "Invoice No." readings are different
+    invoices, not just a stray "|"/"I" OCR misread on the same one - see
+    _INVOICE_NO_CANON's own note.
+    Sample: _invoice_no_differs('26|1TN1L2501832', '26I1TN1L2501832') -> False
+    Sample: _invoice_no_differs('D/2026-27/541', 'D/2026-27/542') -> True"""
+    return a.upper().translate(_INVOICE_NO_CANON) != b.upper().translate(_INVOICE_NO_CANON)
+
+
+def _is_near_duplicate(value, already):
+    """True when `value` (one page's own field reading, e.g. a Seller
+    Address line) already appears, punctuation/whitespace aside, SOMEWHERE
+    within `already` (the group's accumulated multi-line value so far) -
+    a genuine multi-page invoice's own repeated letterhead is rarely
+    printed byte-identically page to page (e.g. "...Chennai," on one page,
+    "...Chennai" - no trailing comma - on another), so the exact-substring
+    check `value not in merged_fields[key]` alone lets that trivial
+    difference through and needlessly duplicates the SAME line into the
+    merged result.
+    Sample: _is_near_duplicate('...Chennai', '...Chennai,') -> True"""
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+    value_n = norm(value)
+    return bool(value_n) and value_n in norm(already)
+
 
 # A physical-dimension spec with no unit word of its own (e.g. `18.5"` for a
 # monitor's screen size) - digits then a bare inch/feet mark, nothing else.
@@ -131,33 +164,20 @@ def _norm_gstin(value):
     return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
 
 
-def _find_gstin(text):
-    """
-    Extract a GSTIN from a line even when OCR dropped the ':' or split and
-    reordered it (e.g. 'AABCP8005C2ZZ  GSTIN/UIN  33' -> '33AABCP8005C2ZZ').
-    Returns "" if none found.
-    """
+# "Serial Number:XXXX", "Serial No.: XXXX", "S/N: XXXX", "Sr. No: XXXX" - the
+# value is one unspaced token (letters/digits/dashes); only stripped when it
+# contains a digit, so a plain word after the label is never eaten.
+_SERIAL_NO_RE = re.compile(
+    r"(?i)\b(?:serial\s*(?:no\.?|number)|s\s*/\s*n|sr\.?\s*no\.?)\s*[:#\-]?\s*"
+    r"(?P<val>[A-Za-z0-9][A-Za-z0-9\-]*)"
+    # ...and any further serials of the same list ("S/N: A1B2C3 / D4E5F6, ..."):
+    # unspaced UPPERCASE alphanumerics of 6+ chars that contain a digit.
+    r"(?:[\s,/&]+(?-i:(?=[A-Z0-9\-]*\d)[A-Z0-9][A-Z0-9\-]{5,})(?![A-Za-z0-9\-]))*"
+)
 
-    up = text.upper()
 
-    match = _GSTIN_RE.search(up.replace(" ", ""))
-    if match:
-        return match.group(0)
-
-    # Reassemble a split code + body, only on lines that mention GSTIN/UIN.
-    low = up.lower()
-    if "gstin" in low or "uin" in low:
-        tokens = re.findall(r"[A-Z0-9]+", up)
-        code = next((t for t in tokens if re.fullmatch(r"\d{2}", t)), "")
-        body = next(
-            (t for t in tokens
-             if re.fullmatch(r"[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]{2}", t)),
-            "",
-        )
-        if code and body and _GSTIN_RE.fullmatch(code + body):
-            return code + body
-
-    return ""
+# Dell hardware serial in its hyphenated form, printed with no label at all.
+_DELL_TAG_RE = re.compile(r"(?i)\bCN-[0-9A-Z]{6}(?:-[0-9A-Z]{3,5}){3,}\b")
 
 
 class OCREngine:
@@ -175,6 +195,12 @@ class OCREngine:
         if cls._ocr is not None:
             return
 
+        # Imported here, not at module level: importing PaddleOCR takes many
+        # seconds, and a born-digital PDF (text layer, no OCR) never needs it -
+        # so extraction workers start in ~1 s and only a run that actually
+        # meets a scanned page pays for it.
+        from paddleocr import PaddleOCR
+
         print("Loading PaddleOCR...")
 
         start = time.perf_counter()
@@ -188,7 +214,9 @@ class OCREngine:
 
             use_gpu=False,
 
-            cpu_threads=8,
+            # Parallel extraction workers set PIIPS_OCR_THREADS so N processes
+            # share the cores instead of each using all 8.
+            cpu_threads=int(os.environ.get("PIIPS_OCR_THREADS") or 8),
 
             enable_mkldnn=True,
 
@@ -199,14 +227,57 @@ class OCREngine:
             f"PaddleOCR Loaded in {time.perf_counter()-start:.2f} sec"
         )
     def __init__(self):
+        # PaddleOCR itself is loaded lazily, on the first page that needs OCR
+        # (see initialize / process_page) - constructing the engine is cheap.
+        pass
 
-        if OCREngine._ocr is None:
-            OCREngine.initialize()
     # Standalone image formats accepted in addition to PDF
     IMAGE_EXTS = (
         ".png", ".jpg", ".jpeg",
         ".tif", ".tiff", ".bmp", ".webp",
     )
+
+    # File kinds, in the order the progress bar draws them.
+    KIND_ORIGINAL, KIND_SCANNED, KIND_PHOTO = 0, 1, 2
+
+    def classify_file(self, path):
+        """Which kind of document `path` is, WITHOUT extracting it: 0 = an
+        original born-digital PDF (every page has a text layer), 1 = a scan /
+        photocopy (some page needs OCR), 2 = a photographed/blurry page or an
+        unreadable file. Mirrors the checks read_pdf itself makes.
+        Sample: OCREngine().classify_file('a.pdf') -> 0"""
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            image = None
+            if ext == ".pdf" and fitz is not None:
+                doc = fitz.open(path)
+                try:
+                    for page in doc:
+                        if not page.get_text("text").strip():
+                            # A thumbnail is plenty to tell a flat scan from a
+                            # photographed page (this only decides the ORDER
+                            # of the progress pieces; read_pdf does the real,
+                            # full-resolution checks) and is ~50x cheaper
+                            # than the 300 DPI OCR render.
+                            pix = page.get_pixmap(dpi=60)
+                            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                                pix.height, pix.width, pix.n)
+                            image = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
+                            break
+                finally:
+                    doc.close()
+                if image is None:
+                    return self.KIND_ORIGINAL
+            else:
+                image = cv2.imread(path)
+                if image is None:
+                    return self.KIND_PHOTO
+                image = cv2.resize(image, None, fx=0.25, fy=0.25) if max(image.shape[:2]) > 1600 else image
+            if _looks_like_photo_page(image):
+                return self.KIND_PHOTO
+            return self.KIND_SCANNED
+        except Exception:  # noqa: BLE001 - unreadable: last in line
+            return self.KIND_PHOTO
 
     def file_to_images(self, path):
         """
@@ -317,14 +388,44 @@ class OCREngine:
 
     @staticmethod
     def _render_pdf_page(pdf_path, page_no):
-        """Rasterise a single PDF page at the OCR DPI (poppler, same as the
-        full-document path) for pages that must be OCR'd."""
-        pages = convert_from_path(
-            pdf_path, dpi=_OCR_DPI, first_page=page_no, last_page=page_no
-        )
-        if not pages:
-            return None
-        return cv2.cvtColor(np.array(pages[0]), cv2.COLOR_RGB2BGR)
+        """Rasterise a single PDF page at the OCR DPI for a page that must
+        be OCR'd (no usable text layer of its own).
+
+        PyMuPDF (fitz) first, not poppler - a real, measured quality
+        difference, not a style preference: the SAME PDF/page/DPI rendered
+        via poppler (pdf2image's convert_from_path) then fed to PaddleOCR
+        read a clearly-legible line as "ZAAAA P NAAA TAAAAAAAH IAAAAA
+        NAAAAAAAA AAAAA AR" at confidence 0.55; the identical page
+        rendered via fitz instead and fed to the exact same PaddleOCR call
+        read it correctly ("22 SENAI THALAIVAR MALLIGAI HABIBULLAH ROAD T
+        NAGAR") at confidence 0.99. fitz is already required for this
+        method to be reached at all (see _page_inputs's own `fitz is not
+        None` guard), so no extra fallback is needed here."""
+        with fitz.open(pdf_path) as doc:
+            if not (1 <= page_no <= doc.page_count):
+                return None
+            pix = doc[page_no - 1].get_pixmap(dpi=_OCR_DPI, alpha=False)
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+    # Optional per-file progress reporting (see read_pdf's `progress`): a
+    # callable taking a 0..1 fraction of the WHOLE document, and the slice of
+    # that range the page currently being processed covers.
+    _progress_cb = None
+    _page_span = (0.0, 1.0)
+
+    def _report(self, fraction):
+        """Report progress within the current page (0..1), mapped into the
+        document-wide fraction the caller asked for. Never raises.
+        Sample: self._report(0.55)"""
+        cb = self._progress_cb
+        if cb is None:
+            return
+        lo, hi = self._page_span
+        try:
+            cb(lo + (hi - lo) * max(0.0, min(1.0, fraction)))
+        except Exception:  # noqa: BLE001 - progress must never break extraction
+            pass
 
     def process_page(
         self,
@@ -345,17 +446,38 @@ class OCREngine:
             # -----------------------------------------
 
             if boxes is None:
-                with OCREngine._ocr_lock:
-                    result = OCREngine._ocr.ocr(
-                        image,
-                        det=True,
-                        rec=True,
-                        cls=True
-                    )
+                # The OCR call blocks for seconds with no way to see inside
+                # it - creep this page's progress forward while it runs (an
+                # ease-out curve that never reaches the next milestone) so
+                # the file's bar keeps moving instead of freezing.
+                creeping = threading.Event()
+
+                def _creep():
+                    began = time.perf_counter()
+                    while not creeping.wait(0.4):
+                        self._report(
+                            0.05 + 0.45 * (1 - 2.718281828 ** (-(time.perf_counter() - began) / 8.0))
+                        )
+
+                if self._progress_cb is not None:
+                    threading.Thread(target=_creep, daemon=True).start()
+                try:
+                    with OCREngine._ocr_lock:
+                        OCREngine.initialize()
+                        result = OCREngine._ocr.ocr(
+                            image,
+                            det=True,
+                            rec=True,
+                            cls=True
+                        )
+                finally:
+                    creeping.set()
 
                 boxes = self.normalize_result(
                     result
                 )
+
+            self._report(0.55)      # text/OCR boxes in hand
 
 
             # -----------------------------------------
@@ -433,6 +555,7 @@ class OCREngine:
                 boxes
             )
             rows = self.merge_table_header_rows(rows)
+            self._report(0.7)       # rows grouped
 
             # -----------------------------------------
             # Detect Table
@@ -513,6 +636,7 @@ class OCREngine:
                 footer_rows,
                 page_width
             )
+            self._report(0.85)      # header fields read
 
 
 
@@ -561,6 +685,7 @@ class OCREngine:
                 footer_rows,
                 page_width
             )
+            self._report(0.95)      # items + tax summary read
 
 
             # -----------------------------------------
@@ -792,7 +917,21 @@ class OCREngine:
 
                 continue
 
-            if abs(
+            # Two boxes on the same physical line occupy distinct
+            # (non-overlapping) x-ranges - that's what "side by side"
+            # means. If the incoming box's x-range substantially overlaps
+            # a box already in this row, they can't really be neighbours
+            # on one line; they're stacked lines (e.g. a tightly-leaded
+            # company-name/address letterhead) whose centers happened to
+            # land within line_threshold of each other. Split them into
+            # separate rows instead of concatenating unrelated lines.
+            stacked = any(
+                min(box["right"], other["right"]) - max(box["x"], other["x"])
+                > 0.5 * min(box["width"], other["width"])
+                for other in current_row
+            )
+
+            if (not stacked) and abs(
 
                 box["center_y"]
 
@@ -839,95 +978,6 @@ class OCREngine:
             rows.append(
                 current_row
             )
-
-        return rows
-    def print_rows(
-        self,
-        rows
-    ):
-
-        for i, row in enumerate(rows):
-
-            print(
-                "\nROW",
-                i + 1
-            )
-
-            for word in row:
-
-                print(
-                    f'{word["text"]:<30} '
-                    f'X={word["x"]:.0f} '
-                    f'Y={word["y"]:.0f}'
-                )
-    def reorder_boxes(
-        self,
-        boxes
-    ):
-
-        if not boxes:
-            return []
-
-        # ----------------------------------
-        # Calculate Average Height
-        # ----------------------------------
-
-        avg_height = sum(
-            b["height"]
-            for b in boxes
-        ) / len(boxes)
-
-        line_threshold = max(
-            10,
-            avg_height * 0.7
-        )
-
-        # ----------------------------------
-        # Top -> Bottom
-        # ----------------------------------
-
-        boxes.sort(
-            key=lambda b: b["center_y"]
-        )
-
-        rows = []
-
-        current_row = []
-
-        current_y = None
-
-        for box in boxes:
-
-            if current_y is None:
-
-                current_y = box["center_y"]
-
-            if abs(
-                box["center_y"] -
-                current_y
-            ) <= line_threshold:
-
-                current_row.append(box)
-
-            else:
-
-                current_row.sort(
-                    key=lambda x: x["x"]
-                )
-
-                rows.append(current_row)
-
-                current_row = [box]
-
-                current_y = box["center_y"]
-
-        if current_row:
-
-            current_row.sort(
-                key=lambda x: x["x"]
-            )
-
-            rows.append(current_row)
 
         return rows
             
@@ -1028,9 +1078,21 @@ class OCREngine:
         self,
         pdf_path,
         allow_scanned=False,
+        progress=None,
     ):
+        """Extract every invoice in a document. `progress`, when given, is
+        called with a 0..1 fraction as the work advances (loading, each page's
+        OCR/parse stages, merging) so a caller can show a live per-file bar.
+        Sample: OCREngine().read_pdf('a.pdf', progress=lambda f: print(f))"""
+
+        self._progress_cb = progress
+        self._page_span = (0.0, 1.0)
+        if progress:
+            progress(0.02)
 
         page_inputs = self._page_inputs(pdf_path)
+        if progress:
+            progress(0.15)
 
         # By default this only processes born-digital PDFs (a real embedded
         # text layer). A page with no text layer (image is not None) had to
@@ -1040,8 +1102,8 @@ class OCREngine:
         # it, so it gets moved to UNSUPPORTED upstream instead of silently
         # producing lower-confidence data.
         #
-        # `allow_scanned=True` (config_store's "allow_scanned_pdfs" toggle,
-        # PART and SERVICE alike - see processor.py) skips that rejection:
+        # `allow_scanned=True` (config_store's per-type "allow_scanned_pdfs_
+        # part"/"_service" toggles - see processor.py) skips that rejection:
         # `boxes` stays None for a rasterised page, so
         # process_page's own OCR path below runs PaddleOCR on it exactly
         # the way an image file (.png/.jpg) already always has. A genuine
@@ -1068,6 +1130,9 @@ class OCREngine:
                     "Document is a scanned or photocopied PDF, not an original "
                     "born-digital PDF (no embedded text layer) — unsupported."
                 )
+
+        if progress:
+            progress(0.25)          # loaded + validated; pages next
 
         result = {
 
@@ -1107,19 +1172,32 @@ class OCREngine:
         # PDFs concatenate two or more DISTINCT invoices as consecutive
         # pages instead (e.g. a batch of service call reports saved as one
         # file). A new group starts whenever a page declares its OWN
-        # "Invoice No." and it differs from the current group's — a page
-        # with no Invoice No. of its own never triggers a split, so ordinary
-        # multi-page single invoices are unaffected.
+        # "Invoice No." and it CLEARLY differs from the current group's — a
+        # page with no Invoice No. of its own never triggers a split, so
+        # ordinary multi-page single invoices are unaffected. "Clearly"
+        # (see _invoice_no_differs) rather than a bare string inequality:
+        # the same physical invoice number can OCR slightly differently
+        # page to page on a poor scan (e.g. "26|1TN1L2501832" on page 1,
+        # "26I1TN1L2501832" on page 2 - one stray "|"/"I" swap), which
+        # would otherwise fragment one genuine multi-page invoice into
+        # several phantom ones.
         groups = []
 
         def _new_group():
-            return {"text": [], "fields": [], "items": [], "tax": [], "invoice_no": ""}
+            return {"text": [], "fields": [], "items": [], "tax": [], "invoice_no": "",
+                     "page_start": None, "page_end": None}
 
         for page_no, (boxes, image) in enumerate(
             page_inputs,
             start=1
         ):
 
+
+            # This page's slice of the 0.25 .. 0.97 stretch of the bar.
+            self._page_span = (
+                0.25 + 0.72 * (page_no - 1) / len(page_inputs),
+                0.25 + 0.72 * page_no / len(page_inputs),
+            )
 
             page = self.process_page(
                 page_no,
@@ -1154,12 +1232,15 @@ class OCREngine:
             if not groups:
                 groups.append(_new_group())
             elif (page_invoice_no and groups[-1]["invoice_no"]
-                    and page_invoice_no != groups[-1]["invoice_no"]):
+                    and _invoice_no_differs(page_invoice_no, groups[-1]["invoice_no"])):
                 groups.append(_new_group())
 
             group = groups[-1]
             if page_invoice_no and not group["invoice_no"]:
                 group["invoice_no"] = page_invoice_no
+            if group["page_start"] is None:
+                group["page_start"] = page_no
+            group["page_end"] = page_no
 
 
             # -------------------------------------
@@ -1221,6 +1302,9 @@ class OCREngine:
         if not groups:
             groups.append(_new_group())
 
+        if progress:
+            progress(0.97)
+
         result["Invoices"] = [self._merge_group(g) for g in groups]
 
         # Back-compat top-level aliases: single-invoice consumers (format
@@ -1253,7 +1337,21 @@ class OCREngine:
         # starts that pass with nothing claimed yet) - gets silently
         # concatenated onto the correct first-page value instead of being
         # ignored, corrupting the real Seller/Buyer/Consignee Name.
-        _SINGLE_VALUE_FIELDS = {"Seller Name", "Buyer Name", "Consignee Name"}
+        #
+        # "Invoice No." and "Vendor Code" are the same category of problem
+        # for a different reason: a single fixed identifier, reprinted
+        # identically on every page of one multi-page invoice, but OCR'd
+        # SLIGHTLY differently page to page on a poor scan (the exact
+        # "|"/"I" noise _invoice_no_differs already tolerates for the
+        # page-grouping decision itself) - "value not in merged_fields[key]"
+        # below only catches an EXACT non-match, so two such near-identical
+        # readings still get wrongly concatenated into one garbled value
+        # ("26|1TN1L2501832\n26I1TN1L2501832") instead of keeping just the
+        # first page's own reading.
+        _SINGLE_VALUE_FIELDS = {
+            "Seller Name", "Buyer Name", "Consignee Name",
+            "Invoice No.", "Vendor Code",
+        }
 
         merged_fields = {}
         for fields in group["fields"]:
@@ -1264,7 +1362,9 @@ class OCREngine:
                     merged_fields[key] = value
                 elif key in _SINGLE_VALUE_FIELDS:
                     continue
-                elif value not in merged_fields[key]:
+                elif value not in merged_fields[key] and not _is_near_duplicate(
+                    value, merged_fields[key]
+                ):
                     # Append multiline values
                     merged_fields[key] += "\n" + value
 
@@ -1304,239 +1404,15 @@ class OCREngine:
             "Fields": merged_fields,
             "Items": group["items"],
             "TaxSummary": group["tax"],
+            # 1-based, inclusive - which of the source PDF's own physical
+            # pages this invoice's content actually came from. Downstream
+            # (invoice_schema/database/app.py's PDF endpoint) uses this so
+            # the PDF viewer/download shows this invoice's WHOLE span, not
+            # just its first page, for a genuine multi-page invoice sharing
+            # a file with other invoices (see PageStart/PageEnd's own use).
+            "PageStart": group["page_start"],
+            "PageEnd": group["page_end"],
         }
-    def extract_invoice_fields(
-        self,
-        header_rows,
-        footer_rows,
-        page_width
-    ):
-        """
-        Extract header key/value fields from an Indian GST (Tally-style)
-        invoice layout using the OCR geometry:
-
-          * Right-side metadata grid  -> label on one line, value in the
-            cell directly below, in two sub-columns.
-          * Left-side party blocks    -> Seller / Consignee (Ship to) /
-            Buyer (Bill to), each with name, GSTIN/UIN and State Name.
-          * "In words" amounts        -> read from the footer rows.
-
-        Column boundaries are derived from page_width, so no absolute
-        pixel constants are hard-coded.
-        """
-
-        fields = {}
-
-        if not header_rows or page_width <= 0:
-            return fields
-
-        left_cut = page_width * 0.45      # left block vs right block
-        sub_cut = page_width * 0.67       # right block: two sub-columns
-
-        RIGHT_LABELS = {
-            "invoice no.",
-            "dated",
-            "delivery note",
-            "mode/terms of payment",
-            "reference no. & date.",
-            "other references",
-            "buyer's order no.",
-            "dispatch doc no.",
-            "delivery note date",
-            "dispatched through",
-            "destination",
-            "terms of delivery",
-        }
-
-        # ------------------------------------------------------------------
-        # Right-side metadata grid: label -> value in the row below.
-        # Two sub-columns are tracked independently.
-        # ------------------------------------------------------------------
-
-        pending = {"L": None, "R": None}
-        seen_labels = []
-
-        for row in header_rows:
-
-            for sub, low_x, high_x in (
-                ("L", left_cut, sub_cut),
-                ("R", sub_cut, float("inf"))
-            ):
-
-                cell_words = sorted(
-                    (
-                        w for w in row
-                        if low_x <= w["x"] < high_x
-                    ),
-                    key=lambda w: w["x"]
-                )
-
-                if not cell_words:
-                    continue
-
-                text = " ".join(
-                    w["text"].strip()
-                    for w in cell_words
-                ).strip()
-
-                if not text:
-                    continue
-
-                if text.lower() in RIGHT_LABELS:
-
-                    pending[sub] = text.rstrip(":").strip()
-
-                    if pending[sub] not in seen_labels:
-                        seen_labels.append(pending[sub])
-
-                elif pending[sub]:
-
-                    fields.setdefault(pending[sub], text)
-
-                    pending[sub] = None
-
-        # Keep the full field structure visible even when a cell is blank.
-        for label in seen_labels:
-            fields.setdefault(label, "")
-
-        # ------------------------------------------------------------------
-        # Left-side party blocks: Seller / Consignee / Buyer.
-        # ------------------------------------------------------------------
-
-        section = "Seller"
-        named = {"Seller": False, "Consignee": False, "Buyer": False}
-
-        for row in header_rows:
-
-            cell_words = sorted(
-                (w for w in row if w["x"] < left_cut),
-                key=lambda w: w["x"]
-            )
-
-            if not cell_words:
-                continue
-
-            text = " ".join(
-                w["text"].strip()
-                for w in cell_words
-            ).strip()
-
-            if not text:
-                continue
-
-            low = text.lower()
-
-            # Section markers
-            if "consignee" in low and "ship to" in low:
-                section = "Consignee"
-                continue
-
-            if "buyer" in low and "bill to" in low:
-                section = "Buyer"
-                continue
-
-            # GSTIN (colon optional; may be split/reordered by OCR)
-            gstin = _find_gstin(text)
-            if gstin:
-                fields.setdefault(f"{section} GSTIN/UIN", gstin)
-                continue
-
-            # State Name (colon optional)
-            sm = re.match(r"\s*state\s*name\b[\s:]*", text, flags=re.IGNORECASE)
-            if sm:
-                fields.setdefault(
-                    f"{section} State Name",
-                    text[sm.end():].strip(" :"),
-                )
-                continue
-
-            # Other colon-delimited fields (PH, EMAIL ID, E-Mail, ...)
-            if ":" in text:
-
-                label, _, value = text.partition(":")
-
-                label = label.strip()
-                value = value.strip()
-
-                if not label:
-                    continue
-
-                fields.setdefault(label, value)
-                continue
-
-            # Non-colon text -> first line is the party name,
-            # following lines are the address.
-            if not named[section]:
-
-                fields.setdefault(f"{section} Name", text)
-                named[section] = True
-
-            else:
-
-                addr_key = f"{section} Address"
-
-                if addr_key in fields:
-                    fields[addr_key] += "\n" + text
-                else:
-                    fields[addr_key] = text
-
-        # ------------------------------------------------------------------
-        # Footer "in words" amounts.
-        # ------------------------------------------------------------------
-
-        # Markers that OCR may merge onto the in-words line; the amount in
-        # words ends before any of these.
-        cut_markers = [
-            "previous balance",
-            "e. & o.e",
-            "e.& o.e",
-            "e & o.e",
-            "e&oe",
-            "e. & o. e",
-            "company's",
-            "declaration",
-        ]
-
-        def _trim_in_words(value):
-            low_v = value.lower()
-            cut = len(value)
-            for marker in cut_markers:
-                pos = low_v.find(marker)
-                if pos > 0:
-                    cut = min(cut, pos)
-            return value[:cut].strip(" .,-")
-
-        for index, row in enumerate(footer_rows):
-
-            text = " ".join(
-                w["text"].strip()
-                for w in row
-            ).strip()
-
-            low = text.lower()
-
-            if "amount chargeable" in low and "in words" in low:
-
-                if index + 1 < len(footer_rows):
-
-                    value = " ".join(
-                        w["text"].strip()
-                        for w in footer_rows[index + 1]
-                    ).strip()
-
-                    fields.setdefault(
-                        "Amount Chargeable (in words)",
-                        _trim_in_words(value)
-                    )
-
-            if "tax amount" in low and "in words" in low and ":" in text:
-
-                fields.setdefault(
-                    "Tax Amount (in words)",
-                    _trim_in_words(text.partition(":")[2].strip())
-                )
-
-        return fields
 
     def extract_tax_summary(
         self,
@@ -1639,214 +1515,6 @@ class OCREngine:
 
         return summary
 
-    def extract_fields(
-        self,
-        pages
-    ):
-
-        HEADERS = [
-
-            "Invoice No",
-            "Invoice Date",
-            "Dated",
-            "Delivery Note",
-            "Mode/Terms of Payment",
-            "Reference No",
-            "Other References",
-            "Buyer's Order No",
-            "Dispatch Doc No",
-            "Delivery Note Date",
-            "Dispatched through",
-            "Destination",
-            "Terms of Delivery",
-            "GSTIN/UIN",
-            "GSTIN",
-            "State Name",
-            "E-Mail",
-            "EMAIL ID",
-            "PH",
-            "Phone",
-            "Consignee (Ship to)",
-            "Buyer (Bill to)",
-            "Amount Chargeable (in words)",
-            "Tax Amount (in words)",
-            "Declaration"
-
-        ]
-
-
-        fields = {}
-
-
-        header_lookup = {
-
-            h.lower(): h
-
-            for h in HEADERS
-
-        }
-
-
-        for page in pages:
-
-
-            rows = page.get(
-                "Rows",
-                []
-            )
-
-
-            for index,row in enumerate(rows):
-
-
-                row.sort(
-                    key=lambda x:x["x"]
-                )
-
-
-                words = [
-
-                    w["text"].strip()
-
-                    for w in row
-
-                ]
-
-
-                row_text = " ".join(words)
-
-
-                lower = row_text.lower()
-
-
-
-                matched = None
-
-
-                for header in HEADERS:
-
-
-                    if header.lower() in lower:
-
-                        matched = header
-
-                        break
-
-
-
-                if not matched:
-
-                    continue
-
-
-
-                # -----------------------------------
-                # Remove header part
-                # -----------------------------------
-
-                pos = lower.find(
-                    matched.lower()
-                )
-
-
-                after = row_text[
-
-                    pos +
-
-                    len(matched)
-
-                :].strip(
-                    " :-."
-                )
-
-
-                # -----------------------------------
-                # Ignore table header
-                # -----------------------------------
-
-                if "description of goods" in lower:
-
-                    continue
-
-
-
-                value = after
-
-
-
-                # -----------------------------------
-                # If no value on same line,
-                # take next rows
-                # -----------------------------------
-
-                if not value:
-
-
-                    next_lines=[]
-
-
-                    for nxt in range(
-                        index+1,
-                        min(
-                            index+4,
-                            len(rows)
-                        )
-                    ):
-
-
-                        txt=" ".join(
-
-                            w["text"]
-
-                            for w in rows[nxt]
-
-                        )
-
-
-                        txt_lower=txt.lower()
-
-
-
-                        # stop at next known header
-
-                        if any(
-
-                            h.lower() in txt_lower
-
-                            for h in HEADERS
-
-                        ):
-
-                            break
-
-
-
-                        next_lines.append(txt)
-
-
-
-                    value="\n".join(
-                        next_lines
-                    )
-
-
-
-                # -----------------------------------
-                # Cleanup
-                # -----------------------------------
-
-                value=value.strip()
-
-
-
-                if value:
-
-
-                    fields[matched]=value
-
-
-
-        return fields
     def normalize_result(
         self,
         result
@@ -2110,6 +1778,22 @@ class OCREngine:
 
                 break
 
+            # A genuinely simple, non-GST invoice table (e.g. a generic
+            # small-business template billing a flat "DESCRIPTION |
+            # AMOUNT" per line, no HSN/Qty/Rate/tax breakdown at all -
+            # SHWETMANI ENTERPRISES's own layout) never reaches the 3-
+            # keyword threshold above no matter how its header is split
+            # across rows, since there's no third table-related word
+            # anywhere on the page to find. "description" + "amount"
+            # together, even alone, is still an unambiguous item-table
+            # header - virtually no other part of a real invoice pairs
+            # those two words on one row.
+            if {"description", "amount"} <= matched:
+
+                table_start = index
+
+                break
+
             # Some layouts wrap the header onto two stacked lines (e.g.
             # "Unit" above "Price", "Net" above "Amount") - neither line
             # alone reaches the keyword threshold, but together they
@@ -2229,81 +1913,6 @@ class OCREngine:
             table_end
 
         )
-    def extract_header(
-        self,
-        header_rows
-    ):
-
-        fields = {}
-
-        current_key = None
-
-        for row in header_rows:
-
-            row.sort(
-                key=lambda x: x["x"]
-            )
-
-            # Complete row text
-            row_text = " ".join(
-                word["text"]
-                for word in row
-            ).strip()
-
-            if not row_text:
-                continue
-
-            # ----------------------------------
-            # Find labels ending with :
-            # ----------------------------------
-
-            for index, word in enumerate(row):
-
-                text = word["text"].strip()
-
-                if text.endswith(":"):
-
-                    key = text[:-1].strip()
-
-                    value = " ".join(
-
-                        w["text"]
-
-                        for w in row[index + 1:]
-
-                    ).strip()
-
-                    fields[key] = value
-
-                    current_key = key
-
-            # ----------------------------------
-            # Multi-line value
-            # ----------------------------------
-
-            if current_key:
-
-                has_label = False
-
-                for word in row:
-
-                    if word["text"].endswith(":"):
-
-                        has_label = True
-
-                        break
-
-                if not has_label:
-
-                    first_x = row[0]["x"]
-
-                    if first_x < 250:
-
-                        fields[current_key] += (
-                            "\n" + row_text
-                        )
-
-        return fields
             
     def extract_items(
             self,
@@ -2326,6 +1935,8 @@ class OCREngine:
         # wrongly appended onto the PREVIOUS item first before anyone
         # notices it was actually the next item's own opening line.
         pending_lead_in = ""
+
+        orphan_amount = None
 
         # A vendor whose numeric columns (HSN/Qty/Rate/Amount) sit
         # vertically CENTERED against a multi-line wrapped description
@@ -2400,6 +2011,17 @@ class OCREngine:
                       # still recovered separately - see the HSN-caption
                       # capture just above the charge-line handling below.
                       "hsn/sac",
+                      # A vendor that repeats the invoice's own Buyer's
+                      # Order No. as an extra line inside the item's
+                      # description cell (e.g. "PO # : SPRPUR/2026/09/04 -
+                      # 86476" printed right under the part name) - real
+                      # printed text, but Service First's own catalog
+                      # description for the part never includes it, so
+                      # keeping it glued onto Description only prevents an
+                      # otherwise-clean SF match (same rationale as
+                      # "hsn/sac" above - the PO No. itself is already
+                      # captured separately as Buyer's Order No.).
+                      "po #",
                       # A bank-details footer block (account for payment,
                       # not part of the invoice's own line items) sitting
                       # directly below the table's "Total" row (e.g.
@@ -2414,17 +2036,70 @@ class OCREngine:
                       # blank HSN/Quantity - the same failure shape as the
                       # "Taxable Amount"/"Total" case above.
                       "way bill", "net amount", "bank name", "beneficiary",
-                      "account no", "ifsc code", "branch")
+                      "account no", "ifsc code", "branch",
+                      # R Logic's own footer/summary lines: "TCS | 0.00" (Tax
+                      # Collected at Source, a real GST line item on the
+                      # invoice's own tax-summary block, not a purchased
+                      # part) has no leading serial and a genuine trailing
+                      # amount, so without this it's indistinguishable from
+                      # a real item and becomes a phantom 5th line with
+                      # blank HSN - the same failure shape as "Taxable
+                      # Amount"/"Total" above. "Important Note :" and
+                      # "Remarks : Based On Sales Orders ..." are boilerplate
+                      # invoice notes printed right after the last charge
+                      # line (Packing and Forwarding Expenses) with no
+                      # amount of their own, so they'd otherwise fold into
+                      # that charge's own Description via the "bare
+                      # charge-keyword row wraps onto the next line" rule
+                      # just above.
+                      "tcs", "important note", "remarks",
+                      # A simple small-business invoice's own summary/
+                      # signature block below the item list (SHWETMANI
+                      # ENTERPRISES: "Advance 0/-" / "Make all cheque
+                      # payable to..." / "Customer Approval Signature:") -
+                      # same failure shape as "Taxable Amount"/"Total"
+                      # above: no leading serial, real words, sometimes a
+                      # trailing amount, so without these it folds into the
+                      # last genuine item's own Description instead of
+                      # being recognized as page furniture. "Subtotal" and
+                      # "Tax" alone aren't included here - both are already
+                      # too generic/risky to blanket-exclude (a real item
+                      # description could legitimately contain either).
+                      "advance", "make all cheque", "customer approval signature",
+                      "total due",
+                      # A freelancer/service-call invoice's own case-detail
+                      # block below the (single) real billed line - "Name",
+                      # "Call Status-...", "Pan Card-...", "Aadhar Card-...",
+                      "bank-", "a/c no", "ifsc-", "call slip enclosed",
+                      # A small-business invoice's own payment/terms footer
+                      # (BABA INFOTECH: "PAYMENT MODE / By Bank Ac. ... /
+                      # Ifsc Code :- ... / AMOUNT IN WORD:- ... / NOTE:-
+                      # ... / If you have any questions about this
+                      # invoice") - all page furniture below the one real
+                      # billed line, same failure shape as the bank block
+                      # above, just worded differently.
+                      "payment mode", "bank ac", "ifsc", "in word:",
+                      "note:-", "if you have any questions",
+                      "verified by", "seal and signature",
+                      "system generated invoice", "pan card", "aadhar card",
+                      "call status", "subject to", "jurisdiction",
+                      "upi id")
 
 
         def _strip_currency(value):
             # A Rate/Amount token glued to its currency symbol ("₹ 14000.00",
             # "Rs. 250", "INR250") reads as text, not a number, unless the
-            # symbol/prefix is stripped first.
+            # symbol/prefix is stripped first. A trailing "/-" (or "/=") is
+            # the same idea in reverse - a common Indian-invoice shorthand
+            # for "only" ("8400/-" = "Rs. 8,400 only", e.g. SHWETMANI
+            # ENTERPRISES's own simple per-line amounts) - without this,
+            # is_number()/clean_number() reject the whole token as text,
+            # so the row never registers as a genuine item start at all.
+            value = re.sub(r"[/=]-?\s*$", "", value.strip())
             return re.sub(
                 r"^\s*(₹|\$|€|£|rs\.?|inr)\s*",
                 "",
-                value.strip(),
+                value,
                 flags=re.IGNORECASE,
             )
 
@@ -2471,6 +2146,29 @@ class OCREngine:
             # broader row-classification checks intentionally stay strict.
             v = value.strip()
             return is_hsn(v) or re.match(r"^99\d{2}$", v) is not None
+
+        def _hsn_token_value(value):
+            """The normalized (plain-digit) HSN/SAC value a table-cell
+            token represents, or None if it isn't HSN-shaped at all. Some
+            vendors (e.g. R Logic) print the code split by its own real
+            chapter.heading.sub-heading structure - "84.73.3020" for what's
+            really HSN 84733020 - rather than as one plain digit run;
+            without this, is_hsn's own plain \\d{4,10} check never matches
+            it, the HSN column stays blank, and the whole invoice fails the
+            mandatory-field gate for it despite the PDF genuinely stating a
+            code. Accepts a bare optional trailing letter the same as the
+            plain form does (see is_hsn's own docstring)."""
+            v = value.strip()
+            m = re.match(r"^\d{4,10}[A-Za-z]?$", v)
+            if m:
+                return v
+            if re.fullmatch(r"\d{2,4}(?:\.\d{1,4}){1,3}[A-Za-z]?", v):
+                digits = re.sub(r"\.", "", v)
+                letter = digits[-1] if digits[-1].isalpha() else ""
+                num_part = digits[:-1] if letter else digits
+                if 4 <= len(num_part) <= 10:
+                    return num_part + letter
+            return None
 
 
 
@@ -2590,13 +2288,13 @@ class OCREngine:
                 t = w["text"].strip()
                 if value_cols:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
-                    if col == "HSN" and is_hsn(t.replace(",", "")):
+                    if col == "HSN" and _hsn_token_value(t.replace(",", "")) is not None:
                         return True
                     if col in ("Quantity", "Rate", "Amount") and (
                         is_number(t) or number_with_unit(t) is not None
                     ):
                         return True
-                elif is_hsn(t.replace(",", "")) or is_number(t):
+                elif _hsn_token_value(t.replace(",", "")) is not None or is_number(t):
                     return True
             return False
 
@@ -2616,6 +2314,29 @@ class OCREngine:
 
         item_seq = 0
 
+        # A payment/terms footer block (BABA INFOTECH: "PAYMENT MODE / By
+        # Bank Ac. ... / NOTE:- ..." wrapped over several lines, then a "For
+        # <company>" signature line) sits below the last real item and
+        # runs to the end of the table - its wrapped continuation lines
+        # carry none of the footer keywords themselves, so once its
+        # opening marker is seen every later no-serial row is footer text,
+        # never more description for the item above it. A genuine new item
+        # still starts through its own serial/values path, unaffected.
+        FOOTER_START_KW = ("payment mode", "bank ac", "ifsc", "in word:",
+                           "note:-", "if you have any questions")
+        footer_started = False
+
+
+        # Whether any later row opens with its own item serial ("1 Coconut
+        # Pci Express Lan Card ... 750.00"). When one does, a numbers-only row
+        # above it is a subtotal, never a values-first item (see below).
+        serial_rows_exist = any(
+            r and re.fullmatch(
+                r"\d{1,3}[.)]?",
+                sorted(r, key=lambda w: w.get("center_x", w["x"]))[0]["text"].strip(),
+            )
+            for r in table_rows[1:]
+        )
 
         for row in table_rows:
 
@@ -2655,7 +2376,73 @@ class OCREngine:
 
             lower = row_text.lower()
 
+            if any(k in lower for k in FOOTER_START_KW):
+                footer_started = True
 
+            # A skewed scan/photo can print the FIRST item's amount on a row
+            # above the item's own row, sharing it with nothing but the
+            # header's wrapped "No." word ("No. ... 900.00", then "1 Service
+            # Charges Received 998713"). Nothing has started yet, so the lone
+            # figure under the Amount column is buffered and given to the
+            # first item if that item ends up with no amount of its own.
+            if (current_item is None and not items and orphan_amount is None
+                    and value_cols.get("Amount") is not None):
+                nums_here = [
+                    w for w in words
+                    if is_number(w["text"].strip().replace(",", ""))
+                    and abs(w["x"] - value_cols["Amount"]) < 150
+                ]
+                others = [w for w in words if w not in nums_here]
+                if (len(nums_here) == 1 and clean_number(nums_here[0]["text"]) not in (None, 0)
+                        and all(re.fullmatch(r"(?i)no\.?|s\.?\s*no\.?|sl\.?", w["text"].strip())
+                                for w in others)):
+                    orphan_amount = clean_number(nums_here[0]["text"])
+                    continue
+
+
+
+            # Values-first item (Shupla IT): the item's own "01 | QTY | 875.00 |
+            # QTY | 875.00" quantity/rate/amount row is printed ABOVE its
+            # description lines, with nothing but unit words on it. Nothing
+            # has started yet, so open the item from those values; the
+            # description rows that follow attach to it as continuation.
+            if (current_item is None and not items and not footer_started
+                    and not serial_rows_exist
+                    and value_cols.get("Amount") is not None):
+                by_col = {}
+                other_text = []
+                for w in words:
+                    t = w["text"].strip()
+                    if is_number(t.replace(",", "")):
+                        col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
+                        if col in ("Quantity", "Rate", "Amount") and col not in by_col:
+                            by_col[col] = clean_number(t)
+                        else:
+                            other_text.append(t)
+                    elif not is_unit(t):
+                        other_text.append(t)
+                if ("Amount" in by_col and len(by_col) >= 2 and not other_text
+                        and by_col["Amount"] and (by_col.get("Rate") or by_col.get("Quantity"))):
+                    current_item = {
+                        "SI": "1",
+                        "Description": pending_lead_in,
+                        "HSN": None,
+                        "Quantity": by_col.get("Quantity"),
+                        "Rate": by_col.get("Rate"),
+                        "Amount": by_col["Amount"],
+                        "charge": False,
+                    }
+                    pending_lead_in = ""
+                    item_seq = 1
+                    continue
+
+            # "HSN/SAC-84716060" printed on its own line under an item's
+            # description carries that item's HSN.
+            if current_item is not None and not current_item.get("HSN"):
+                hsn_m = re.search(r"hsn\s*/?\s*sac\s*[-:]?\s*(\d{4,8})\b", lower)
+                if hsn_m:
+                    current_item["HSN"] = hsn_m.group(1)
+                    continue
 
             # Ignore table header
 
@@ -2679,6 +2466,12 @@ class OCREngine:
                 "total"
             ]):
 
+                # A tax/total row between an item's wrapped description line
+                # and the next item's own row (HP: "machinery and equip",
+                # then CGST / SGST / "Total for Item:", then "000003 ...")
+                # proves that wrapped line belongs to the item above, not to
+                # the next one - it must not be peeled onto it as a lead-in.
+                last_peelable_addition = None
                 continue
 
 
@@ -2843,15 +2636,70 @@ class OCREngine:
             # "1000Base-T...") lands the "1000" fragment under the
             # Description column, not HSN, and would otherwise start a
             # phantom new item out of a genuine continuation row.
+            # An unlabelled CGST/SGST/IGST amount sitting on its own row
+            # (e.g. a scanned page whose "CGST"/"SGST" text OCR'd into
+            # nothing recognisable) has exactly the same shape the
+            # fallback below looks for - a bare Amount-column value with
+            # no serial - and would otherwise become a phantom second
+            # item with fabricated Quantity/Rate once nothing else marks
+            # it as tax data (see EXCLUDE_KW above, which can't help here
+            # since the identifying word itself never made it into the
+            # OCR text at all). Caught structurally instead: India's GST
+            # rates are a fixed, small set of slabs - if this row's own
+            # Amount-column value is (within a few paise, for rounding)
+            # the CURRENTLY OPEN item's own Amount times one of the half-
+            # rates (CGST/SGST split) or full rates (IGST) EXPECT to
+            # apply, it's that item's own tax line, not a new item.
+            tax_subline_amt = None
+            if current_item and current_item.get("Amount") and value_cols:
+                # Of the numbers bucketed under the Amount column, the one
+                # sitting CLOSEST to that column's own x is the row's real
+                # line amount - not merely the first one found: a row that
+                # also carries a tax-amount cell left of it (Anakage's
+                # "... 2,27,910.00 | 18% | 41,023.80 | 2,27,910.00", the
+                # 41,023.80 being exactly 18% of the previous line) used to
+                # have that tax cell read as THE amount, so a genuine second
+                # item with its own full set of values was dismissed as a
+                # tax line and folded into the item above it.
+                best_gap = None
+                for w in words:
+                    t = w["text"].strip()
+                    col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
+                    if col != "Amount":
+                        continue
+                    v = clean_number(t)
+                    if v is None:
+                        v = number_with_unit(t)
+                    if v is None:
+                        continue
+                    gap = abs(w["x"] - value_cols["Amount"])
+                    if best_gap is None or gap < best_gap:
+                        best_gap = gap
+                        tax_subline_amt = v
+            looks_like_tax_subline = tax_subline_amt is not None and any(
+                abs(tax_subline_amt - current_item["Amount"] * r / 100) < 0.5
+                for r in (2.5, 5, 6, 9, 12, 14, 18, 28)
+            )
+
             if (
                 serial is None
                 and value_cols
+                and not looks_like_tax_subline
                 and not any(k in lower for k in CHARGE_KW)
                 and not any(k in lower for k in EXCLUDE_KW)
                 and not re.search(r"round(?:ed)?[\s-]*off", lower)
+                # "Total" is already in EXCLUDE_KW, but a scanned/photocopied
+                # page can OCR-drop its trailing letter ("Tota") - e.g. this
+                # exact row, "Nos | Tota | 1 | 2,600.00", is genuinely the
+                # invoice's own Total row (quantity "1 Nos", amount
+                # "2,600.00"), not a second line item. Word-boundary regex
+                # (not a plain EXCLUDE_KW substring) specifically so this
+                # doesn't also match "tota" buried inside an unrelated real
+                # word (e.g. "Toyota").
+                and not re.search(r"\btota\b", lower)
                 and (
                     any(
-                        is_hsn(t.replace(",", ""))
+                        _hsn_token_value(t.replace(",", "")) is not None
                         and min(value_cols, key=lambda c: abs(w["x"] - value_cols[c])) == "HSN"
                         for w, t in zip(words, texts)
                     )
@@ -2860,6 +2708,21 @@ class OCREngine:
                 and any(
                     re.search(r"[A-Za-z]{2,}", t) and not is_unit(t)
                     for t in texts
+                )
+                # An item whose Qty/Rate/Amount are printed on the line
+                # BELOW its description - a "Serial Number: CN00HPF3..." /
+                # "S/N: ..." / "Part No: ..." detail line carrying the row's
+                # own HSN and price cells (Channel Four) - hasn't had its
+                # values yet, so that detail line completes it (recovered by
+                # the continuation branch below) rather than starting a
+                # phantom second item of its own.
+                and not (
+                    current_item is not None
+                    and current_item.get("Amount") is None
+                    and re.match(
+                        r"^\W*(serial|s/?n\b|sr\.?\s*no|imei|part\s*(no|number)|model)",
+                        lower.strip(),
+                    )
                 )
             ):
                 item_seq += 1
@@ -2894,11 +2757,47 @@ class OCREngine:
                     and not is_number(w["text"].strip())
                     for w in cont_words
                 )
+                # The NEXT sequential serial + a real multi-word product name
+                # (>= 3 words), after an item that already has its values,
+                # opens the next item even though this row carries no values
+                # of its own: its Qty/Rate/Amount are printed on the detail
+                # line BELOW it (Channel Four's "2 USB MOUSE DELL MS116" /
+                # "Serial Number: ... 84716060 2 ₹254.24 ₹508.48"). A wrapped
+                # description fragment that merely starts with a digit
+                # ("2 GB DDR4") has too few name words to qualify.
+                starts_next_item = bool(
+                    serial_from_token
+                    and current_item is not None
+                    and current_item.get("Amount") is not None
+                    and serial.isdigit()
+                    and int(serial) == item_seq + 1
+                    and not row_has_values(cont_words)
+                    and len({
+                        m.lower()
+                        for m in re.findall(
+                            r"[A-Za-z]{2,}",
+                            (desc or "") + " " + " ".join(w["text"] for w in cont_words),
+                        )
+                        if not is_unit(m)
+                    }) >= 3
+                )
                 if (
                     serial_from_token
                     and current_item is not None
+                    and not starts_next_item
                     and (not row_has_values(cont_words) or not has_desc_text)
                 ):
+                    # A digit-led row can still be page furniture, not a
+                    # genuine wrapped description - e.g. a freelancer/
+                    # service-call invoice's own numbered case-detail block
+                    # below the one real billed line ("2 Name Jagdish
+                    # Chandra", "6 BANK-ICICI", "7 A/C NO-..."). Same
+                    # EXCLUDE_KW list used for the "no leading serial" new-
+                    # item gate above - it has no leading serial here only
+                    # because a case/detail number happens to look like one.
+                    if any(k in lower for k in EXCLUDE_KW):
+                        last_peelable_addition = None
+                        continue
                     cont = desc
                     for w in cont_words:
                         t = w["text"].strip()
@@ -2932,12 +2831,28 @@ class OCREngine:
                     and last_peelable_addition
                     and current_item["Description"].endswith(last_peelable_addition)
                 ):
-                    current_item["Description"] = current_item["Description"][
+                    remainder = current_item["Description"][
                         : -len(last_peelable_addition)
                     ].rstrip()
-                    pending_lead_in = (
-                        last_peelable_addition + " " + pending_lead_in
-                    ).strip() if pending_lead_in else last_peelable_addition
+                    # Some vendors print the item's HSN CATEGORY name on the
+                    # row with the serial/values (e.g. "Laptop ACCESSORIES
+                    # (850440)", the HSN group's generic label, not a real
+                    # item name) and wrap the item's own specific
+                    # description onto the line AFTER it instead of before -
+                    # the mirror image of the layout this peel-back exists
+                    # for. That shape is unmistakable: the remainder is
+                    # nothing but "<label> (<this item's own HSN>)" - never
+                    # a genuine standalone item name on its own - so the
+                    # text peeling would remove is actually this item's OWN
+                    # real description, not the next item's opening line.
+                    # Leave it in place instead of peeling it away.
+                    hsn = (current_item.get("HSN") or "").strip()
+                    is_hsn_category_label = bool(hsn) and remainder.endswith(f"({hsn})")
+                    if not is_hsn_category_label:
+                        current_item["Description"] = remainder
+                        pending_lead_in = (
+                            last_peelable_addition + " " + pending_lead_in
+                        ).strip() if pending_lead_in else last_peelable_addition
                 last_peelable_addition = None
 
                 if current_item:
@@ -2979,6 +2894,17 @@ class OCREngine:
                 }
                 pending_lead_in = ""
 
+                if orphan_amount is not None and not items:
+                    # The amount buffered above the first item's own row
+                    # (see orphan_amount). Quantity/Rate are not printed on
+                    # such a page, so it is one unit at that amount, like a
+                    # flat charge line; anything the row itself carries
+                    # overwrites these below.
+                    current_item["Amount"] = orphan_amount
+                    current_item["Quantity"] = 1
+                    current_item["Rate"] = orphan_amount
+                    orphan_amount = None
+
 
                 numbers = []
 
@@ -2989,6 +2915,27 @@ class OCREngine:
                     words[:serial_word_idx] + words[serial_word_idx + 1:]
                     if serial_from_token else words
                 )
+
+                # A grouped CGST/SGST/IGST tax breakdown (SAP Business One's
+                # own GST-invoice shape - e.g. R-Logic) packs 3 Rate+Amount
+                # sub-column pairs, plus a final Line Total, all past the
+                # "IGST" partition anchor (see detect_table_columns) - 7
+                # numeric tokens the nearest-column scheme can only ever
+                # bucket as one indistinct "IGST" slot. Detected here (once
+                # per row, not per token) by that exact token count, rather
+                # than merely "an IGST column exists" - a simple format with
+                # ONE bare IGST amount column (no CGST/SGST breakdown at
+                # all) also sets that same "IGST" key, and must NOT go
+                # through this positional remapping.
+                gst3_tokens = []
+                if value_cols.get("IGST") is not None:
+                    gst3_tokens = sorted(
+                        (w for w in value_words
+                         if w["x"] >= value_cols["IGST"] - 40
+                         and is_number(w["text"].strip())),
+                        key=lambda w: w["x"],
+                    )
+                is_gst3_breakdown = len(gst3_tokens) == 7
 
                 for word in value_words:
 
@@ -3013,6 +2960,91 @@ class OCREngine:
                             key=lambda c: abs(word["x"] - value_cols[c])
                         )
 
+                        # A tightly-kerned PDF text layer can glue an ENTIRE
+                        # row's worth of numeric cell values into ONE OCR/
+                        # PDF-text token, space-separated but with no
+                        # distinguishable per-value x-position at all (e.g.
+                        # an Amazon invoice: "3,117.77 1 3,117.77 18% IGST
+                        # 561.20 3,678.97" as a single word) - nearest-
+                        # column matching can only ever place the WHOLE
+                        # blob under one column, discarding the rest.
+                        # Detected here by sub-part count (more space-
+                        # separated parts than this row has known value
+                        # columns to receive) AND the first few parts each
+                        # individually looking number-shaped - a genuine
+                        # Description that merely starts with a numeric
+                        # magnitude (e.g. "1.5 MTR HDMI CABLE BLACK") has
+                        # only ONE leading number followed by ordinary
+                        # words, not several - and gated on landing nearest
+                        # a genuine VALUE column (never Description/SI/HSN),
+                        # so real description text is never reachable here
+                        # regardless of its own wording. Split positionally:
+                        # the known value columns (sorted left-to-right -
+                        # e.g. Rate/UnitPrice, Quantity, Amount) take the
+                        # first that-many parts in the same order; any
+                        # leftover middle parts (typically a GST rate + tax
+                        # type + tax amount, ahead of a final Line Total
+                        # this schema has no field for) are scanned for a
+                        # percentage-shaped token to recover the item's own
+                        # tax rate, the same way ChargeRatePercent does for
+                        # a charge line's own rate cell.
+                        if col in ("Rate", "Quantity", "Amount", "Total"):
+                            blob_parts = txt.split()
+                            ordered = sorted(
+                                (c for c in ("Rate", "Quantity", "Amount") if c in value_cols),
+                                key=lambda c: value_cols[c],
+                            )
+                            if (
+                                len(blob_parts) >= 5
+                                and len(blob_parts) > len(ordered)
+                                and sum(1 for p in blob_parts[:3] if is_number(p)) >= 2
+                            ):
+                                # A header whose Quantity column wasn't
+                                # detected (only Rate/Amount known) leaves
+                                # the blob's own "price qty net" triple
+                                # mis-bucketed (qty landing in Amount).
+                                # When the first three parts are numbers
+                                # with price x qty = net, they ARE that
+                                # triple - use them as such.
+                                triple = [
+                                    clean_number(p) if is_number(p) else None
+                                    for p in blob_parts[:3]
+                                ]
+                                if (
+                                    "Quantity" not in ordered
+                                    and all(v is not None for v in triple)
+                                    and abs(triple[0] * triple[1] - triple[2]) <= 0.02 * max(triple[2], 1)
+                                ):
+                                    for c, v in zip(("Rate", "Quantity", "Amount"), triple):
+                                        if current_item.get(c) is None:
+                                            current_item[c] = v
+                                    ordered = []
+                                for i, c in enumerate(ordered):
+                                    if current_item.get(c) is None and is_number(blob_parts[i]):
+                                        current_item[c] = clean_number(blob_parts[i])
+                                for p in blob_parts[len(ordered):-1]:
+                                    m = re.fullmatch(r"(\d{1,2}(?:\.\d+)?)\s*%", p)
+                                    if m:
+                                        current_item["TaxRatePercent"] = float(m.group(1))
+                                        break
+                                continue
+
+                        # In a confirmed 3-way CGST/SGST/IGST breakdown (see
+                        # is_gst3_breakdown above), the generic "Amount"
+                        # anchor actually landed on the breakdown's own
+                        # CGST-Amount sub-label (nothing on the header row
+                        # said "Taxable" to lock the real Amount column
+                        # there instead - see detect_table_columns), so a
+                        # token nearest it is really a CGST/SGST/IGST
+                        # sub-value, not the item's Amount - decoded
+                        # positionally below instead, so discard it the same
+                        # as a genuine IGST-zone token here. The item's real
+                        # (pre-tax) Amount is the "Total" column instead.
+                        if is_gst3_breakdown:
+                            if col == "Total":
+                                col = "Amount"
+                            elif col == "Amount":
+                                col = "IGST"
 
                         # A 4+ digit token whose nearest column is Quantity
                         # is almost never a genuine quantity (real order
@@ -3025,19 +3057,67 @@ class OCREngine:
                         if (
                             col == "Quantity"
                             and "HSN" in value_cols
-                            and re.match(r"^\d{4,10}[A-Za-z]?$", txt)
+                            and _hsn_token_value(txt) is not None
                         ):
                             col = "HSN"
 
 
-                        # HSN / SAC code (4, 6 or 8 digits, optional letter)
-                        if col == "HSN" and re.match(
-                            r"^\d{4,10}[A-Za-z]?$",
-                            txt
+                        # A narrow Quantity column's own values (typically a
+                        # bare 1-3 digit integer, sometimes "N.00") are often
+                        # right-aligned within that column while the header
+                        # LABEL text ("Quantity") is wide and left-anchored -
+                        # so the value itself can land physically closer to
+                        # the NEXT column's anchor (Rate/Amount) by just a
+                        # handful of pixels (e.g. Viyona's own "1" quantity:
+                        # 128px from its true Quantity anchor vs 123px from
+                        # Rate - Rate wins the naive nearest-distance check
+                        # by 5px, so the quantity is misfiled as Rate, then
+                        # silently overwritten once the row's real Rate
+                        # value arrives right after it, leaving Quantity
+                        # blank). Reroute a near-tie back to Quantity when
+                        # it's still unclaimed and the token itself is
+                        # quantity-shaped (a plain integer or simple
+                        # decimal, not a currency-formatted Rate/Amount).
+                        if (
+                            col in ("Rate", "Amount")
+                            and "Quantity" in value_cols
+                            and current_item.get("Quantity") is None
+                            and re.fullmatch(r"\d{1,3}(\.\d{1,2})?", txt)
+                            and abs(word["x"] - value_cols["Quantity"])
+                            <= abs(word["x"] - value_cols[col]) + 40
                         ):
-                            current_item["HSN"] = txt
+                            col = "Quantity"
+
+
+                        # HSN / SAC code (4, 6 or 8 digits, optional letter -
+                        # or the same digits printed with dot separators
+                        # following the code's own chapter.heading.sub-
+                        # heading structure, e.g. "84.73.3020" for what's
+                        # really HSN 84733020 - _hsn_token_value strips the
+                        # dots so the saved value always matches the plain
+                        # digit form used everywhere else (SF lookup, other
+                        # vendors' own printed HSN, etc.)).
+                        hsn_val = _hsn_token_value(txt) if col == "HSN" else None
+                        if hsn_val is not None:
+                            current_item["HSN"] = hsn_val
                             continue
 
+
+                        # A bare percentage ("18%") sitting nearest one of
+                        # these columns is the line's GST RATE cell, not a
+                        # quantity/price/amount - left to be parsed as a
+                        # number below it overwrote the real Rate with 18
+                        # (Anakage: Rate 18.0 against a 227,910 amount)
+                        # whenever the table has no dedicated GST column to
+                        # claim it.
+                        if col in ("Quantity", "Rate", "Amount"):
+                            pm = re.fullmatch(r"(\d{1,2}(?:\.\d+)?)\s*%", txt)
+                            if pm:
+                                pv = clean_number(pm.group(1))
+                                if (pv is not None and 0 < pv <= 40
+                                        and "TaxRatePercent" not in current_item):
+                                    current_item["TaxRatePercent"] = pv
+                                continue
 
                         if col in ("Quantity", "Rate", "Amount") and is_number(txt):
                             current_item[col] = clean_number(txt)
@@ -3076,6 +3156,19 @@ class OCREngine:
                         # land nearest the IGST partition anchor (see
                         # detect_table_columns), never a real description.
                         if col in ("GST", "IGST"):
+                            # Some layouts print a CLEAN rate alone in this
+                            # column (e.g. Sureworks' own "18.0%", no
+                            # amount glued in) rather than the combined
+                            # amount+percent blob this column usually
+                            # holds - captured only when it parses as a
+                            # plain, plausible GST percentage on its own,
+                            # so the messy combined case above still falls
+                            # through to being discarded exactly as before.
+                            gm = re.fullmatch(r"(\d{1,2}(?:\.\d+)?)\s*%", txt)
+                            if gm and "TaxRatePercent" not in current_item:
+                                v = clean_number(gm.group(1))
+                                if v is not None and 0 < v <= 40:
+                                    current_item["TaxRatePercent"] = v
                             continue
 
                         # Numbers under other columns (e.g. discount) are
@@ -3118,7 +3211,17 @@ class OCREngine:
                         " " + txt
                     )
 
-
+                # Decode the 3-way CGST/SGST/IGST breakdown positionally
+                # (see is_gst3_breakdown/gst3_tokens above): CGST Rate, CGST
+                # Amount, SGST Rate, SGST Amount, IGST Rate, IGST Amount,
+                # then Line Total - the effective tax rate is always the
+                # sum of the 3 rate slots (even indices 0/2/4); only one of
+                # CGST+SGST vs IGST is ever non-zero on a real invoice (an
+                # intra-state vs inter-state transaction), so summing all
+                # three is correct either way without needing to know which.
+                if is_gst3_breakdown:
+                    rates = [clean_number(gst3_tokens[i]["text"]) for i in (0, 2, 4)]
+                    current_item["TaxRatePercent"] = sum(r for r in rates if r is not None)
 
                 # -----------------------------
                 # Assign numeric values (fallback, by order)
@@ -3276,9 +3379,10 @@ class OCREngine:
                     last_peelable_addition = None
                     continue
 
-                if (current_item and has_text
+                if (current_item and has_text and not footer_started
                         and not any(k in lower for k in EXCLUDE_KW)
-                        and not any(k in lower for k in CHARGE_KW)):
+                        and not any(k in lower for k in CHARGE_KW)
+                        and not re.search(r"\btota\b", lower)):
                     # A scanned/garbled image can split one logical item
                     # row across several OCR rows, with the Quantity/Rate/
                     # Amount figures landing on a row that has no
@@ -3294,6 +3398,17 @@ class OCREngine:
                     if value_cols:
                         for w in words:
                             t = w["text"].strip()
+                            # The HSN/SAC cell can sit on the same detail
+                            # line as the price cells ("Serial Number: ...
+                            # 84716040 ₹508.47 ₹1,016.94") - recovered like
+                            # the numeric columns are, only when this item
+                            # still has none.
+                            if not current_item.get("HSN") and current_item.get("Amount") is None:
+                                hv = _hsn_token_value(t.replace(",", ""))
+                                if (hv is not None and "HSN" in value_cols
+                                        and min(value_cols, key=lambda c: abs(w["x"] - value_cols[c])) == "HSN"):
+                                    current_item["HSN"] = hv
+                                    continue
                             if not is_number(t):
                                 continue
                             col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
@@ -3335,6 +3450,10 @@ class OCREngine:
                             and not content.startswith("(")
                             and ":" not in content
                             and len(content.split()) > 1
+                            # a serial/ID line ("112540108037, Warranty") is
+                            # never a next item's opening name: it needs two
+                            # real words
+                            and len(re.findall(r"[A-Za-z]{3,}", content)) >= 2
                         )
                         else None
                     )
@@ -3355,11 +3474,40 @@ class OCREngine:
                 current_item
             )
 
-
+        # A "next serial + name words" row that never received any value of
+        # its own was really a wrapped description line whose leading digits
+        # only looked like the next serial ("2 PORT SERAIL CARD", or the
+        # amount's own tail "02KV9G Dell Latitude ..."): fold it back into
+        # the item above instead of leaving an empty phantom line.
+        folded = []
+        for item in items:
+            if (
+                folded
+                and item.get("Amount") is None
+                and item.get("Quantity") is None
+                and item.get("Rate") is None
+                and not item.get("charge")
+            ):
+                folded[-1]["Description"] = (
+                    folded[-1]["Description"] + " " + item["Description"]
+                ).strip()
+                continue
+            folded.append(item)
+        items = folded
 
         # Cleanup
 
         for seq, item in enumerate(items, start=1):
+
+            # Device serial numbers ("Serial Number:CN05NT8RPRC00626041SA08",
+            # "S/N: CN-0657PN-64180-...") are never part of the item's name:
+            # drop each label + its value, keeping the product text.
+            item["Description"] = _SERIAL_NO_RE.sub(
+                lambda m: " " if re.search(r"\d", m.group("val")) else m.group(0),
+                item["Description"],
+            )
+            # Unlabelled Dell service-tag serials ("CN-05NT8R-PRC00-627-08LI-A08").
+            item["Description"] = _DELL_TAG_RE.sub(" ", item["Description"])
 
             item["Description"] = re.sub(
                 r"\s+",
@@ -3510,6 +3658,19 @@ class OCREngine:
 
             elif "hsn" in txt:
                 columns["HSN"] = x
+                # A scanned page with no visible gap between adjacent
+                # headers can OCR-merge two labels into one token (e.g.
+                # "HSN/SACQuantity", HSN and Quantity glued together with
+                # nothing between them) - the elif chain only ever
+                # classifies a token as ONE column, so "Quantity" would
+                # otherwise never get an anchor at all, and its row values
+                # have nowhere to attach for the rest of the document.
+                # Same x as HSN (the true split point is unknown) is still
+                # far better than no anchor at all; setdefault so a later,
+                # separately-printed "Quantity" header (the normal case)
+                # always wins over this approximation.
+                if "qty" in txt or "quantity" in txt:
+                    columns.setdefault("Quantity", x)
 
             elif "sac" == txt:
                 columns.setdefault("HSN", x)
@@ -3569,6 +3730,20 @@ class OCREngine:
                 if not amount_locked:
                     columns.setdefault("Amount", x)
 
+        # A scanned page can OCR the "Amount" header into something
+        # unrecognizable (e.g. "Aannnt") - no keyword above ever matches it,
+        # so the column is silently never created and every value in it
+        # (the line's own Amount) has nowhere to land and is dropped
+        # entirely. Last-resort positional fallback: a standard GST-invoice
+        # item table's rightmost header column is always Amount, so the
+        # header row's own rightmost word - as long as it sits past every
+        # column already found (never overrides a genuinely-matched one) -
+        # is that column even when its text is unrecognizable.
+        if "Amount" not in columns and header_row:
+            rightmost = max(header_row, key=lambda w: w["x"])
+            if not columns or rightmost["x"] > max(columns.values()):
+                columns["Amount"] = rightmost["x"]
+
         # ------------------------------------------
         # Merge split headers
         # Example:
@@ -3608,162 +3783,6 @@ class OCREngine:
         print("-" * 40)
 
         return columns
-    def split_page_regions(
-        self,
-        rows
-    ):
-
-        left_rows = []
-        right_rows = []
-        table_rows = []
-        footer_rows = []
-
-
-        for row in rows:
-
-            if not row:
-                continue
-
-
-            avg_x = sum(
-                w["center_x"]
-                for w in row
-            ) / len(row)
-
-
-
-            text = " ".join(
-                w["text"].lower()
-                for w in row
-            )
-
-
-
-            # -----------------------------
-            # Table
-            # -----------------------------
-
-            if (
-                "description" in text
-                or
-                "goods" in text
-                or
-                "hsn" in text
-                or
-                "quantity" in text
-            ):
-
-                table_rows.append(row)
-
-                continue
-
-
-
-            # -----------------------------
-            # Footer
-            # -----------------------------
-
-            if (
-                "amount chargeable" in text
-                or
-                "tax amount" in text
-                or
-                "declaration" in text
-            ):
-
-                footer_rows.append(row)
-
-                continue
-
-
-
-            # -----------------------------
-            # Header split
-            # -----------------------------
-
-            if avg_x < 900:
-
-                left_rows.append(row)
-
-            else:
-
-                right_rows.append(row)
-
-
-
-        return {
-
-            "Left": left_rows,
-
-            "Right": right_rows,
-
-            "Table": table_rows,
-
-            "Footer": footer_rows
-
-        }
-    def detect_regions(
-        self,
-        rows
-    ):
-
-        all_words = [
-            w
-            for row in rows
-            for w in row
-        ]
-
-
-        if not all_words:
-            return {}
-
-
-        page_width = max(
-            w["right"]
-            for w in all_words
-        )
-
-
-        middle = page_width / 2
-
-
-        regions = {
-
-            "LEFT": [],
-
-            "RIGHT": [],
-
-            "CENTER": []
-
-        }
-
-
-        for row in rows:
-
-
-            row_center = sum(
-                w["center_x"]
-                for w in row
-            ) / len(row)
-
-
-            if row_center < middle * 0.8:
-
-                regions["LEFT"].append(row)
-
-
-            elif row_center > middle * 1.2:
-
-                regions["RIGHT"].append(row)
-
-
-            else:
-
-                regions["CENTER"].append(row)
-
-
-
-        return regions
     def clean_table_rows(self, table_rows):
 
         cleaned_rows = []
@@ -3806,7 +3825,29 @@ class OCREngine:
 
 
             if any(x in lower for x in remove_words):
-                continue
+                # A marketplace-style item row prints its own "Tax Type"
+                # cell on the SAME row as the product ("1 | Symbol Trigger
+                # Assembly for MC9000 ... | ₹3,117.77 1 ₹3,117.77 18% IGST
+                # ₹561.20 ₹3,678.97"): serial + a real multi-word product
+                # name + the tax-type word. Only that shape is kept - a
+                # genuine tax row never opens with a serial and a product
+                # name, and never mentions "total"/"tax amount"/"round".
+                only_tax_type_hit = not any(
+                    x in lower for x in (
+                        "output igst", "input igst", "tax amount", "total",
+                        "round off", "round-off", "roundoff",
+                    )
+                )
+                name_words = [
+                    w for w in re.findall(r"[A-Za-z]{3,}", text)
+                    if w.lower() not in ("igst", "cgst", "sgst")
+                ]
+                if not (
+                    only_tax_type_hit
+                    and re.fullmatch(r"\d{1,3}[.)]?", words_in_row[0])
+                    and len(name_words) >= 3
+                ):
+                    continue
 
 
             # remove duplicate headers
@@ -3814,6 +3855,7 @@ class OCREngine:
                 "description",
                 "hsn",
                 "quantity",
+                "qty",  # some templates abbreviate the column header itself
                 "rate",
                 "amount"
             ]

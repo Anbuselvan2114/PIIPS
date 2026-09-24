@@ -9,6 +9,84 @@ before 2.2 is grouped under **2.1** below as a retrospective summary (by
 theme, not a literal commit-by-commit log) rather than a series of real
 sub-versions.
 
+## 2.3 — 2026-09-24
+
+### Security hardening for production
+
+- **Server-side authentication.** `/api/login` now returns a signed,
+  12-hour bearer token (secret auto-generated into `config.json` as
+  `auth_secret` on first start - one per environment, never deployed). Every
+  `/api/*` route except health/version/login/forgot-password and the
+  pre-login config/role-menu reads requires it; PDF/download links carry it
+  as `?access_token=`. An expired or missing session sends the user back to
+  the sign-in screen.
+- **Server-side authorisation** (`security.py`): Viewer is read-only for
+  every write; the Users, Configuration, API Configuration, Training,
+  Mapping, Create Field and Template routes require the matching menu in the
+  caller's Screen Access mapping (Super Admin always passes); and a request
+  naming a different acting user than the token's owner is rejected - which
+  makes every existing per-endpoint role check trustworthy. Previously all
+  of this was enforced only by hiding menus in the browser.
+- Sign-in is limited to 10 attempts / 15 min per client+user;
+  forgot-password to 5 / hour per client and 3 / hour per account.
+- `/api/config` no longer returns the signing secret; interactive API docs
+  and the OpenAPI schema are disabled.
+- Removed ~700 lines of unreachable extraction code from `ocr_engine.py`.
+
+### Processing run
+
+- **Parallel extraction.** Start now extracts several files at the same time
+  in a pool of worker processes (`extract_worker.py`; each keeps its own
+  OCR engine loaded and the pool is warmed at service start). Results are
+  still consumed in file order, so duplicate detection and batching behave
+  exactly as before - a 123-file check returned identical output either way.
+  Default is one worker per CPU core (max 8); set `parallel_workers` in
+  `config.json` to change it (`1` = old one-at-a-time behaviour). Runs of
+  a single file stay in-process. After a service restart the workers need
+  about a minute to finish loading; a run started in that window is just slower. If a worker dies the rest are extracted
+  in-process instead of failing the run.
+- **Step-based progress.** A run of N files has N+2 pieces on the bar: a
+  leading "Preparing" piece (scanning the Input folder, sorting files,
+  loading already-processed invoices and trained templates, starting the
+  workers - the bar and what it is doing show the instant Start is clicked),
+  one piece per file, and a final Service First sync / save piece. Every
+  piece is a small 0-100% bar of its own and all look the same. File pieces
+  are ordered original PDFs first, then scanned, then photographed ones and,
+  inside each group, smallest file first (hover a piece for its name-less
+  position and kind). Files being extracted in parallel fill side by side
+  (stage by stage, with a smooth creep during a scanned page's OCR), and the
+  last piece fills as the sync / save progresses. The run reads 100% and
+  "completed" only after the last piece is full.
+- **Faster start.** PaddleOCR is now loaded lazily (a born-digital PDF never
+  needs it) and preloaded in the background by each worker, so workers are
+  ready in about a second instead of ~30 s and born-digital files no longer
+  wait on the OCR engine.
+- **Shared visibility.** Only one process run can exist at a time (a second
+  Start gets a clear "already running - started by <user>" message). Every
+  signed-in user now sees the live bar: a strip at the top of every screen,
+  and the Dashboard card with Start disabled, without reloading. Progress
+  polling uses a brief payload (no per-file result list).
+
+### Extraction
+
+- Full 540-invoice sweep (520 PART + 20 SERVICE): line Quantity/Rate/Amount
+  reconciliation against the GST rate, serial numbers ("S/N", "Serial
+  Number:") stripped from item descriptions, wrapped description lines no
+  longer attached to the wrong item, marketplace item rows (Amazon-style,
+  tax type on the item row) recognised, amounts printed above a skewed
+  scan's first item recovered, unreadable invoice dates left blank instead
+  of invented.
+- Addresses: labels no longer cut words mid-way ("Corporate" -> "Corpo"),
+  table-column captions and CIN lines no longer leak into address blocks,
+  missing seller/buyer PIN codes recovered from the letterhead text, the
+  50-character Address / Address 2 limit still enforced.
+- Buyer's Order No.: a misspelt "SPRPUR/" prefix (or wrong separator)
+  around an otherwise valid date/serial is flagged doubtful and listed in
+  Buyer Order Entry for correction.
+- SERVICE NAV Vendor Code: handwritten "^" read as "I" (Sureworks).
+- Fields popup: Purchase Header / Purchase Line / Reservation Entry tabs
+  (Reservation hidden for SERVICE); Address 2 shown as optional.
+
 ## 2.2.1 — 2026-09-05
 
 ### Read-only Viewer role

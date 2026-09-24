@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoicePdfUrl, getActiveAnnouncements, announcementImageUrl } from "./api";
+import { invoicePdfUrl, getActiveAnnouncements, announcementImageUrl, getActiveJob } from "./api";
 
 // PIIPS logo — a monogram "P" (source: logo/PIIPS-logo.svg) on an indigo-to-
 // magenta gradient badge; the P's counter doubles as a precision-target dot,
@@ -292,6 +292,121 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
   );
 }
 
+// A progress bar split into one piece per step: every file is a piece, and
+// (process runs) a final extra piece is the Service First sync + save - so a
+// 100-file run shows 101 pieces and only fills the last one when the run is
+// really complete. `done` pieces are filled left to right; with files being
+// extracted in parallel the fill advances as each one finishes. The last
+// piece pulses while its step is running.
+// ONE bar for the whole run, split into pieces: a first piece for "Sorting &
+// preparing files" (scanning, sorting original/scanned/photo, loading invoices
+// and templates, starting workers), one piece per file, and a last piece for
+// the Service First sync / save. Every piece is a small 0-100% bar of its own
+// and they all look the same; the first and last just get a wider slot on a
+// long run so their progress is visible next to hundreds of 1-2 px file pieces.
+const EDGE_SHARE = 0.05;                       // each end piece's share of a long bar
+export const isPreparing = (job) => (job?.stage || "").startsWith("Preparing");
+
+export function runPercent(job) {
+  const segs = job?.segments || [];
+  if (segs.length < 3) return job?.percent ?? 0;
+  const mid = segs.slice(1, -1);
+  const w = segs.length > 22 ? EDGE_SHARE : 1 / segs.length;
+  const avg = mid.reduce((s, v) => s + v, 0) / mid.length;
+  const pct = Math.round(w * segs[0] + (1 - 2 * w) * avg + w * segs[segs.length - 1]);
+  return job?.status === "completed" ? 100 : Math.min(pct, 99);
+}
+
+export function RunBar({ job }) {
+  const segs = job?.segments || [];
+  const n = segs.length;
+  return (
+    <div className="run-bars">
+      {n >= 3
+        ? <SegmentedProgress total={n} done={job.processed} segments={segs}
+                             kinds={job.segment_kinds} syncStep />
+        : <SegmentedProgress total={1} done={0} segments={[segs[0] ?? 0]} syncStep={false} />}
+    </div>
+  );
+}
+
+// One small bar per piece: 0..100% each. Files extracted in parallel fill side
+// by side; the whole bar fills left to right. Pieces all look identical.
+export function SegmentedProgress({ total, done, segments, kinds, syncStep = false, failed = false }) {
+  const n = Math.max(0, total || 0);
+  if (!n) return <div className="progress"><div className="progress-bar" style={{ width: "0%" }} /></div>;
+  const pct = (i) => (segments && segments.length === n ? segments[i] : 0);
+  const cells = [];
+  for (let i = 0; i < n; i++) {
+    const p = Math.max(0, Math.min(100, pct(i)));
+    const kindName = kinds && kinds.length === n ? ["original PDF", "scanned", "photographed"][kinds[i]] : "";
+    const what = !syncStep ? "Sorting & preparing files"
+      : i === 0 ? "Sorting & preparing files"
+      : i === n - 1 ? "Service First sync & save"
+      : `File ${i} of ${n - 2}${kindName ? ` (${kindName})` : ""}`;
+    cells.push(
+      <span key={i} className="seg" title={`${what} — ${p}%`}>
+        <span className={`seg-fill${failed ? " seg-failed" : ""}`} style={{ width: `${p}%` }} />
+      </span>
+    );
+  }
+  const edge = syncStep && n > 22 ? `${EDGE_SHARE * 100}% ` : "";
+  const cols = edge
+    ? `${edge}repeat(${n - 2}, minmax(0, 1fr)) ${edge.trim()}`
+    : `repeat(${n}, minmax(0, 1fr))`;
+  const gap = n > 250 ? 0 : n > 110 ? 1 : 2;
+  return (
+    <div className={`seg-progress${n > 250 ? " seg-dense" : ""}`}
+         style={{ gridTemplateColumns: cols, gap }}
+         role="progressbar" aria-valuemin={0} aria-valuemax={100}>
+      {cells}
+    </div>
+  );
+}
+
+
+// Slim, app-wide progress strip for the invoice-processing run that is
+// currently going - whoever started it. Only one process run can exist at a
+// time, so every signed-in user (on any screen) sees the same live bar, who
+// started it, and knows Start is unavailable until it finishes. Hidden when
+// nothing is running (and on the Dashboard, which shows the full card).
+export function JobBanner({ hidden = false }) {
+  const [job, setJob] = useState(null);
+  useEffect(() => {
+    let stop = false;
+    let timer = null;
+    const tick = async () => {
+      let next = null;
+      try {
+        const j = await getActiveJob("process", true);
+        if (j && (j.status === "running" || j.status === "pending")) next = j;
+      } catch { /* server briefly unreachable - keep the last view */ next = undefined; }
+      if (stop) return;
+      if (next !== undefined) setJob(next);
+      timer = setTimeout(tick, next ? 1000 : 3000);
+    };
+    tick();
+    return () => { stop = true; clearTimeout(timer); };
+  }, []);
+  if (!job || hidden) return null;
+  const files = job.file_total ?? job.total;
+  const phase = job.stage ? job.stage.toLowerCase() : "working";
+  return (
+    <div className="job-banner">
+      <div className="progress-meta" style={{ marginBottom: 6 }}>
+        <span>
+          <strong>Invoice processing in progress</strong>
+          {job.started_by_name ? ` — started by ${job.started_by_name}` : ""}
+          {" · "}{phase}
+        </span>
+        <span>{files && !isPreparing(job) ? `${Math.min(job.processed, files)}/${files} files · ` : ""}{runPercent(job)}%</span>
+      </div>
+      <RunBar job={job} />
+    </div>
+  );
+}
+
+
 export function Modal({ title, onClose, children, width = 1000 }) {
   return (
     <div onClick={onClose}
@@ -312,11 +427,22 @@ export function Modal({ title, onClose, children, width = 1000 }) {
 }
 
 // PDF/image viewer pop-up (opened by clicking an invoice number).
-export function PdfModal({ file, onClose }) {
+export function PdfModal({ file, page, pageEnd, onClose }) {
+  // A vendor can print more than one invoice in a single PDF (e.g. 2
+  // invoices, 1 per page, all sharing one uploaded file), or one invoice
+  // can itself span several pages - every row for the SAME file_name
+  // otherwise looks identical, so without a page (range) the viewer would
+  // always open at page 1 (and a save/download from it would include
+  // every page, or miss the invoice's own later pages) regardless of
+  // which invoice's row was actually clicked. Passing `page`/`pageEnd`
+  // through to invoicePdfUrl has the backend extract and serve just that
+  // page range instead of the whole file (see app.py's invoice_pdf) - so
+  // both viewing and downloading are already scoped to the right
+  // invoice, no client-side page-jump needed.
   return (
     <Modal title={file} onClose={onClose} width={1100}>
       <div style={{ height: "75vh" }}>
-        <iframe title={file} src={invoicePdfUrl(file)}
+        <iframe title={file} src={invoicePdfUrl(file, page, pageEnd)}
                 style={{ width: "100%", height: "100%", border: "none", borderRadius: 8 }} />
       </div>
     </Modal>
