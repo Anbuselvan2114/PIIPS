@@ -360,6 +360,25 @@ class OCREngine:
             arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
             return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
+    # Optional per-file progress reporting (see read_pdf's `progress`): a
+    # callable taking a 0..1 fraction of the WHOLE document, and the slice of
+    # that range the page currently being processed covers.
+    _progress_cb = None
+    _page_span = (0.0, 1.0)
+
+    def _report(self, fraction):
+        """Report progress within the current page (0..1), mapped into the
+        document-wide fraction the caller asked for. Never raises.
+        Sample: self._report(0.55)"""
+        cb = self._progress_cb
+        if cb is None:
+            return
+        lo, hi = self._page_span
+        try:
+            cb(lo + (hi - lo) * max(0.0, min(1.0, fraction)))
+        except Exception:  # noqa: BLE001 - progress must never break extraction
+            pass
+
     def process_page(
         self,
         page_no,
@@ -379,17 +398,37 @@ class OCREngine:
             # -----------------------------------------
 
             if boxes is None:
-                with OCREngine._ocr_lock:
-                    result = OCREngine._ocr.ocr(
-                        image,
-                        det=True,
-                        rec=True,
-                        cls=True
-                    )
+                # The OCR call blocks for seconds with no way to see inside
+                # it - creep this page's progress forward while it runs (an
+                # ease-out curve that never reaches the next milestone) so
+                # the file's bar keeps moving instead of freezing.
+                creeping = threading.Event()
+
+                def _creep():
+                    began = time.perf_counter()
+                    while not creeping.wait(0.4):
+                        self._report(
+                            0.05 + 0.45 * (1 - 2.718281828 ** (-(time.perf_counter() - began) / 8.0))
+                        )
+
+                if self._progress_cb is not None:
+                    threading.Thread(target=_creep, daemon=True).start()
+                try:
+                    with OCREngine._ocr_lock:
+                        result = OCREngine._ocr.ocr(
+                            image,
+                            det=True,
+                            rec=True,
+                            cls=True
+                        )
+                finally:
+                    creeping.set()
 
                 boxes = self.normalize_result(
                     result
                 )
+
+            self._report(0.55)      # text/OCR boxes in hand
 
 
             # -----------------------------------------
@@ -467,6 +506,7 @@ class OCREngine:
                 boxes
             )
             rows = self.merge_table_header_rows(rows)
+            self._report(0.7)       # rows grouped
 
             # -----------------------------------------
             # Detect Table
@@ -547,6 +587,7 @@ class OCREngine:
                 footer_rows,
                 page_width
             )
+            self._report(0.85)      # header fields read
 
 
 
@@ -595,6 +636,7 @@ class OCREngine:
                 footer_rows,
                 page_width
             )
+            self._report(0.95)      # items + tax summary read
 
 
             # -----------------------------------------
@@ -987,9 +1029,21 @@ class OCREngine:
         self,
         pdf_path,
         allow_scanned=False,
+        progress=None,
     ):
+        """Extract every invoice in a document. `progress`, when given, is
+        called with a 0..1 fraction as the work advances (loading, each page's
+        OCR/parse stages, merging) so a caller can show a live per-file bar.
+        Sample: OCREngine().read_pdf('a.pdf', progress=lambda f: print(f))"""
+
+        self._progress_cb = progress
+        self._page_span = (0.0, 1.0)
+        if progress:
+            progress(0.02)
 
         page_inputs = self._page_inputs(pdf_path)
+        if progress:
+            progress(0.15)
 
         # By default this only processes born-digital PDFs (a real embedded
         # text layer). A page with no text layer (image is not None) had to
@@ -1027,6 +1081,9 @@ class OCREngine:
                     "Document is a scanned or photocopied PDF, not an original "
                     "born-digital PDF (no embedded text layer) — unsupported."
                 )
+
+        if progress:
+            progress(0.25)          # loaded + validated; pages next
 
         result = {
 
@@ -1086,6 +1143,12 @@ class OCREngine:
             start=1
         ):
 
+
+            # This page's slice of the 0.25 .. 0.97 stretch of the bar.
+            self._page_span = (
+                0.25 + 0.72 * (page_no - 1) / len(page_inputs),
+                0.25 + 0.72 * page_no / len(page_inputs),
+            )
 
             page = self.process_page(
                 page_no,
@@ -1189,6 +1252,9 @@ class OCREngine:
 
         if not groups:
             groups.append(_new_group())
+
+        if progress:
+            progress(0.97)
 
         result["Invoices"] = [self._merge_group(g) for g in groups]
 

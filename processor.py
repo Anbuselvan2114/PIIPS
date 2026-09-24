@@ -83,6 +83,9 @@ class ProcessingJob:
         self.status = "pending"          # pending | running | completed | failed
         self.total = 0                   # steps: files (+1 sync step in process mode)
         self.file_total = 0              # files only
+        self.file_order = []             # source paths, in the order the pieces are drawn
+        self.file_progress = {}          # path -> 0..100 (that file's own bar)
+        self.sync_progress = 0           # 0..100 of the final Service First sync / save piece
         self.processed = 0
         self.current_file = ""
         self.stage = ""                  # Extracting | Syncing | Processing (per file)
@@ -94,10 +97,41 @@ class ProcessingJob:
 
     # -- progress snapshots ------------------------------------------------
 
+    def _segments(self):
+        """Per-piece progress, 0..100 each: one per file in order, then (process
+        mode) the final sync piece. Caller holds the lock."""
+        segs = [self.file_progress.get(p, 0) for p in self.file_order]
+        if self.mode == "process" and self.total > len(self.file_order):
+            segs.append(self.sync_progress)
+        return segs
+
     def _percent(self):
         if self.total <= 0:
             return 0
+        segs = self._segments()
+        if segs and len(segs) == self.total:
+            # Overall progress is the average of every piece's own bar, so it
+            # moves smoothly while several files extract at once - and stays
+            # under 100 until the run is really finished.
+            pct = round(sum(segs) / len(segs))
+            return 100 if self.status == "completed" else min(pct, 99)
         return round(self.processed / self.total * 100)
+
+    def set_file_progress(self, path, pct):
+        """Record one file's own progress (never backwards, 99 max until its
+        extraction has actually finished). Sample: job.set_file_progress(p, 40)"""
+        with self._lock:
+            if path in self.file_progress and self.file_progress[path] < 100:
+                self.file_progress[path] = max(self.file_progress[path], min(int(pct), 99))
+
+    def finish_file(self, path):
+        with self._lock:
+            if path in self.file_progress:
+                self.file_progress[path] = 100
+
+    def set_sync_progress(self, pct):
+        with self._lock:
+            self.sync_progress = max(self.sync_progress, min(int(pct), 100))
 
     def status_dict(self, brief=False):
         """Lightweight snapshot for polling (no extracted JSON payload).
@@ -118,6 +152,14 @@ class ProcessingJob:
                 "started_at": self.started_at.isoformat(timespec="seconds"),
                 "processed": self.processed,
                 "percent": self._percent(),
+                # one 0..100 value per piece of the segmented bar
+                "segments": self._segments(),
+                # the files being extracted right now, each with its own %
+                "running_files": [
+                    {"name": os.path.basename(p), "pct": self.file_progress[p]}
+                    for p in self.file_order
+                    if 0 < self.file_progress.get(p, 0) < 100
+                ],
                 "current_file": self.current_file,
                 "stage": self.stage,
                 "error": self.error,
@@ -274,6 +316,8 @@ class JobManager:
             source_files.sort()
 
             with job._lock:
+                job.file_order = list(source_files)
+                job.file_progress = {p: 0 for p in source_files}
                 job.file_total = len(source_files)
                 # Process mode has one extra, final step: the Service First
                 # sync + database save that follows the last extraction.
@@ -771,10 +815,12 @@ class JobManager:
             # every PART invoice queued above, instead of that pair once
             # per invoice - a 43-file run used to mean 80+ HTTP round trips,
             # each blocking on Service First's own response time.
-            if job.mode == "process" and pending:
+            if job.mode == "process":
                 with job._lock:
                     job.current_file = ""
                     job.stage = "Syncing"
+                job.set_sync_progress(5)
+            if job.mode == "process" and pending:
                 try:
                     spare_map, hsn_map = service_api.fetch_sf_batch(
                         ctx["data"] for ctx in pending
@@ -782,7 +828,8 @@ class JobManager:
                 except Exception:  # noqa: BLE001 - best-effort, same as any single SF call failing
                     traceback.print_exc()
                     spare_map, hsn_map = {}, {}
-                for ctx in pending:
+                job.set_sync_progress(35)
+                for n_done, ctx in enumerate(pending, start=1):
                     try:
                         verdict = service_api.apply_sf_batch(ctx["data"], spare_map, hsn_map)
                         rec = _finish_group(ctx, verdict)
@@ -791,6 +838,7 @@ class JobManager:
                         rec = {"file": ctx["filename"], "status": "error", "error": str(exc)}
                     with job._lock:
                         job.results.append(rec)
+                    job.set_sync_progress(35 + 30 * n_done / len(pending))
 
             # Commit the learned model once, only after a full training run.
             if job.mode == "train":
@@ -814,15 +862,19 @@ class JobManager:
             if job.mode == "process":
                 with job._lock:
                     job.stage = "Processing"
+                job.set_sync_progress(70)
                 self._save_to_db(job)
+                job.set_sync_progress(88)
                 self._reset_moved_files(job)
                 self._resync_pending(job)
                 self._expire_stale_unresolved(job)
+                job.set_sync_progress(95)
                 self._move_by_status(job)
 
             with job._lock:
                 # The final step (Service First sync + DB save) is done.
                 job.processed = job.total
+                job.sync_progress = 100
                 job.status = "completed"
                 job.current_file = ""
                 job.stage = ""
@@ -839,14 +891,14 @@ class JobManager:
 
     # Fewer files than this and spinning up worker processes (each loads its
     # own PaddleOCR, a few seconds) costs more than it saves.
-    PARALLEL_MIN_FILES = 8
+    PARALLEL_MIN_FILES = 2
 
     @staticmethod
     def _worker_count(file_count):
         """How many extraction processes to use for `file_count` files:
         config.json's "parallel_workers" (1 = extract sequentially in this
-        process), default half the CPU cores capped at 4.
-        Sample: JobManager._worker_count(100) -> 4"""
+        process), default one per CPU core (max 8) so every core is busy.
+        Sample: JobManager._worker_count(100) -> 8"""
         if file_count < JobManager.PARALLEL_MIN_FILES:
             return 1
         try:
@@ -859,7 +911,7 @@ class JobManager:
         except (TypeError, ValueError):
             workers = None
         if workers is None:
-            workers = min(4, max(1, (os.cpu_count() or 2) // 2))
+            workers = min(8, max(1, os.cpu_count() or 2))
         return max(1, min(workers, file_count))
 
     # The worker processes are created once and kept alive between runs: each
@@ -870,6 +922,20 @@ class JobManager:
     _pool = None
     _pool_workers = 0
     _pool_lock = threading.Lock()
+    _progress_queue = None      # workers -> main: (path, percent) per-file progress
+    _current_job = None         # the run whose files those messages belong to
+
+    @classmethod
+    def _drain_progress(cls, queue):
+        """Feed the workers' per-file progress messages into the running job."""
+        while True:
+            try:
+                path, pct = queue.get()
+            except Exception:  # noqa: BLE001 - queue closed
+                return
+            job = cls._current_job
+            if job is not None:
+                job.set_file_progress(path, pct)
 
     @classmethod
     def _get_pool(cls, workers):
@@ -881,11 +947,16 @@ class JobManager:
                 cls._pool = None
             if cls._pool is None:
                 threads = max(1, (os.cpu_count() or 2) // workers)
+                ctx = multiprocessing.get_context("spawn")
+                cls._progress_queue = ctx.Queue()
+                threading.Thread(
+                    target=cls._drain_progress, args=(cls._progress_queue,), daemon=True
+                ).start()
                 cls._pool = ProcessPoolExecutor(
                     max_workers=workers,
-                    mp_context=multiprocessing.get_context("spawn"),
+                    mp_context=ctx,
                     initializer=extract_worker.init_worker,
-                    initargs=(threads,),
+                    initargs=(threads, cls._progress_queue),
                 )
                 cls._pool_workers = workers
             return cls._pool
@@ -929,17 +1000,23 @@ class JobManager:
         remaining files are extracted sequentially in this process instead.
         Sample: for path, res in JobManager()._extract_stream(job, files, lambda p: False): ..."""
 
-        def tick(name):
+        JobManager._current_job = job
+
+        def tick(path):
+            job.finish_file(path)
             with job._lock:
                 job.processed += 1
-                job.current_file = name
+                job.current_file = os.path.basename(path)
 
         engine = []
 
         def extract_here(path):
             if not engine:
                 engine.append(OCREngine())
-            return engine[0].read_pdf(path, allow_scanned=allow_fn(path))
+            return engine[0].read_pdf(
+                path, allow_scanned=allow_fn(path),
+                progress=lambda f, p=path: job.set_file_progress(p, int(f * 100)),
+            )
 
         workers = self._worker_count(len(source_files))
         pool = None
@@ -956,7 +1033,7 @@ class JobManager:
                     result = extract_here(path)
                 except Exception as exc:  # noqa: BLE001 - reported per file
                     result = exc
-                tick(os.path.basename(path))
+                tick(path)
                 yield path, result
             return
 
@@ -974,7 +1051,7 @@ class JobManager:
             by_path = {}
             for path in sorted(source_files, key=_size, reverse=True):
                 fut = pool.submit(extract_worker.extract_one, path, allow_fn(path))
-                fut.add_done_callback(lambda _f, name=os.path.basename(path): tick(name))
+                fut.add_done_callback(lambda _f, p=path: tick(p))
                 by_path[path] = fut
             futures = [by_path[path] for path in source_files]
 

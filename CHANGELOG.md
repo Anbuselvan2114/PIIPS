@@ -40,14 +40,19 @@ sub-versions.
   OCR engine loaded and the pool is warmed at service start). Results are
   still consumed in file order, so duplicate detection and batching behave
   exactly as before - a 123-file check returned identical output either way.
-  Default is half the CPU cores (max 4); set `parallel_workers` in
+  Default is one worker per CPU core (max 8); set `parallel_workers` in
   `config.json` to change it (`1` = old one-at-a-time behaviour). Runs of
-  fewer than 8 files stay in-process. If a worker dies the rest are extracted
+  a single file stay in-process. After a service restart the workers need
+  about a minute to finish loading; a run started in that window is just slower. If a worker dies the rest are extracted
   in-process instead of failing the run.
 - **Step-based progress.** A run of N files has N+1 steps - one per file plus
   a final Service First sync / save step - shown as a bar split into N+1
-  pieces (the last one pulses while syncing). The run reads 100% and
-  "completed" only after that last step.
+  pieces. Every piece is a small 0-100% bar of its own and all look the same:
+  files being extracted in parallel fill side by side (stage-by-stage, with a
+  smooth creep during a scanned page's OCR), and the last piece fills as the
+  Service First sync / save progresses. The Dashboard also lists the files
+  being extracted right now with their own percentages. The run reads 100% and
+  "completed" only after the last piece is full.
 - **Shared visibility.** Only one process run can exist at a time (a second
   Start gets a clear "already running - started by <user>" message). Every
   signed-in user now sees the live bar: a strip at the top of every screen,

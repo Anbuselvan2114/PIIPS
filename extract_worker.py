@@ -12,13 +12,17 @@ given. Everything here must stay importable without importing processor.py
 import os
 
 _engine = None
+_progress_queue = None
 
 
-def init_worker(ocr_threads):
+def init_worker(ocr_threads, progress_queue=None):
     """Pool initializer: cap PaddleOCR's own thread count so N workers don't
-    each grab every core (see ocr_engine.OCREngine.initialize).
-    Sample: init_worker(2)"""
+    each grab every core (see ocr_engine.OCREngine.initialize), and remember
+    the queue per-file progress is reported on.
+    Sample: init_worker(2, queue)"""
+    global _progress_queue
     os.environ["PIIPS_OCR_THREADS"] = str(max(1, int(ocr_threads)))
+    _progress_queue = progress_queue
 
 
 def extract_one(path, allow_scanned):
@@ -31,7 +35,16 @@ def extract_one(path, allow_scanned):
         if _engine is None:
             from ocr_engine import OCREngine
             _engine = OCREngine()
-        return "ok", _engine.read_pdf(path, allow_scanned=allow_scanned)
+
+        last = [-1]
+
+        def report(fraction):
+            pct = int(fraction * 100)
+            if _progress_queue is not None and pct != last[0]:
+                last[0] = pct
+                _progress_queue.put((path, pct))
+
+        return "ok", _engine.read_pdf(path, allow_scanned=allow_scanned, progress=report)
     except Exception as exc:  # noqa: BLE001 - reported back per file
         import traceback
         traceback.print_exc()

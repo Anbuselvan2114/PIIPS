@@ -298,19 +298,24 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
 // really complete. `done` pieces are filled left to right; with files being
 // extracted in parallel the fill advances as each one finishes. The last
 // piece pulses while its step is running.
-export function SegmentedProgress({ total, done, syncStep = false, failed = false }) {
+export function SegmentedProgress({ total, done, segments, syncStep = false, failed = false }) {
   const n = Math.max(0, total || 0);
   if (!n) return <div className="progress"><div className="progress-bar" style={{ width: "0%" }} /></div>;
   const filled = Math.min(done || 0, n);
+  // Each piece is a small bar of its own: 0..100% for its file (files being
+  // extracted in parallel fill side by side), the last one for the sync step.
+  // Every piece looks the same - only its fill differs.
+  const pct = (i) => (segments && segments.length === n ? segments[i] : (i < filled ? 100 : 0));
   const cells = [];
   for (let i = 0; i < n; i++) {
     const isSync = syncStep && i === n - 1;
-    let cls = "seg";
-    if (i < filled) cls += failed ? " seg-failed" : " seg-done";
-    else if (isSync && filled >= n - 1) cls += " seg-active";
-    if (isSync) cls += " seg-sync";
-    cells.push(<span key={i} className={cls}
-      title={isSync ? "Service First sync & save" : `File ${i + 1} of ${syncStep ? n - 1 : n}`} />);
+    const p = Math.max(0, Math.min(100, pct(i)));
+    cells.push(
+      <span key={i} className="seg"
+        title={`${isSync ? "Service First sync & save" : `File ${i + 1} of ${syncStep ? n - 1 : n}`} — ${p}%`}>
+        <span className={`seg-fill${failed ? " seg-failed" : ""}`} style={{ width: `${p}%` }} />
+      </span>
+    );
   }
   return (
     <div className="seg-progress" style={{ gridTemplateColumns: `repeat(${n}, 1fr)` }}
@@ -358,7 +363,7 @@ export function JobBanner({ hidden = false }) {
         </span>
         <span>{Math.min(job.processed, files)}/{files} files · {job.percent}%</span>
       </div>
-      <SegmentedProgress total={job.total} done={job.processed} syncStep />
+      <SegmentedProgress total={job.total} done={job.processed} segments={job.segments} syncStep />
     </div>
   );
 }
