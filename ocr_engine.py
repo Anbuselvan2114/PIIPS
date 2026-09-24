@@ -253,8 +253,16 @@ class OCREngine:
                 doc = fitz.open(path)
                 try:
                     for page in doc:
-                        if not self._pdf_text_boxes(page):
-                            image = self._render_pdf_page(path, page.number + 1)
+                        if not page.get_text("text").strip():
+                            # A thumbnail is plenty to tell a flat scan from a
+                            # photographed page (this only decides the ORDER
+                            # of the progress pieces; read_pdf does the real,
+                            # full-resolution checks) and is ~50x cheaper
+                            # than the 300 DPI OCR render.
+                            pix = page.get_pixmap(dpi=60)
+                            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                                pix.height, pix.width, pix.n)
+                            image = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
                             break
                 finally:
                     doc.close()
@@ -264,7 +272,8 @@ class OCREngine:
                 image = cv2.imread(path)
                 if image is None:
                     return self.KIND_PHOTO
-            if _looks_like_photo_page(image) or _looks_like_blurry_page(image):
+                image = cv2.resize(image, None, fx=0.25, fy=0.25) if max(image.shape[:2]) > 1600 else image
+            if _looks_like_photo_page(image):
                 return self.KIND_PHOTO
             return self.KIND_SCANNED
         except Exception:  # noqa: BLE001 - unreadable: last in line

@@ -107,10 +107,16 @@ class ProcessingJob:
     def _segments(self):
         """Per-piece progress, 0..100 each: one per file in order, then (process
         mode) the final sync piece. Caller holds the lock."""
-        segs = [self.file_progress.get(p, 0) for p in self.file_order]
+        if self.file_order:
+            segs = [self.file_progress.get(p, 0) for p in self.file_order]
+        else:
+            # Files are known (Input folder scanned) but still being sorted
+            # into original / scanned / photo: draw the full set of pieces
+            # already, all empty, so the bar is split from the very start.
+            segs = [0] * self.file_total
         if self.mode == "process":
             segs.insert(0, self.prep_progress)
-            if self.scanned:
+            if self.file_total or self.scanned:
                 segs.append(self.sync_progress)
         return segs
 
@@ -142,10 +148,11 @@ class ProcessingJob:
         """Kind of every piece, aligned with _segments(): -1 preparing,
         0 original PDF, 1 scanned, 2 photographed, -2 final sync. Caller
         holds the lock."""
-        kinds = [self.file_kind.get(p, 0) for p in self.file_order]
+        kinds = ([self.file_kind.get(p, 0) for p in self.file_order]
+                 if self.file_order else [0] * self.file_total)
         if self.mode == "process":
             kinds.insert(0, -1)
-            if self.scanned:
+            if self.file_total or self.scanned:
                 kinds.append(-2)
         return kinds
 
