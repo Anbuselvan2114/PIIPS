@@ -2,7 +2,8 @@ import { useState } from "react";
 import { forgotPassword } from "./api";
 
 export default function ForgotPassword({ onDone }) {
-  const [value, setValue] = useState("");
+  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -11,7 +12,7 @@ export default function ForgotPassword({ onDone }) {
     setMsg(null);
     setBusy(true);
     try {
-      const r = await forgotPassword(value.trim());
+      const r = await forgotPassword(username.trim(), email.trim());
       setMsg({ ok: true, text: r.message || "If that account exists, a new password has been emailed to it." });
     } catch (err) {
       // Even a server error shouldn't reveal whether the account exists.
@@ -26,22 +27,30 @@ export default function ForgotPassword({ onDone }) {
       <form className="auth-card" onSubmit={submit}>
         <div className="auth-brand">Forgot password</div>
         <div className="auth-sub">
-          Enter your username or email — we'll send a new temporary password
-          to the address on file.
+          Enter your username and the email address registered for it — we'll
+          send a new temporary password to that address.
         </div>
 
         <div className="field">
-          <label className="label">Username or email</label>
+          <label className="label">Username</label>
+          <div className="input-group">
+            <span className="ico">👤</span>
+            <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus placeholder="Username" />
+          </div>
+        </div>
+
+        <div className="field">
+          <label className="label">Email</label>
           <div className="input-group">
             <span className="ico">✉</span>
-            <input value={value} onChange={(e) => setValue(e.target.value)} autoFocus placeholder="Username or email" />
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Registered email" />
           </div>
         </div>
 
         {msg && <div className={`alert ${msg.ok ? "alert-success" : "alert-danger"}`}>{msg.text}</div>}
 
         <button type="submit" className="btn btn-primary btn-lg" style={{ width: "100%", marginTop: 18 }}
-                disabled={busy || !value.trim()}>
+                disabled={busy || !username.trim() || !email.trim()}>
           {busy ? "Sending…" : "Send new password"}
         </button>
 

@@ -1973,7 +1973,12 @@ class LoginModel(BaseModel):
 
 
 class ForgotPasswordModel(BaseModel):
-    username_or_email: str
+    # Several accounts can share one email address, so the form asks for the
+    # username AND the email and matches the pair. `username_or_email` is the
+    # older single-field form, still accepted.
+    username: Optional[str] = ""
+    email: Optional[str] = ""
+    username_or_email: Optional[str] = ""
 
 
 class ChangePasswordModel(BaseModel):
@@ -2055,7 +2060,15 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
     import database
     import mailer
 
-    name_or_email = (payload.username_or_email or "").strip()
+    username = (payload.username or "").strip()
+    email = (payload.email or "").strip()
+    legacy = (payload.username_or_email or "").strip()
+    if legacy and not username and not email:
+        if "@" in legacy:
+            email = legacy
+        else:
+            username = legacy
+    name_or_email = username or email
     generic = {"ok": True, "message": "If that account exists, a new password has been emailed to it."}
     if not name_or_email:
         return generic
@@ -2069,8 +2082,30 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
         )
 
     try:
-        user = database.get_user_by_email(name_or_email) if "@" in name_or_email \
-            else database.get_user(name_or_email)
+        if username:
+            # The account is named: an email given alongside it must be that
+            # account's own, so one shared address can't reset a neighbour.
+            user = database.get_user(username)
+            if user and email and (user.get("Email") or "").strip().lower() != email.lower():
+                user = None
+        else:
+            matches = database.get_users_by_email(email)
+            if len(matches) > 1:
+                # Same address on several accounts and no username given: don't
+                # guess which one - mail the address its usernames so the owner
+                # can ask again with the username.
+                names = ", ".join(m["UserName"] for m in matches if m["IsActive"])
+                if names:
+                    try:
+                        mailer.send_mail(
+                            email, "Your PIIPS usernames",
+                            "<p>Several PIIPS accounts use this email address: <b>"
+                            + names + "</b>.</p><p>On the Forgot password screen, enter the "
+                            "username you need together with this email address.</p>")
+                    except mailer.MailError:
+                        pass
+                return generic
+            user = matches[0] if matches else None
     except Exception:  # noqa: BLE001
         return generic
 

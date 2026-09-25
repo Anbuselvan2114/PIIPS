@@ -5264,6 +5264,30 @@ def get_user(username):
         conn.close()
 
 
+def get_users_by_email(email):
+    """EVERY user registered with this email (several accounts may share one
+    address), case-insensitive; [] when none. Sample: get_users_by_email('a@b.co')"""
+    if not (email or "").strip():
+        return []
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT u.UserId, u.UserName, u.UserTypeID, t.UserTypeName, u.Password, u.IsActive, "
+            "u.Email, u.MustChangePassword FROM dbo.tbl_user u "
+            "LEFT JOIN dbo.tbl_UserType t ON u.UserTypeID = t.UserTypeId "
+            "WHERE LOWER(LTRIM(RTRIM(u.Email))) = LOWER(LTRIM(RTRIM(?))) ORDER BY u.UserName",
+            email)
+        return [{
+            "UserId": r[0], "UserName": r[1], "UserTypeID": r[2],
+            "UserTypeName": r[3], "Password": r[4], "IsActive": bool(r[5]),
+            "Email": r[6], "MustChangePassword": bool(r[7]),
+        } for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def get_user_by_email(email):
     """Fetch one user by email, or None. Sample: get_user_by_email('jsmith@precisionit.co.in')"""
     if not email:

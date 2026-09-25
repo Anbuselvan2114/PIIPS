@@ -293,10 +293,10 @@ export const login = async (username, password) => {
   return rest;
 };
 
-export const forgotPassword = (username_or_email) =>
+export const forgotPassword = (username, email) =>
   request("/api/forgot-password", {
     method: "POST",
-    body: JSON.stringify({ username_or_email }),
+    body: JSON.stringify({ username, email }),
   });
 
 export const changePassword = (user_id, current_password, new_password) =>
