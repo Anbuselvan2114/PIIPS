@@ -5611,6 +5611,46 @@ TRACKER_AUDIT_COLUMNS = [
 ]
 
 
+# Who / when for the two header values people ask about, and for a part
+# description edited on Part Description Mapping.
+HEADER_AUDIT_COLUMNS = [
+    ("BuyerOrderNoUpdatedByID", "INT NULL"), ("BuyerOrderNoUpdatedBy", "NVARCHAR(100) NULL"),
+    ("BuyerOrderNoUpdatedDatetime", "DATETIME NULL"),
+    ("NavVendorCodeUpdatedByID", "INT NULL"), ("NavVendorCodeUpdatedBy", "NVARCHAR(100) NULL"),
+    ("NavVendorCodeUpdatedDatetime", "DATETIME NULL"),
+]
+LINE_AUDIT_COLUMNS = [
+    ("PartDescriptionUpdatedByID", "INT NULL"), ("PartDescriptionUpdatedBy", "NVARCHAR(100) NULL"),
+    ("PartDescriptionUpdatedDatetime", "DATETIME NULL"),
+]
+
+
+def _ensure_header_line_audit_columns(cur):
+    """Add the who/when columns to tbl_Purchase_Header / tbl_Purchase_Line (once
+    they exist - both are created lazily by the first processing run)."""
+    for table, cols in (("tbl_Purchase_Header", HEADER_AUDIT_COLUMNS),
+                        ("tbl_Purchase_Line", LINE_AUDIT_COLUMNS)):
+        cur.execute("SELECT 1 FROM sys.tables WHERE name = ?", table)
+        if not cur.fetchone():
+            continue
+        for col, ddl in cols:
+            cur.execute(f"IF COL_LENGTH('dbo.{table}', ?) IS NULL "
+                        f"EXEC('ALTER TABLE dbo.{table} ADD [' + ? + '] ' + ?)", col, col, ddl)
+
+
+def _stamp_header(cur, action, header_id, user_id, name, at):
+    """Buyer Order No / NAV Vendor Code who+when on tbl_Purchase_Header itself."""
+    if not header_id or action not in ("BUYER_ORDER_SET", "BUYER_ORDER_UPDATED",
+                                       "VENDOR_CODE_SET", "VENDOR_CODE_UPDATED"):
+        return
+    _ensure_header_line_audit_columns(cur)
+    prefix = "BuyerOrderNo" if action.startswith("BUYER_ORDER") else "NavVendorCode"
+    cur.execute(
+        f"UPDATE dbo.tbl_Purchase_Header SET {prefix}UpdatedByID = ?, {prefix}UpdatedBy = ?, "
+        f"{prefix}UpdatedDatetime = ISNULL(?, GETDATE()) WHERE Id = ?",
+        user_id, name, at, header_id)
+
+
 def _stamp_tracker(cur, action, header_id, batch, user_id, name, at, to_status, detail):
     """Mirror an audit event onto the tracker row (and tbl_BatchDownload for a
     batch download) so the CURRENT who/when is one SELECT away."""
@@ -5683,6 +5723,7 @@ def ensure_audit_table():
             cur.execute("IF OBJECT_ID('dbo.tbl_BatchDownload') IS NOT NULL AND "
                         "COL_LENGTH('dbo.tbl_BatchDownload', ?) IS NULL "
                         "EXEC('ALTER TABLE dbo.tbl_BatchDownload ADD [' + ? + '] ' + ?)", col, col, ddl)
+        _ensure_header_line_audit_columns(cur)
         conn.commit()
         _audit_ready = True
     finally:
@@ -5739,6 +5780,11 @@ def log_event(action, header_id=None, batch=None, file_name=None, invoice_no=Non
                 (str(invoice_no)[:100] if invoice_no else None), action,
                 from_status, to_status, (detail or "")[:600] or None)
             _stamp_tracker(cur, action, header_id, batch, user_id, name, at, to_status, detail)
+            try:
+                _stamp_header(cur, action, header_id, user_id, name, at)
+            except Exception:  # noqa: BLE001 - the header stamp is a mirror; keep the audit row
+                import traceback
+                traceback.print_exc()
             if conn is not None:
                 conn.commit()
         finally:
@@ -5812,6 +5858,52 @@ def log_processed_batch(batch_name, started_by, started_at):
     except Exception:  # noqa: BLE001
         import traceback
         traceback.print_exc()
+
+
+def record_part_description_update(purchase_order_no, description, user_id=None, part_no_map_id=None):
+    """A part description was corrected on Part Description Mapping: stamp who
+    and when on the matching tbl_Purchase_Line rows (this PO's lines whose
+    invoice description equals the description that was saved) and add an audit
+    event per invoice. Returns how many lines were stamped.
+    Sample: record_part_description_update('SPRPUR/2026/08/12-85974', 'DELL ADAPTER 65W', 7, 1234)"""
+    po = (purchase_order_no or "").strip()
+    norm = re.sub(r"\s+", " ", (description or "").strip()).lower()
+    if not po or not norm:
+        return 0
+    try:
+        ensure_audit_table()
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            _ensure_header_line_audit_columns(cur)
+            name = "System"
+            if user_id:
+                cur.execute("SELECT UserName FROM dbo.tbl_User WHERE UserId = ?", user_id)
+                r = cur.fetchone()
+                name = r[0] if r else f"user #{user_id}"
+            cur.execute(
+                "SELECT l.Id, l.Purchase_Header_ID, l.[Description] FROM dbo.tbl_Purchase_Line l "
+                "JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID "
+                "WHERE LOWER(LTRIM(RTRIM(pt.BuyerOrderNo))) = LOWER(?)", po)
+            hits = [(lid, hid) for lid, hid, d in cur.fetchall()
+                    if re.sub(r"\s+", " ", (d or "").strip()).lower() == norm]
+            for lid, _hid in hits:
+                cur.execute(
+                    "UPDATE dbo.tbl_Purchase_Line SET PartDescriptionUpdatedByID = ?, "
+                    "PartDescriptionUpdatedBy = ?, PartDescriptionUpdatedDatetime = GETDATE() WHERE Id = ?",
+                    user_id, name, lid)
+            for hid in sorted({h for _l, h in hits}):
+                log_event("PART_DESCRIPTION_UPDATED", header_id=hid, user_id=user_id, _cur=cur,
+                          detail=f"Part description set to '{(description or '').strip()[:200]}' on Part "
+                                 f"Description Mapping (Service First part {part_no_map_id})")
+            conn.commit()
+            return len(hits)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - never breaks the save
+        import traceback
+        traceback.print_exc()
+        return 0
 
 
 def get_audit(header_id=None, batch=None, user=None, action=None, entity=None,

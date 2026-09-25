@@ -1032,7 +1032,7 @@ class PartDescriptionSaveModel(BaseModel):
 
 
 @app.post("/api/part-description-update/save")
-def part_description_update_save(payload: PartDescriptionSaveModel):
+def part_description_update_save(payload: PartDescriptionSaveModel, request: Request):
     """Push a corrected description for one Service First part back to SF -
     Part Description Mapping menu's Update button (UpdateInvoiceDescription-
     InPurchaseLine). part_no_map_id is stores_SparePurchaseLine.PartNoMapID
@@ -1071,6 +1071,11 @@ def part_description_update_save(payload: PartDescriptionSaveModel):
                 )
     try:
         result = service_api.update_invoice_description(payload.part_no_map_id, payload.description)
+        # Who / when for the matching Purchase Line rows (best effort).
+        import database
+        database.record_part_description_update(
+            payload.purchase_order_no, desc, request.scope.get("state", {}).get("user_id"),
+            payload.part_no_map_id)
         return {"result": result}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Service First update failed: {exc}")

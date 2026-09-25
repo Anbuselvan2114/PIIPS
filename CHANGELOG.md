@@ -22,6 +22,15 @@ Nothing is displayed for this yet; it is recorded in the database for reporting.
   when for the last status change, and who / when the batch was last downloaded.
   A value that arrived automatically is recorded against the person who
   STARTED the process, at the process time.
+- **Header (`tbl_Purchase_Header`):** who / when the Buyer Order No was last set
+  or changed, and who / when the NAV Vendor Code was (`BuyerOrderNoUpdatedBy`,
+  `BuyerOrderNoUpdatedDatetime`, `NavVendorCodeUpdatedBy`,
+  `NavVendorCodeUpdatedDatetime`; the person who started the process for
+  values read automatically).
+- **Lines (`tbl_Purchase_Line`):** who / when a part description was updated on
+  Part Description Mapping (`PartDescriptionUpdatedBy`,
+  `PartDescriptionUpdatedDatetime`) on the invoice lines that carry that
+  description for the PO. None of these columns appear in the Excel export.
 - **Batches (`tbl_BatchDownload`):** who last downloaded the batch (with the
   existing date and count).
 - **History (`tbl_Audit_Event`):** every action as its own row - upload, process,
