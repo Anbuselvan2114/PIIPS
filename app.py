@@ -1973,7 +1973,12 @@ class LoginModel(BaseModel):
 
 
 class ForgotPasswordModel(BaseModel):
-    username_or_email: str
+    # Several accounts can share one email address, so the form asks for the
+    # username AND the email and matches the pair. `username_or_email` is the
+    # older single-field form, still accepted.
+    username: Optional[str] = ""
+    email: Optional[str] = ""
+    username_or_email: Optional[str] = ""
 
 
 class ChangePasswordModel(BaseModel):
@@ -2005,7 +2010,21 @@ def _base_url(request: Request):
 
 
 def _client_ip(request: Request):
-    return (request.client.host if request.client else "") or "unknown"
+    """The caller's address for throttling. Behind the IIS reverse proxy every
+    request arrives from the proxy's own (loopback/private) address, which
+    would make ALL users share one throttle bucket - so when the direct peer
+    is a proxy on this machine/LAN, take the first X-Forwarded-For hop."""
+    peer = (request.client.host if request.client else "") or "unknown"
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if forwarded:
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(peer)
+            if addr.is_loopback or addr.is_private:
+                return forwarded
+        except ValueError:
+            pass
+    return peer
 
 
 @app.post("/api/login")
@@ -2041,7 +2060,15 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
     import database
     import mailer
 
-    name_or_email = (payload.username_or_email or "").strip()
+    username = (payload.username or "").strip()
+    email = (payload.email or "").strip()
+    legacy = (payload.username_or_email or "").strip()
+    if legacy and not username and not email:
+        if "@" in legacy:
+            email = legacy
+        else:
+            username = legacy
+    name_or_email = username or email
     generic = {"ok": True, "message": "If that account exists, a new password has been emailed to it."}
     if not name_or_email:
         return generic
@@ -2055,12 +2082,38 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
         )
 
     try:
-        user = database.get_user_by_email(name_or_email) if "@" in name_or_email \
-            else database.get_user(name_or_email)
+        if username:
+            # The account is named: an email given alongside it must be that
+            # account's own, so one shared address can't reset a neighbour.
+            user = database.get_user(username)
+            if user and email and (user.get("Email") or "").strip().lower() != email.lower():
+                user = None
+        else:
+            matches = database.get_users_by_email(email)
+            if len(matches) > 1:
+                # Same address on several accounts and no username given: don't
+                # guess which one - mail the address its usernames so the owner
+                # can ask again with the username.
+                names = ", ".join(m["UserName"] for m in matches if m["IsActive"])
+                if names:
+                    try:
+                        mailer.send_mail(
+                            email, "Your PIIPS usernames",
+                            "<p>Several PIIPS accounts use this email address: <b>"
+                            + names + "</b>.</p><p>On the Forgot password screen, enter the "
+                            "username you need together with this email address.</p>")
+                    except mailer.MailError:
+                        pass
+                return generic
+            user = matches[0] if matches else None
     except Exception:  # noqa: BLE001
         return generic
 
     if not user or not user["IsActive"] or not user.get("Email"):
+        # The caller always gets the same reply (no account enumeration); the
+        # reason is logged for whoever runs the server.
+        print(f"[forgot-password] no reset sent: no active account with an email "
+              f"for username={username!r} email={email!r}")
         return generic
 
     temp_password = database.generate_temp_password()
@@ -2074,8 +2127,11 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
             user["Email"], "Your PIIPS password was reset",
             mailer.password_reset_email_html(user["UserName"], temp_password, _base_url(request)),
         )
-    except mailer.MailError:
-        pass  # generic response either way - the password was still reset
+    except mailer.MailError as exc:
+        # Same reply either way - the password WAS reset - but say why the mail
+        # never arrived (SMTP not configured / login refused / unreachable).
+        print(f"[forgot-password] password reset for {user['UserName']!r} but the email "
+              f"could not be sent: {exc}")
 
     return generic
 
@@ -2090,6 +2146,8 @@ def api_change_password(payload: ChangePasswordModel):
         raise HTTPException(status_code=404, detail="User not found.")
     if not database.verify_password(payload.current_password or "", user["Password"] or ""):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
+    if (payload.new_password or "").strip().lower() == (user["UserName"] or "").strip().lower():
+        raise HTTPException(status_code=400, detail="Your new password can't be the same as your username.")
     try:
         database.reset_password(user["UserName"], payload.new_password, force_change=False)
     except ValueError as exc:
@@ -2184,9 +2242,14 @@ def api_create_user(payload: UserCreateModel, request: Request):
             raise HTTPException(status_code=400, detail="Enter a valid email address.")
 
     try:
+        # Viewer: the Super Admin's own chosen password (kept). Everyone else:
+        # the initial password is simply the username - the user MUST replace
+        # it at their first login (must_change_password), so it only ever
+        # works once, until they set their own under the full policy.
         temp_password = database.create_user(
             name, payload.user_type_id, email or None, payload.created_by,
-            password=payload.password if is_viewer else None,
+            password=payload.password if is_viewer else name,
+            force_change=None if is_viewer else True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2295,17 +2358,36 @@ def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
                        "- not their own, another Admin's, or a Super Admin's.",
             )
 
+    target_is_viewer = (target.get("UserTypeName") or "").strip().lower() == "viewer"
     if payload.new_password:
-        try:
-            database.validate_password_policy(payload.new_password)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        if is_super_admin:
+            # A Super Admin may give ANY user any password of their choosing
+            # (no complexity rules - just not empty); the user replaces it under
+            # the normal policy at their next login.
+            if not payload.new_password.strip() or len(payload.new_password) > 128:
+                raise HTTPException(status_code=400, detail="Enter a password (1-128 characters).")
+        else:
+            try:
+                database.validate_password_policy(payload.new_password)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
         new_password = payload.new_password
+        initial = is_super_admin
     else:
-        new_password = database.generate_temp_password()
+        # Back to the initial credential: password = username, change forced
+        # at the next login.
+        new_password = target["UserName"]
+        initial = True
 
     try:
-        database.reset_password(target["UserName"], new_password, force_change=True, modified_by=payload.user_id)
+        # A Viewer account is a fixed credential the Super Admin hands out (no
+        # forced change, same as when it is created); everyone else must
+        # change the password at next login.
+        database.reset_password(target["UserName"], new_password,
+                                force_change=not (is_super_admin and payload.new_password and target_is_viewer),
+                                modified_by=payload.user_id, check_policy=not initial)
+    except ValueError as exc:      # e.g. Sadmin's password is fixed
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 

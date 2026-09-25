@@ -4920,9 +4920,10 @@ def init_mail_settings_table():
         conn.close()
 
 
-# The one account guaranteed to always exist, with a fixed (not auto-
-# generated) password and no email/forced-change requirement, so it can
-# never be locked out by mail-server misconfiguration. Any number of other
+# The one account guaranteed to always exist, with a FIXED password that can
+# never be changed (reset_password refuses it, and every start restores it) and
+# no email/forced-change requirement, so it can never be locked out by
+# mail-server misconfiguration. Any number of other
 # Super Admins may also exist (created normally, with email + a generated
 # password like everyone else) - this is just the always-available default.
 DEFAULT_SUPER_ADMIN_USERNAME = "Sadmin"
@@ -4937,8 +4938,20 @@ def ensure_default_super_admin():
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM tbl_user WHERE UserName = ?", DEFAULT_SUPER_ADMIN_USERNAME)
-        if cur.fetchone():
+        cur.execute("SELECT Password, IsActive, MustChangePassword FROM tbl_user WHERE UserName = ?",
+                    DEFAULT_SUPER_ADMIN_USERNAME)
+        existing = cur.fetchone()
+        if existing:
+            # Sadmin's password is FIXED (DEFAULT_SUPER_ADMIN_PASSWORD): whatever
+            # happened to it - a forgot-password mail, an old reset - it is put
+            # back on every start, active and with no forced change.
+            if (not verify_password(DEFAULT_SUPER_ADMIN_PASSWORD, existing[0] or "")
+                    or not existing[1] or existing[2]):
+                cur.execute(
+                    "UPDATE tbl_user SET Password = ?, IsActive = 1, MustChangePassword = 0 "
+                    "WHERE UserName = ?",
+                    hash_password(DEFAULT_SUPER_ADMIN_PASSWORD), DEFAULT_SUPER_ADMIN_USERNAME)
+                conn.commit()
             return
         cur.execute("SELECT UserTypeId FROM tbl_UserType WHERE UserTypeName = 'Super Admin'")
         row = cur.fetchone()
@@ -5199,6 +5212,7 @@ def list_users():
         for r in cur.fetchall():
             d = dict(zip(cols, r))
             d["IsActive"] = bool(d.get("IsActive"))
+            d["MustChangePassword"] = bool(d.get("MustChangePassword"))
             for k in ("CreatedDatetime", "LastModifiedDatetime"):
                 if d.get(k) is not None:
                     d[k] = str(d[k])
@@ -5208,7 +5222,7 @@ def list_users():
         conn.close()
 
 
-def create_user(username, user_type_id, email, created_by=None, password=None):
+def create_user(username, user_type_id, email, created_by=None, password=None, force_change=None):
     """Create a user (raises if the name exists). Normally a system-
     generated temporary password is used and returned so the caller can
     email it. `password`: an admin-assigned password instead of an
@@ -5224,7 +5238,9 @@ def create_user(username, user_type_id, email, created_by=None, password=None):
     # persistent credential the admin just chose, not a placeholder - don't
     # force a change on first login the way the emailed-temp-password flow
     # does.
-    must_change = password is None
+    # `force_change` overrides that: the "initial password = username" flow
+    # passes an admin-known password AND still forces a change at first login.
+    must_change = (password is None) if force_change is None else bool(force_change)
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -5257,6 +5273,30 @@ def get_user(username):
             "UserTypeName": r[3], "Password": r[4], "IsActive": bool(r[5]),
             "Email": r[6], "MustChangePassword": bool(r[7]),
         }
+    finally:
+        conn.close()
+
+
+def get_users_by_email(email):
+    """EVERY user registered with this email (several accounts may share one
+    address), case-insensitive; [] when none. Sample: get_users_by_email('a@b.co')"""
+    if not (email or "").strip():
+        return []
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT u.UserId, u.UserName, u.UserTypeID, t.UserTypeName, u.Password, u.IsActive, "
+            "u.Email, u.MustChangePassword FROM dbo.tbl_user u "
+            "LEFT JOIN dbo.tbl_UserType t ON u.UserTypeID = t.UserTypeId "
+            "WHERE LOWER(LTRIM(RTRIM(u.Email))) = LOWER(LTRIM(RTRIM(?))) ORDER BY u.UserName",
+            email)
+        return [{
+            "UserId": r[0], "UserName": r[1], "UserTypeID": r[2],
+            "UserTypeName": r[3], "Password": r[4], "IsActive": bool(r[5]),
+            "Email": r[6], "MustChangePassword": bool(r[7]),
+        } for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -5368,13 +5408,20 @@ def authenticate(username, password):
     }
 
 
-def reset_password(username, new_password, force_change=False, modified_by=None):
+def reset_password(username, new_password, force_change=False, modified_by=None, check_policy=True):
     """Set a new hashed password for a user, validated against the password
     policy. `force_change=True` also flags the account so the user must set
     their own password on next login (used by user creation and the
     forgot-password flow; a normal self-service change passes False to
-    clear the flag). Sample: reset_password('jsmith', 'N3wPass!1', True, 7)"""
-    validate_password_policy(new_password)
+    clear the flag). `check_policy=False` skips the complexity rules - only
+    for the initial "password = username" credential, which the user must
+    replace (under the full policy) at their first login.
+    Sample: reset_password('jsmith', 'N3wPass!1', True, 7)"""
+    if (username or "").strip().lower() == DEFAULT_SUPER_ADMIN_USERNAME.lower():
+        raise ValueError(
+            f"The password of '{DEFAULT_SUPER_ADMIN_USERNAME}' is fixed and can't be changed.")
+    if check_policy:
+        validate_password_policy(new_password)
     init_user_table()
     ensure_menu_schema()
     conn = get_connection()

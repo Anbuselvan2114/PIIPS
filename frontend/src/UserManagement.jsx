@@ -54,7 +54,7 @@ export default function UserManagement({ user }) {
       );
       const text = isViewerType
         ? `User "${form.username.trim()}" created with the password you set.`
-        : `User "${form.username.trim()}" created. A temporary password was emailed to them.${emailNote(r)}`;
+        : `User "${form.username.trim()}" created. Their initial password is their username - they must change it at first login.${emailNote(r)}`;
       setMessage({ ok: true, text });
       setForm({ username: "", email: "", user_type_id: types[0]?.id ?? "", password: "" });
       refresh();
@@ -75,13 +75,13 @@ export default function UserManagement({ user }) {
   };
 
   const resetPw = async (u) => {
-    const ok = await confirmDialog(`Send "${u.UserName}" a new auto-generated password by email?`, {
-      confirmLabel: "Send password",
+    const ok = await confirmDialog(`Reset "${u.UserName}" to the initial password (their username)? They must change it at next login.`, {
+      confirmLabel: "Reset password",
     });
     if (!ok) return;
     try {
       const r = await adminResetPassword(user?.user_id, u.UserId);
-      setMessage({ ok: true, text: `New password emailed to "${u.UserName}".${emailNote(r)}` });
+      setMessage({ ok: true, text: `"${u.UserName}" reset - the password is now their username; they must change it at next login.${emailNote(r)}` });
     } catch (e) { setMessage({ ok: false, text: e.message }); }
   };
 
@@ -96,7 +96,8 @@ export default function UserManagement({ user }) {
   };
 
   const assignableUsers = useMemo(
-    () => users.filter((u) => u.IsActive && canAssignFor(u)),
+    // A Super Admin can set a password for ANY user (Sadmin's own is fixed).
+    () => users.filter((u) => (isSuperAdmin ? u.UserName !== "Sadmin" : u.IsActive) && canAssignFor(u)),
     [users, isSuperAdmin, user]
   );
 
@@ -129,7 +130,7 @@ export default function UserManagement({ user }) {
     setAssignPwBusy(true);
     try {
       const r = await adminResetPassword(user?.user_id, Number(assignPw.target_user_id), assignPw.next);
-      setAssignPwMsg({ ok: true, text: `Password updated for "${target?.UserName}" and emailed to them.${emailNote(r)}` });
+      setAssignPwMsg({ ok: true, text: `Password updated for "${target?.UserName}".${emailNote(r)}` });
       setAssignPw({ target_user_id: "", next: "", confirm: "" });
     } catch (e) { setAssignPwMsg({ ok: false, text: e.message }); }
     finally { setAssignPwBusy(false); }
@@ -145,7 +146,8 @@ export default function UserManagement({ user }) {
           Assign a new password for another user — {isSuperAdmin
             ? "as Super Admin you can select any user."
             : "you can select any User/Accounts account (not yourself, another Admin, or a Super Admin)."}
-          {" "}The new password is emailed to them and they must set their own on next login.
+          {isSuperAdmin ? " Any password is accepted for any user; it is emailed to them (if they have an email) and they must set their own on next login (a Viewer keeps it)."
+            : " The new password is emailed to them and they must set their own on next login."}
         </p>
         <form className="row" style={stackStyle} onSubmit={onAssignPw}>
           <div className="field">
@@ -178,7 +180,7 @@ export default function UserManagement({ user }) {
         <p className="hint">
           {isViewerType
             ? "A Viewer account is read-only, so it's set up directly here with a password of your choosing instead of an emailed temporary one — no email address is needed."
-            : "A temporary password is generated automatically and emailed to the address below — the admin never sets a password directly. The user is required to set their own password the first time they log in."}
+            : "The initial password is the same as the username. The user is required to set their own password the first time they log in."}
         </p>
         <div className="row" style={stackStyle}>
           <div className="field">
@@ -221,6 +223,7 @@ export default function UserManagement({ user }) {
           rows={users.map((u) => ({
             _key: u.UserId, user: u.UserName, type: u.UserTypeName || u.UserTypeID,
             email: u.Email || "—",
+            password: u.MustChangePassword ? u.UserName : "",
             active: u.IsActive ? "Active" : "Inactive", created: u.CreatedDatetime || "—", _u: u,
           }))}
           searchKeys={["user", "type", "email", "active", "created"]}
@@ -228,6 +231,12 @@ export default function UserManagement({ user }) {
           columns={[
             { key: "user", label: "User" },
             { key: "email", label: "Email" },
+            { key: "password", label: "Password", sortable: false,
+              render: (r) => r._u.MustChangePassword
+                ? <span title="First login pending - the initial password is the username, and must be changed at first login">
+                    <code>{r._u.UserName}</code> <span className="hint">(initial - change pending)</span>
+                  </span>
+                : <span className="hint" title="Passwords are stored one-way encrypted; the user chose this one">set by the user</span> },
             { key: "type", label: "Type", sortable: false,
               render: (r) => {
                 if (!canAssignFor(r._u)) return r.type;
@@ -270,7 +279,7 @@ export default function UserManagement({ user }) {
                             : undefined}>
                     {r._u.IsActive ? "Inactivate" : "Give access"}
                   </button>
-                  {canAssignFor(r._u) && (
+                  {canAssignFor(r._u) && r._u.UserName !== "Sadmin" && (
                     <button className="btn btn-sm btn-subtle" onClick={() => resetPw(r._u)}>
                       Reset password
                     </button>

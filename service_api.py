@@ -497,11 +497,11 @@ def evaluate_invoice(data):
         return {"status": status, "is_active": False, "is_synced": is_synced,
                 "errors": [reason], "reason": reason}
 
-    # 16 — seller GSTIN could not be captured from the PDF.
-    if not seller_gst:
-        return fail("seller gst could nt be captured")
-
-    # 8 — no Buyer's Order No. on the PDF (nothing to look up in SF).
+    # 8 — no Buyer's Order No. on the PDF (nothing to look up in SF). Checked
+    # BEFORE the seller GSTIN: a missing PO has its own manual-entry workflow
+    # (Buyer Order Entry), so an invoice lacking one lands there even when the
+    # vendor also has no readable GSTIN, instead of being parked under a
+    # provisional status the final completeness gate turns into DATA MISMATCH.
     if not order_no:
         return fail("Buyer order no is empty in pdf", status="BUYER ORDER NO DOESN'T EXIST")
 
@@ -511,6 +511,10 @@ def evaluate_invoice(data):
     if data.get("buyer_order_doubtful"):
         return fail("Buyer order no format is doubtful — please verify",
                     status="BUYER ORDER NO DOESN'T EXIST")
+
+    # 16 — seller GSTIN could not be captured from the PDF.
+    if not seller_gst:
+        return fail("seller gst could nt be captured")
 
     # Service-First-dependent checks (only when the backend is configured).
     if _base_url():
