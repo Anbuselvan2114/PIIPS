@@ -96,7 +96,8 @@ export default function UserManagement({ user }) {
   };
 
   const assignableUsers = useMemo(
-    () => users.filter((u) => u.IsActive && canAssignFor(u)),
+    // A Super Admin can set a password for ANY user (Sadmin's own is fixed).
+    () => users.filter((u) => (isSuperAdmin ? u.UserName !== "Sadmin" : u.IsActive) && canAssignFor(u)),
     [users, isSuperAdmin, user]
   );
 
@@ -129,7 +130,7 @@ export default function UserManagement({ user }) {
     setAssignPwBusy(true);
     try {
       const r = await adminResetPassword(user?.user_id, Number(assignPw.target_user_id), assignPw.next);
-      setAssignPwMsg({ ok: true, text: `Password updated for "${target?.UserName}" and emailed to them.${emailNote(r)}` });
+      setAssignPwMsg({ ok: true, text: `Password updated for "${target?.UserName}".${emailNote(r)}` });
       setAssignPw({ target_user_id: "", next: "", confirm: "" });
     } catch (e) { setAssignPwMsg({ ok: false, text: e.message }); }
     finally { setAssignPwBusy(false); }
@@ -145,7 +146,8 @@ export default function UserManagement({ user }) {
           Assign a new password for another user — {isSuperAdmin
             ? "as Super Admin you can select any user."
             : "you can select any User/Accounts account (not yourself, another Admin, or a Super Admin)."}
-          {" "}The new password is emailed to them and they must set their own on next login.
+          {isSuperAdmin ? " Any password is accepted for any user; it is emailed to them (if they have an email) and they must set their own on next login (a Viewer keeps it)."
+            : " The new password is emailed to them and they must set their own on next login."}
         </p>
         <form className="row" style={stackStyle} onSubmit={onAssignPw}>
           <div className="field">
@@ -277,7 +279,7 @@ export default function UserManagement({ user }) {
                             : undefined}>
                     {r._u.IsActive ? "Inactivate" : "Give access"}
                   </button>
-                  {canAssignFor(r._u) && (
+                  {canAssignFor(r._u) && r._u.UserName !== "Sadmin" && (
                     <button className="btn btn-sm btn-subtle" onClick={() => resetPw(r._u)}>
                       Reset password
                     </button>

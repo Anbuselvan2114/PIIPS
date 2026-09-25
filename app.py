@@ -2358,13 +2358,21 @@ def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
                        "- not their own, another Admin's, or a Super Admin's.",
             )
 
+    target_is_viewer = (target.get("UserTypeName") or "").strip().lower() == "viewer"
     if payload.new_password:
-        try:
-            database.validate_password_policy(payload.new_password)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        if is_super_admin:
+            # A Super Admin may give ANY user any password of their choosing
+            # (no complexity rules - just not empty); the user replaces it under
+            # the normal policy at their next login.
+            if not payload.new_password.strip() or len(payload.new_password) > 128:
+                raise HTTPException(status_code=400, detail="Enter a password (1-128 characters).")
+        else:
+            try:
+                database.validate_password_policy(payload.new_password)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
         new_password = payload.new_password
-        initial = False
+        initial = is_super_admin
     else:
         # Back to the initial credential: password = username, change forced
         # at the next login.
@@ -2372,8 +2380,14 @@ def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
         initial = True
 
     try:
-        database.reset_password(target["UserName"], new_password, force_change=True,
+        # A Viewer account is a fixed credential the Super Admin hands out (no
+        # forced change, same as when it is created); everyone else must
+        # change the password at next login.
+        database.reset_password(target["UserName"], new_password,
+                                force_change=not (is_super_admin and payload.new_password and target_is_viewer),
                                 modified_by=payload.user_id, check_policy=not initial)
+    except ValueError as exc:      # e.g. Sadmin's password is fixed
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 

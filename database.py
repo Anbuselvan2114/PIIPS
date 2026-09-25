@@ -4920,9 +4920,10 @@ def init_mail_settings_table():
         conn.close()
 
 
-# The one account guaranteed to always exist, with a fixed (not auto-
-# generated) password and no email/forced-change requirement, so it can
-# never be locked out by mail-server misconfiguration. Any number of other
+# The one account guaranteed to always exist, with a FIXED password that can
+# never be changed (reset_password refuses it, and every start restores it) and
+# no email/forced-change requirement, so it can never be locked out by
+# mail-server misconfiguration. Any number of other
 # Super Admins may also exist (created normally, with email + a generated
 # password like everyone else) - this is just the always-available default.
 DEFAULT_SUPER_ADMIN_USERNAME = "Sadmin"
@@ -4937,8 +4938,20 @@ def ensure_default_super_admin():
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM tbl_user WHERE UserName = ?", DEFAULT_SUPER_ADMIN_USERNAME)
-        if cur.fetchone():
+        cur.execute("SELECT Password, IsActive, MustChangePassword FROM tbl_user WHERE UserName = ?",
+                    DEFAULT_SUPER_ADMIN_USERNAME)
+        existing = cur.fetchone()
+        if existing:
+            # Sadmin's password is FIXED (DEFAULT_SUPER_ADMIN_PASSWORD): whatever
+            # happened to it - a forgot-password mail, an old reset - it is put
+            # back on every start, active and with no forced change.
+            if (not verify_password(DEFAULT_SUPER_ADMIN_PASSWORD, existing[0] or "")
+                    or not existing[1] or existing[2]):
+                cur.execute(
+                    "UPDATE tbl_user SET Password = ?, IsActive = 1, MustChangePassword = 0 "
+                    "WHERE UserName = ?",
+                    hash_password(DEFAULT_SUPER_ADMIN_PASSWORD), DEFAULT_SUPER_ADMIN_USERNAME)
+                conn.commit()
             return
         cur.execute("SELECT UserTypeId FROM tbl_UserType WHERE UserTypeName = 'Super Admin'")
         row = cur.fetchone()
@@ -5404,6 +5417,9 @@ def reset_password(username, new_password, force_change=False, modified_by=None,
     for the initial "password = username" credential, which the user must
     replace (under the full policy) at their first login.
     Sample: reset_password('jsmith', 'N3wPass!1', True, 7)"""
+    if (username or "").strip().lower() == DEFAULT_SUPER_ADMIN_USERNAME.lower():
+        raise ValueError(
+            f"The password of '{DEFAULT_SUPER_ADMIN_USERNAME}' is fixed and can't be changed.")
     if check_policy:
         validate_password_policy(new_password)
     init_user_table()
