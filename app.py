@@ -2005,7 +2005,21 @@ def _base_url(request: Request):
 
 
 def _client_ip(request: Request):
-    return (request.client.host if request.client else "") or "unknown"
+    """The caller's address for throttling. Behind the IIS reverse proxy every
+    request arrives from the proxy's own (loopback/private) address, which
+    would make ALL users share one throttle bucket - so when the direct peer
+    is a proxy on this machine/LAN, take the first X-Forwarded-For hop."""
+    peer = (request.client.host if request.client else "") or "unknown"
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if forwarded:
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(peer)
+            if addr.is_loopback or addr.is_private:
+                return forwarded
+        except ValueError:
+            pass
+    return peer
 
 
 @app.post("/api/login")
@@ -2090,6 +2104,8 @@ def api_change_password(payload: ChangePasswordModel):
         raise HTTPException(status_code=404, detail="User not found.")
     if not database.verify_password(payload.current_password or "", user["Password"] or ""):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
+    if (payload.new_password or "").strip().lower() == (user["UserName"] or "").strip().lower():
+        raise HTTPException(status_code=400, detail="Your new password can't be the same as your username.")
     try:
         database.reset_password(user["UserName"], payload.new_password, force_change=False)
     except ValueError as exc:
@@ -2184,9 +2200,14 @@ def api_create_user(payload: UserCreateModel, request: Request):
             raise HTTPException(status_code=400, detail="Enter a valid email address.")
 
     try:
+        # Viewer: the Super Admin's own chosen password (kept). Everyone else:
+        # the initial password is simply the username - the user MUST replace
+        # it at their first login (must_change_password), so it only ever
+        # works once, until they set their own under the full policy.
         temp_password = database.create_user(
             name, payload.user_type_id, email or None, payload.created_by,
-            password=payload.password if is_viewer else None,
+            password=payload.password if is_viewer else name,
+            force_change=None if is_viewer else True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2301,11 +2322,16 @@ def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         new_password = payload.new_password
+        initial = False
     else:
-        new_password = database.generate_temp_password()
+        # Back to the initial credential: password = username, change forced
+        # at the next login.
+        new_password = target["UserName"]
+        initial = True
 
     try:
-        database.reset_password(target["UserName"], new_password, force_change=True, modified_by=payload.user_id)
+        database.reset_password(target["UserName"], new_password, force_change=True,
+                                modified_by=payload.user_id, check_policy=not initial)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 

@@ -5199,6 +5199,7 @@ def list_users():
         for r in cur.fetchall():
             d = dict(zip(cols, r))
             d["IsActive"] = bool(d.get("IsActive"))
+            d["MustChangePassword"] = bool(d.get("MustChangePassword"))
             for k in ("CreatedDatetime", "LastModifiedDatetime"):
                 if d.get(k) is not None:
                     d[k] = str(d[k])
@@ -5208,7 +5209,7 @@ def list_users():
         conn.close()
 
 
-def create_user(username, user_type_id, email, created_by=None, password=None):
+def create_user(username, user_type_id, email, created_by=None, password=None, force_change=None):
     """Create a user (raises if the name exists). Normally a system-
     generated temporary password is used and returned so the caller can
     email it. `password`: an admin-assigned password instead of an
@@ -5224,7 +5225,9 @@ def create_user(username, user_type_id, email, created_by=None, password=None):
     # persistent credential the admin just chose, not a placeholder - don't
     # force a change on first login the way the emailed-temp-password flow
     # does.
-    must_change = password is None
+    # `force_change` overrides that: the "initial password = username" flow
+    # passes an admin-known password AND still forces a change at first login.
+    must_change = (password is None) if force_change is None else bool(force_change)
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -5368,13 +5371,17 @@ def authenticate(username, password):
     }
 
 
-def reset_password(username, new_password, force_change=False, modified_by=None):
+def reset_password(username, new_password, force_change=False, modified_by=None, check_policy=True):
     """Set a new hashed password for a user, validated against the password
     policy. `force_change=True` also flags the account so the user must set
     their own password on next login (used by user creation and the
     forgot-password flow; a normal self-service change passes False to
-    clear the flag). Sample: reset_password('jsmith', 'N3wPass!1', True, 7)"""
-    validate_password_policy(new_password)
+    clear the flag). `check_policy=False` skips the complexity rules - only
+    for the initial "password = username" credential, which the user must
+    replace (under the full policy) at their first login.
+    Sample: reset_password('jsmith', 'N3wPass!1', True, 7)"""
+    if check_policy:
+        validate_password_policy(new_password)
     init_user_table()
     ensure_menu_schema()
     conn = get_connection()
