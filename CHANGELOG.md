@@ -11,6 +11,34 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### One-time migration: re-check DATA MISMATCH invoices for the Description fix
+
+- On first start after this update, every invoice currently at DATA MISMATCH
+  is re-OCR'd with the fixed extraction (previous entry below). Only an
+  invoice whose Description(s) actually changed - and whose item count
+  didn't (a different count means the fix changed which rows exist, not
+  just their text, so it's skipped rather than guessed at) - has its
+  `tbl_Purchase_Line.[Description]` corrected and its status re-validated
+  (Service First for PART, the same field gate a NAV vendor code correction
+  uses for SERVICE). It may still end up DATA MISMATCH, just for a
+  different, genuine reason unrelated to extraction. Runs once (config.json's
+  `line_description_continuation_fix_done`), logged per invoice, never
+  blocks startup.
+
+### Purchase Line Description: a trailing spec line got shifted to the next item
+
+- When a vendor prints each item's own serial + values on one row and a
+  second, plain spec line right below it (e.g. AVS/26-27/00668: "1
+  MOTHERBOARD ... 9,800.00" / "HP 280 PRO G6 MICROTOWER PC RCTO"), that spec
+  line was being reassigned to the FOLLOWING item's Description instead of
+  staying on the item it's actually printed under - losing it from item 1
+  and gluing it onto item 2's, ahead of item 2's own name. Fixed: that
+  reassignment now only happens for the layout it was actually built for (a
+  vendor whose values sit in the middle of a wrapped multi-line cell, so the
+  item's Amount is still unknown at that point) - a spec line under an item
+  that already has its Amount stays with that item.
+- Checked against a 40-file random sample - item counts unchanged everywhere.
+
 ### Buyer/Ship-to Name and State: a generic section heading was mistaken for data
 
 - A party block captioned "Buyer Information:"/"Consignee Information:" (no

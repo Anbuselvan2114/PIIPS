@@ -3447,6 +3447,20 @@ class OCREngine:
                         if (
                             content
                             and not recovered_value
+                            # The peel-back this feeds (see its own comment
+                            # near current_item["Description"].endswith(...)
+                            # below) exists ONLY for a vendor whose values sit
+                            # in the MIDDLE of a wrapped description cell, so
+                            # the current item's own Amount is still unknown
+                            # at this point. When this item's row already
+                            # carried its own serial + values (Amount already
+                            # set well before this line), this continuation
+                            # is a genuine TRAILING spec line of THIS item
+                            # (e.g. "MOTHERBOARD ... 9,800.00" / "HP 280 PRO
+                            # G6 MICROTOWER PC RCTO" right below it) - never
+                            # the next item's opening name, so it must not be
+                            # peeled away from it.
+                            and current_item.get("Amount") is None
                             and not content.startswith("(")
                             and ":" not in content
                             and len(content.split()) > 1

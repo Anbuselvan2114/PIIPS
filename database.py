@@ -2045,6 +2045,58 @@ def purchase_header_id_for_invoice(buyer_order_no, file_name, status_name):
         conn.close()
 
 
+def data_mismatch_headers():
+    """[{"header_id", "file_name", "source_json", "invoice_type", "buyer_order_no"}]
+    for every non-excluded invoice currently at DATA MISMATCH - feeds the
+    one-time continuation-line Description re-extraction migration (app.py's
+    _run_line_description_continuation_fix_migration).
+    Sample: data_mismatch_headers()"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT pt.Purchase_Header_ID, pt.FileName, pt.SourceJson, "
+            "  it.InvoiceTypeName, pt.BuyerOrderNo "
+            "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
+            "JOIN dbo.tbl_Status s WITH (NOLOCK) ON s.StatusId = pt.StatusID "
+            "LEFT JOIN dbo.tbl_InvoiceType it WITH (NOLOCK) ON it.InvoiceTypeID = pt.InvoiceTypeID "
+            "WHERE s.StatusName = 'DATA MISMATCH' AND ISNULL(pt.IsExcluded, 0) = 0"
+        )
+        return [
+            {"header_id": hid, "file_name": fname, "source_json": jpath,
+             "invoice_type": (itype or "").strip().upper(), "buyer_order_no": po}
+            for hid, fname, jpath, itype, po in cur.fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def revalidate_header_after_description_fix(header_id, data, verdict, user_id=None):
+    """Persist a freshly-recomputed verdict for one header after its
+    Purchase Line Description(s) were corrected by re-extraction (see the
+    one-time migration in app.py): rebuilds Reservation Entry rows from
+    `data` (empty for a SERVICE invoice, which never has any) and updates
+    the tracker's StatusID / IsActive via usp_ReplaceReservation, exactly
+    like a Buyer Order No / NAV vendor code correction does.
+    Sample: revalidate_header_after_description_fix(7378, data, {"status": "READY TO LOAD", "is_active": True}, 7)"""
+    import excel_export
+    grouped = excel_export.build_rows_grouped([data])
+    group = grouped["groups"][0] if grouped["groups"] else {"reservations": []}
+    re_cols = grouped["columns"]["Reservation Entry"]
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "EXEC dbo.usp_ReplaceReservation ?, ?, ?, ?, ?, ?",
+            header_id, json.dumps(re_cols), json.dumps(group["reservations"]),
+            verdict["status"], 1 if verdict.get("is_active") else 0, user_id,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def fix_purchase_line_descriptions(header_id, new_items):
     """One-time Part Description cleanup migration helper (see app.py's
     _run_part_description_migration): overwrite ONLY the [Description]
