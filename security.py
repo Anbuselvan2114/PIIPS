@@ -76,7 +76,7 @@ MENU_GATES = [
 ]
 
 # Routes a Viewer may still POST to.
-VIEWER_WRITE_OK = {"/api/change-password"}
+VIEWER_WRITE_OK = {"/api/change-password", "/api/logout"}
 
 # Body/query keys naming the ACTING user, per path. Everything not listed
 # uses DEFAULT_ACTOR_KEYS. (/api/users/active's `user_id` is the TARGET;
@@ -89,6 +89,9 @@ ACTOR_KEYS_BY_PATH = {
 MAX_BODY_CHECK_BYTES = 1_000_000
 
 _CACHE_SECONDS = 30
+_TOUCH_SECONDS = 60          # how often a busy user's "last seen" is written
+_last_touch = {}             # uid -> time of the last write
+_revoked = {}                # token -> its expiry (a signed-out token stops working)
 _lock = threading.Lock()
 _secret_cache = None
 _role_cache = {}       # uid -> (expires, role_lower, active)
@@ -200,6 +203,16 @@ def _menus_for(role):
     return _menu_cache[1].get(role, set())
 
 
+def revoke_token(token):
+    """Make a signed-out token unusable for the rest of its life.
+    Sample: revoke_token(tok)"""
+    now = time.time()
+    with _lock:
+        for t in [t for t, exp in _revoked.items() if exp < now]:
+            _revoked.pop(t, None)
+        _revoked[token] = now + TOKEN_TTL_SECONDS
+
+
 def forget_user(user_id=None):
     """Drop cached role/menu data (after a role change / Screen Access save)."""
     _role_cache.pop(user_id, None) if user_id is not None else _role_cache.clear()
@@ -258,7 +271,7 @@ class AuthMiddleware:
         elif query.get("access_token"):
             token = query["access_token"][0]
         uid = verify_token(token)
-        if uid is None:
+        if uid is None or token in _revoked:
             return await self._reject(scope, receive, send, 401,
                                       "Your session has expired. Please sign in again.")
 
@@ -269,6 +282,19 @@ class AuthMiddleware:
         if not active:
             return await self._reject(scope, receive, send, 401,
                                       "Your account is inactive or no longer exists.")
+
+        # "Last seen" for the Online / Offline column (about once a minute).
+        _now = time.time()
+        if _now - _last_touch.get(uid, 0) > _TOUCH_SECONDS:
+            _last_touch[uid] = _now
+            try:
+                import database
+                database.touch_user(uid)
+                # Also close sessions that went quiet (browser closed), so a
+                # logout time is stored for them even though nobody signed out.
+                database.sweep_idle_sessions()
+            except Exception:  # noqa: BLE001
+                pass
 
         if role == "viewer" and method not in ("GET", "HEAD") and path not in VIEWER_WRITE_OK:
             return await self._reject(scope, receive, send, 403, "Viewers have read-only access.")
@@ -319,4 +345,5 @@ class AuthMiddleware:
                 return await receive()
 
         scope.setdefault("state", {})["user_id"] = uid
+        scope["state"]["token"] = token
         return await self.app(scope, replay, send)

@@ -9,6 +9,29 @@ before 2.2 is grouped under **2.1** below as a retrospective summary (by
 theme, not a literal commit-by-commit log) rather than a series of real
 sub-versions.
 
+## Unreleased (next version)
+
+### Who did what, and when - stored, not shown
+
+Nothing is displayed for this yet; it is recorded in the database for reporting.
+
+- **Tracker (`tbl_Purchase_Tracker`), one row per file:** who / when / source for
+  the Buyer Order No (`PDF` read automatically, or `MANUAL` keyed in on Buyer
+  Order Entry), who / when / source for the NAV Vendor Code (`PDF`,
+  `Service First` or `MANUAL`), who / when for Loaded, Posted and Completed, who /
+  when for the last status change, and who / when the batch was last downloaded.
+  A value that arrived automatically is recorded against the person who
+  STARTED the process, at the process time.
+- **Batches (`tbl_BatchDownload`):** who last downloaded the batch (with the
+  existing date and count).
+- **History (`tbl_Audit_Event`):** every action as its own row - upload, process,
+  Buyer Order No / NAV Vendor Code set, every status change (Load, Post,
+  Complete, Reject, Exclude, automatic re-checks and expiry), batch downloads,
+  sign-in and sign-out - so the full trail of any file or batch can be queried.
+- **Users (`tbl_User`):** last login, last logout, and a logged-in flag. Signing
+  out now cancels the session on the server; a session with no activity for 30
+  minutes is closed with its last-seen time as the logout time.
+
 ## 2.3 — 2026-09-24
 
 ### Security hardening for production

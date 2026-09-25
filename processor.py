@@ -1419,6 +1419,13 @@ class JobManager:
                 except Exception:  # noqa: BLE001 - best-effort
                     traceback.print_exc()
 
+            # Audit trail: who uploaded / processed each invoice, and the
+            # automatic Buyer Order No / NAV vendor code, all against whoever
+            # pressed Start (see database.log_processed_batch).
+            database.log_processed_batch(
+                batch_name, job.started_by,
+                job.started_at.replace(microsecond=0) if job.started_at else None)
+
         except Exception:  # noqa: BLE001 - DB save is best-effort
             traceback.print_exc()
 
@@ -1431,7 +1438,7 @@ class JobManager:
             if not (config_store.load_config().get("db_connection") or "").strip():
                 return
             import database
-            result = database.resync_pending(batch_name=job.batch_name)
+            result = database.resync_pending(batch_name=job.batch_name, user_id=job.started_by)
             if result.get("promoted"):
                 print(f"Re-synced {result['promoted']} pending record(s)")
             with job._lock:

@@ -329,7 +329,7 @@ def save_grouped(data, batch_name=None, tracker=None):
     return counts
 
 
-def resync_pending(batch_name=None):
+def resync_pending(batch_name=None, user_id=None):
     """
     Re-attempt Service First for records still "pending in SF" (status 5).
     Reloads each record's extracted JSON, re-calls the API, and — when the
@@ -399,6 +399,9 @@ def resync_pending(batch_name=None):
 
         promoted += 1
         errors.extend(verdict["errors"])
+        log_event("STATUS_CHANGED", header_id=header_id, user_id=user_id,
+                  from_status="PENDING IN SF", to_status=verdict["status"],
+                  detail="Service First now has the part - re-checked automatically during a processing run")
 
     return {"promoted": promoted, "errors": errors}
 
@@ -426,6 +429,19 @@ def expire_stale_unresolved(days=None):
         cur.execute("EXEC dbo.usp_ExpireStaleUnresolved ?", days)
         filenames = [r[0] for r in cur.fetchall() if r[0]]
         conn.commit()
+        if filenames:
+            try:
+                ph = ", ".join("?" for _ in filenames)
+                cur.execute(
+                    "SELECT pt.Purchase_Header_ID FROM dbo.tbl_Purchase_Tracker pt "
+                    "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+                    f"WHERE s.StatusName = 'MANUALLY UPDATED' AND pt.FileName IN ({ph}) "
+                    "AND pt.LastModifiedDatetime >= DATEADD(minute, -5, GETDATE())", *filenames)
+                for (hid,) in cur.fetchall():
+                    log_event("STATUS_CHANGED", header_id=hid, to_status="MANUALLY UPDATED",
+                              detail=f"Left unresolved for over {days} days - parked automatically")
+            except Exception:  # noqa: BLE001
+                pass
         return filenames
     finally:
         conn.close()
@@ -1069,7 +1085,7 @@ def is_batch_locked(batch_name):
         conn.close()
 
 
-def mark_batch_downloaded(batch_name):
+def mark_batch_downloaded(batch_name, user_id=None):
     """Record that a batch's Excel was just downloaded (for the Dashboard's
     Batch Status column - see list_batches). Upserts one row per batch.
     Sample: mark_batch_downloaded('PIIPS_Batch_20260722_101500')"""
@@ -1093,6 +1109,8 @@ def mark_batch_downloaded(batch_name):
         conn.commit()
     finally:
         conn.close()
+    log_event("BATCH_DOWNLOADED", batch=batch_name, user_id=user_id, entity="BATCH",
+              detail="Batch Excel downloaded")
 
 
 def list_statuses():
@@ -2498,6 +2516,8 @@ def set_buyer_order_no(header_id, order_no, verdict, user_id=None):
             return None
         file_name = row[0]
 
+        _before = _audit_ctx(cur, header_id)   # (file, batch, invoice no, status, old PO)
+
         # Header PO column only exists when the field mapping produced it.
         if _hdr_col(cur, "Buyer's Order No."):
             cur.execute(
@@ -2520,6 +2540,13 @@ def set_buyer_order_no(header_id, order_no, verdict, user_id=None):
             order_no, status_name, is_active, is_synced, is_synced,
             user_id, header_id)
         conn.commit()
+        log_event("BUYER_ORDER_UPDATED", header_id=header_id, user_id=user_id,
+                  from_status=_before[3], to_status=status_name,
+                  detail=f"Buyer Order No: {(_before[4] or '(blank)')} -> {order_no} (keyed in on Buyer Order Entry)")
+        if _before[3] != status_name:
+            log_event("STATUS_CHANGED", header_id=header_id, user_id=user_id,
+                      from_status=_before[3], to_status=status_name,
+                      detail="After the Buyer Order No was entered")
         return {"file_name": file_name, "new_status": status_name}
     finally:
         conn.close()
@@ -2548,6 +2575,13 @@ def set_nav_vendor_code(header_id, vendor_code, verdict, user_id=None):
             return None
         file_name = row[0]
 
+        _before = _audit_ctx(cur, header_id)
+        _old_vendor = ""
+        if _hdr_col(cur, "Pay-to Vendor No."):
+            cur.execute("SELECT [Pay-to Vendor No.] FROM dbo.tbl_Purchase_Header WHERE Id = ?", header_id)
+            _vr = cur.fetchone()
+            _old_vendor = (_vr[0] if _vr else "") or ""
+
         # Header columns only exist when the field mapping produced them.
         if _hdr_col(cur, "Buy-from Vendor No."):
             cur.execute(
@@ -2573,6 +2607,13 @@ def set_nav_vendor_code(header_id, vendor_code, verdict, user_id=None):
             status_name, is_active, is_synced, is_synced,
             user_id, header_id)
         conn.commit()
+        log_event("VENDOR_CODE_UPDATED", header_id=header_id, user_id=user_id,
+                  from_status=_before[3], to_status=status_name,
+                  detail=f"NAV Vendor Code: {_old_vendor or '(blank)'} -> {vendor_code} (keyed in on Vendor Code Entry)")
+        if _before[3] != status_name:
+            log_event("STATUS_CHANGED", header_id=header_id, user_id=user_id,
+                      from_status=_before[3], to_status=status_name,
+                      detail="After the NAV Vendor Code was entered")
         return {"file_name": file_name, "new_status": status_name}
     finally:
         conn.close()
@@ -2711,7 +2752,7 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
         # before the UPDATE changes their status out from under a later
         # lookup.
         cur.execute(
-            "SELECT pt.FileName, pt.Purchase_Header_ID FROM dbo.tbl_Purchase_Tracker pt "
+            "SELECT pt.FileName, pt.Purchase_Header_ID, s.StatusName FROM dbo.tbl_Purchase_Tracker pt "
             "JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
             f"WHERE pt.Purchase_Header_ID IN ({id_ph}) AND s.StatusName IN ({from_ph})",
             *ids, *froms)
@@ -2721,10 +2762,12 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
         # so callers that zip the two (e.g. the ALL_INVOICES archive copy)
         # can't get misaligned.
         files, qualifying_ids = [], []
-        for fname, hid in qualifying:
+        from_of = {}
+        for fname, hid, sname in qualifying:
             if fname:
                 files.append(fname)
                 qualifying_ids.append(hid)
+                from_of[hid] = sname
 
         duplicate_no = []
         if to_status == "LOADED" and qualifying_ids and _hdr_col(cur, "No."):
@@ -2763,6 +2806,11 @@ def advance_status(header_ids, from_statuses, to_status, user_id=None):
         conn.commit()
     finally:
         conn.close()
+
+    _stage = {"LOADED": "Load", "POSTED": "Post", "COMPLETED": "Complete"}.get(to_status, to_status)
+    for hid in qualifying_ids:
+        log_event("STATUS_CHANGED", header_id=hid, user_id=user_id,
+                  from_status=from_of.get(hid), to_status=to_status, detail=f"{_stage} step")
 
     # Record/refresh each qualifying vendor's own details the moment its
     # invoice actually reaches LOADED (see tbl_Vendor_Master's own schema
@@ -2815,6 +2863,8 @@ def reject_invoice(header_id, remark, user_id=None):
             "WHERE Id = ?",
             remark, user_id, user_id, tracker_id)
         conn.commit()
+        log_event("REJECTED", header_id=header_id, user_id=user_id, from_status="LOADED",
+                  to_status="REJECTED BY ACCOUNTS", detail=f"Rejected: {remark}")
         return {"file_name": file_name}
     finally:
         conn.close()
@@ -2954,6 +3004,9 @@ def set_excluded(header_id, exclude, user_id=None):
             nr = cur.fetchone()
             new_status = nr[0] if nr else None
         conn.commit()
+        log_event("EXCLUDED" if exclude else "RE_INCLUDED", header_id=header_id, user_id=user_id,
+                  from_status=(row[4] or None), to_status=new_status,
+                  detail="Excluded from its batch" if exclude else "Included back into its batch")
         return {"file_name": file_name, "new_status": new_status}
     finally:
         conn.close()
@@ -4871,6 +4924,10 @@ def init_user_table():
             "LastModifiedDatetime": "DATETIME NULL",
             "Email": "NVARCHAR(200) NULL",
             "MustChangePassword": "BIT NOT NULL DEFAULT 0",
+            "LastLoginDatetime": "DATETIME NULL",
+            "LastLogoutDatetime": "DATETIME NULL",
+            "IsLoggedIn": "BIT NOT NULL DEFAULT 0",
+            "LastSeenDatetime": "DATETIME NULL",
         }
         for col, ddl in adds.items():
             if col not in existing:
@@ -5522,6 +5579,448 @@ def save_mail_settings(username, email, password, smtp_host, smtp_port):
         conn.commit()
     finally:
         conn.close()
+
+
+# ===========================================================================
+# Activity / audit trail: who did what, and when.
+# ---------------------------------------------------------------------------
+# tbl_Audit_Event holds one row per action on an invoice ("file") or a batch:
+# uploaded, processed, buyer order no / NAV vendor code set (automatically from
+# the PDF / Service First, or keyed in by hand), every status change (Load,
+# Post, Complete, Reject, Exclude, re-check...), batch downloads, and user
+# logins/logouts. An automatic value (read from the PDF or fetched from Service
+# First) is recorded against whoever STARTED the process, at the process time.
+# Logging is best-effort: an audit failure never breaks the action itself.
+# ===========================================================================
+
+_audit_ready = False
+
+# tbl_Purchase_Tracker: who / when / from where for the values people ask about.
+TRACKER_AUDIT_COLUMNS = [
+    ("BuyerOrderByID", "INT NULL"), ("BuyerOrderByName", "NVARCHAR(100) NULL"),
+    ("BuyerOrderDatetime", "DATETIME NULL"), ("BuyerOrderSource", "NVARCHAR(30) NULL"),
+    ("VendorCodeByID", "INT NULL"), ("VendorCodeByName", "NVARCHAR(100) NULL"),
+    ("VendorCodeDatetime", "DATETIME NULL"), ("VendorCodeSource", "NVARCHAR(30) NULL"),
+    ("LoadedByID", "INT NULL"), ("LoadedDatetime", "DATETIME NULL"),
+    ("PostedByID", "INT NULL"), ("PostedDatetime", "DATETIME NULL"),
+    ("CompletedByID", "INT NULL"), ("CompletedDatetime", "DATETIME NULL"),
+    ("DownloadedByID", "INT NULL"), ("DownloadedByName", "NVARCHAR(100) NULL"),
+    ("DownloadedDatetime", "DATETIME NULL"),
+    ("LastStatusByID", "INT NULL"), ("LastStatusByName", "NVARCHAR(100) NULL"),
+    ("LastStatusDatetime", "DATETIME NULL"),
+]
+
+
+def _stamp_tracker(cur, action, header_id, batch, user_id, name, at, to_status, detail):
+    """Mirror an audit event onto the tracker row (and tbl_BatchDownload for a
+    batch download) so the CURRENT who/when is one SELECT away."""
+    src_of = lambda d: "Service First" if "Service First" in (d or "") else "PDF"
+    if action in ("BUYER_ORDER_SET", "BUYER_ORDER_UPDATED") and header_id:
+        cur.execute(
+            "UPDATE dbo.tbl_Purchase_Tracker SET BuyerOrderByID = ?, BuyerOrderByName = ?, "
+            "BuyerOrderDatetime = ISNULL(?, GETDATE()), BuyerOrderSource = ? WHERE Purchase_Header_ID = ?",
+            user_id, name, at, "MANUAL" if action == "BUYER_ORDER_UPDATED" else "PDF", header_id)
+    elif action in ("VENDOR_CODE_SET", "VENDOR_CODE_UPDATED") and header_id:
+        cur.execute(
+            "UPDATE dbo.tbl_Purchase_Tracker SET VendorCodeByID = ?, VendorCodeByName = ?, "
+            "VendorCodeDatetime = ISNULL(?, GETDATE()), VendorCodeSource = ? WHERE Purchase_Header_ID = ?",
+            user_id, name, at, "MANUAL" if action == "VENDOR_CODE_UPDATED" else src_of(detail), header_id)
+    elif action == "BATCH_DOWNLOADED" and batch:
+        cur.execute(
+            "UPDATE dbo.tbl_Purchase_Tracker SET DownloadedByID = ?, DownloadedByName = ?, "
+            "DownloadedDatetime = ISNULL(?, GETDATE()) WHERE BatchName = ?", user_id, name, at, batch)
+        cur.execute("IF OBJECT_ID('dbo.tbl_BatchDownload') IS NOT NULL "
+                    "UPDATE dbo.tbl_BatchDownload SET LastDownloadedByID = ?, LastDownloadedByName = ? "
+                    "WHERE BatchName = ?", user_id, name, batch)
+    elif header_id and action in ("STATUS_CHANGED", "REJECTED", "EXCLUDED", "RE_INCLUDED", "PROCESSED"):
+        sets, args = ["LastStatusByID = ?", "LastStatusByName = ?", "LastStatusDatetime = ISNULL(?, GETDATE())"], [user_id, name, at]
+        stage = {"LOADED": "Loaded", "POSTED": "Posted", "COMPLETED": "Completed"}.get(to_status or "")
+        if stage and action == "STATUS_CHANGED":
+            sets += [f"{stage}ByID = ?", f"{stage}Datetime = ISNULL(?, GETDATE())"]
+            args += [user_id, at]
+        cur.execute("UPDATE dbo.tbl_Purchase_Tracker SET " + ", ".join(sets) +
+                    " WHERE Purchase_Header_ID = ?", *args, header_id)
+
+
+def ensure_audit_table():
+    """Create tbl_Audit_Event (+ indexes) once. Sample: ensure_audit_table()"""
+    global _audit_ready
+    if _audit_ready:
+        return
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'tbl_Audit_Event')
+            BEGIN
+                CREATE TABLE dbo.tbl_Audit_Event (
+                    Id                 BIGINT IDENTITY(1,1) PRIMARY KEY,
+                    EventDatetime      DATETIME NOT NULL DEFAULT GETDATE(),
+                    UserId             INT NULL,
+                    UserName           NVARCHAR(100) NULL,
+                    Entity             NVARCHAR(10) NOT NULL,       -- INVOICE | BATCH | USER
+                    BatchName          NVARCHAR(200) NULL,
+                    Purchase_Header_ID INT NULL,
+                    FileName           NVARCHAR(400) NULL,
+                    InvoiceNo          NVARCHAR(100) NULL,
+                    Action             NVARCHAR(40) NOT NULL,
+                    FromStatus         NVARCHAR(80) NULL,
+                    ToStatus           NVARCHAR(80) NULL,
+                    Detail             NVARCHAR(600) NULL
+                );
+                CREATE INDEX IX_Audit_Header ON dbo.tbl_Audit_Event (Purchase_Header_ID, EventDatetime);
+                CREATE INDEX IX_Audit_Batch  ON dbo.tbl_Audit_Event (BatchName, EventDatetime);
+                CREATE INDEX IX_Audit_Time   ON dbo.tbl_Audit_Event (EventDatetime);
+            END
+            """
+        )
+        # The CURRENT who/when for each thing, kept on the tracker row itself.
+        for col, ddl in TRACKER_AUDIT_COLUMNS:
+            cur.execute("IF COL_LENGTH('dbo.tbl_Purchase_Tracker', ?) IS NULL "
+                        "EXEC('ALTER TABLE dbo.tbl_Purchase_Tracker ADD [' + ? + '] ' + ?)", col, col, ddl)
+        for col, ddl in (("LastDownloadedByID", "INT NULL"), ("LastDownloadedByName", "NVARCHAR(100) NULL")):
+            cur.execute("IF OBJECT_ID('dbo.tbl_BatchDownload') IS NOT NULL AND "
+                        "COL_LENGTH('dbo.tbl_BatchDownload', ?) IS NULL "
+                        "EXEC('ALTER TABLE dbo.tbl_BatchDownload ADD [' + ? + '] ' + ?)", col, col, ddl)
+        conn.commit()
+        _audit_ready = True
+    finally:
+        conn.close()
+
+
+def _audit_ctx(cur, header_id):
+    """(file name, batch, vendor invoice no, status name, buyer order no) of one
+    invoice, for stamping onto an audit row."""
+    cur.execute(
+        "SELECT pt.FileName, pt.BatchName, s.StatusName, pt.BuyerOrderNo "
+        "FROM dbo.tbl_Purchase_Tracker pt LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+        "WHERE pt.Purchase_Header_ID = ?", header_id)
+    r = cur.fetchone()
+    inv = None
+    if _hdr_col(cur, "Vendor Invoice No."):
+        cur.execute("SELECT [Vendor Invoice No.] FROM dbo.tbl_Purchase_Header WHERE Id = ?", header_id)
+        ir = cur.fetchone()
+        inv = ir[0] if ir else None
+    if not r:
+        return None, None, inv, None, None
+    return r[0], r[1], inv, r[2], r[3]
+
+
+def log_event(action, header_id=None, batch=None, file_name=None, invoice_no=None,
+              from_status=None, to_status=None, user_id=None, detail=None,
+              entity="INVOICE", at=None, _cur=None):
+    """Record one audit row; never raises. A missing user is "System".
+    Sample: log_event('BUYER_ORDER_UPDATED', header_id=42, user_id=7,
+                      detail='Buyer Order No: (blank) -> SPRPUR/...')"""
+    try:
+        ensure_audit_table()
+        conn = None
+        cur = _cur
+        if cur is None:
+            conn = get_connection()
+            cur = conn.cursor()
+        try:
+            if header_id and (file_name is None or batch is None or invoice_no is None):
+                f, b, i, _s, _p = _audit_ctx(cur, header_id)
+                file_name = file_name if file_name is not None else f
+                batch = batch if batch is not None else b
+                invoice_no = invoice_no if invoice_no is not None else i
+            name = "System"
+            if user_id:
+                cur.execute("SELECT UserName FROM dbo.tbl_User WHERE UserId = ?", user_id)
+                r = cur.fetchone()
+                name = r[0] if r else f"user #{user_id}"
+            cur.execute(
+                "INSERT INTO dbo.tbl_Audit_Event (EventDatetime, UserId, UserName, Entity, BatchName, "
+                "Purchase_Header_ID, FileName, InvoiceNo, Action, FromStatus, ToStatus, Detail) "
+                "VALUES (ISNULL(?, GETDATE()), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                at, user_id, name, entity, batch, header_id, file_name,
+                (str(invoice_no)[:100] if invoice_no else None), action,
+                from_status, to_status, (detail or "")[:600] or None)
+            _stamp_tracker(cur, action, header_id, batch, user_id, name, at, to_status, detail)
+            if conn is not None:
+                conn.commit()
+        finally:
+            if conn is not None:
+                conn.close()
+    except Exception:  # noqa: BLE001 - auditing must never break the action
+        import traceback
+        traceback.print_exc()
+
+
+def log_processed_batch(batch_name, started_by, started_at):
+    """After a processing run saved `batch_name`: one UPLOADED event per invoice
+    (by whoever put the file in Input), one PROCESSED event (by whoever clicked
+    Start, at that time) and - for a Buyer Order No / NAV vendor code that
+    arrived automatically from the PDF or Service First - a BUYER_ORDER_SET /
+    VENDOR_CODE_SET event against the person who STARTED the process.
+    Idempotent per (invoice, run). Sample: log_processed_batch(name, 7, dt)"""
+    try:
+        ensure_audit_table()
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            has_vendor = _hdr_col(cur, "Pay-to Vendor No.")
+            has_inv = _hdr_col(cur, "Vendor Invoice No.")
+            cur.execute(
+                "SELECT pt.Purchase_Header_ID, pt.FileName, s.StatusName, pt.BuyerOrderNo, "
+                "pt.InitiatedByID, pt.InitiatedDatetime, it.InvoiceTypeName "
+                "FROM dbo.tbl_Purchase_Tracker pt "
+                "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+                "LEFT JOIN dbo.tbl_InvoiceType it ON it.InvoiceTypeId = pt.InvoiceTypeID "
+                "WHERE pt.BatchName = ?", batch_name)
+            rows = cur.fetchall()
+            n = 0
+            for hid, fname, status, po, init_by, init_at, itype in rows:
+                cur.execute(
+                    "SELECT 1 FROM dbo.tbl_Audit_Event WHERE Purchase_Header_ID = ? "
+                    "AND Action = 'PROCESSED' AND EventDatetime = ?", hid, started_at)
+                if cur.fetchone():
+                    continue
+                inv = vendor = None
+                if has_inv or has_vendor:
+                    cols = ", ".join(c for c, ok in (("[Vendor Invoice No.]", has_inv),
+                                                     ("[Pay-to Vendor No.]", has_vendor)) if ok)
+                    cur.execute(f"SELECT {cols} FROM dbo.tbl_Purchase_Header WHERE Id = ?", hid)
+                    hr = cur.fetchone()
+                    if hr:
+                        vals = list(hr)
+                        inv = vals.pop(0) if has_inv else None
+                        vendor = vals.pop(0) if has_vendor else None
+                common = dict(header_id=hid, batch=batch_name, file_name=fname, invoice_no=inv, _cur=cur)
+                if init_by:
+                    log_event("UPLOADED", user_id=init_by, at=init_at,
+                              detail="File added to the Input folder", **common)
+                log_event("PROCESSED", user_id=started_by, at=started_at, to_status=status,
+                          detail=f"Processed as {itype or 'invoice'}; status {status}", **common)
+                if (po or "").strip():
+                    log_event("BUYER_ORDER_SET", user_id=started_by, at=started_at,
+                              detail=f"Buyer Order No {po} read automatically from the PDF "
+                                     f"(recorded against the person who started the process)", **common)
+                if (vendor or "").strip():
+                    src = "the PDF" if (itype or "").upper() == "SERVICE" else "Service First"
+                    log_event("VENDOR_CODE_SET", user_id=started_by, at=started_at,
+                              detail=f"NAV Vendor Code {vendor} taken automatically from {src} "
+                                     f"(recorded against the person who started the process)", **common)
+                n += 1
+            log_event("BATCH_PROCESSED", batch=batch_name, user_id=started_by, at=started_at,
+                      entity="BATCH", detail=f"{n} invoice(s) processed", _cur=cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+
+
+def get_audit(header_id=None, batch=None, user=None, action=None, entity=None,
+              date_from=None, date_to=None, search=None, limit=500):
+    """Audit rows, newest first, optionally filtered. `user` matches the user
+    name, `search` matches file / invoice no / batch / detail text.
+    Sample: get_audit(header_id=42) or get_audit(batch='PIIPS_Batch_...')"""
+    ensure_audit_table()
+    where, args = [], []
+    if header_id:
+        where.append("Purchase_Header_ID = ?"); args.append(int(header_id))
+    if batch:
+        where.append("BatchName = ?"); args.append(batch)
+    if user:
+        where.append("UserName = ?"); args.append(user)
+    if action:
+        where.append("Action = ?"); args.append(action)
+    if entity:
+        where.append("Entity = ?"); args.append(entity)
+    if date_from:
+        where.append("EventDatetime >= ?"); args.append(date_from)
+    if date_to:
+        where.append("EventDatetime < DATEADD(day, 1, CAST(? AS DATE))"); args.append(date_to)
+    if search:
+        where.append("(FileName LIKE ? OR InvoiceNo LIKE ? OR BatchName LIKE ? OR Detail LIKE ? OR UserName LIKE ?)")
+        args.extend([f"%{search}%"] * 5)
+    sql = ("SELECT TOP (?) Id, EventDatetime, UserId, UserName, Entity, BatchName, Purchase_Header_ID, "
+           "FileName, InvoiceNo, Action, FromStatus, ToStatus, Detail FROM dbo.tbl_Audit_Event"
+           + (" WHERE " + " AND ".join(where) if where else "")
+           + " ORDER BY EventDatetime DESC, Id DESC")
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, int(limit), *args)
+        cols = [d[0] for d in cur.description]
+        out = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            d["EventDatetime"] = d["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if d["EventDatetime"] else ""
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def audit_filter_options():
+    """Distinct user names and actions present in the audit log (for the filter
+    dropdowns). Sample: audit_filter_options()"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT UserName FROM dbo.tbl_Audit_Event WHERE UserName IS NOT NULL ORDER BY 1")
+        users = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT DISTINCT Action FROM dbo.tbl_Audit_Event ORDER BY 1")
+        return {"users": users, "actions": [r[0] for r in cur.fetchall()]}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Login tracking: last login / last logout / currently logged in (Yes/No)
+# ---------------------------------------------------------------------------
+
+SESSION_IDLE_MINUTES = 30      # no request for this long -> shown as logged out
+
+
+def _ensure_login_columns(cur):
+    for col, ddl in (("LastLoginDatetime", "DATETIME NULL"), ("LastLogoutDatetime", "DATETIME NULL"),
+                     ("IsLoggedIn", "BIT NOT NULL DEFAULT 0"), ("LastSeenDatetime", "DATETIME NULL")):
+        cur.execute("IF COL_LENGTH('dbo.tbl_User', ?) IS NULL EXEC('ALTER TABLE dbo.tbl_User ADD [' + ? + '] ' + ?)",
+                    col, col, ddl)
+
+
+def record_login(user_id):
+    """Stamp a successful login. Sample: record_login(7)"""
+    try:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            _ensure_login_columns(cur)
+            cur.execute("UPDATE dbo.tbl_User SET LastLoginDatetime = GETDATE(), LastSeenDatetime = GETDATE(), "
+                        "IsLoggedIn = 1 WHERE UserId = ?", user_id)
+            conn.commit()
+        finally:
+            conn.close()
+        log_event("LOGIN", user_id=user_id, entity="USER", detail="Signed in")
+    except Exception:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+
+
+def record_logout(user_id, reason="Signed out"):
+    """Stamp a logout. Sample: record_logout(7)"""
+    try:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            _ensure_login_columns(cur)
+            cur.execute("UPDATE dbo.tbl_User SET LastLogoutDatetime = GETDATE(), IsLoggedIn = 0 "
+                        "WHERE UserId = ?", user_id)
+            conn.commit()
+        finally:
+            conn.close()
+        log_event("LOGOUT", user_id=user_id, entity="USER", detail=reason)
+    except Exception:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+
+
+def touch_user(user_id):
+    """Note the user is still active (called at most about once a minute per
+    user by the API middleware). Sample: touch_user(7)"""
+    try:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE dbo.tbl_User SET LastSeenDatetime = GETDATE() WHERE UserId = ?", user_id)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def sweep_idle_sessions():
+    """Close every session with no request for SESSION_IDLE_MINUTES (browser
+    closed / token expired): logged out, logout time = last seen.
+    Returns [(UserId, logout_time)]. Sample: sweep_idle_sessions()"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        _ensure_login_columns(cur)
+        conn.commit()
+        cur.execute(
+            "UPDATE dbo.tbl_User SET IsLoggedIn = 0, LastLogoutDatetime = LastSeenDatetime "
+            "OUTPUT inserted.UserId, inserted.LastLogoutDatetime "
+            "WHERE IsLoggedIn = 1 AND (LastSeenDatetime IS NULL OR "
+            "LastSeenDatetime < DATEADD(minute, ?, GETDATE()))", -SESSION_IDLE_MINUTES)
+        timed_out = cur.fetchall()
+        conn.commit()
+    finally:
+        conn.close()
+    for uid, at in timed_out:
+        log_event("LOGOUT", user_id=uid, entity="USER", at=at, detail="Session timed out (no activity)")
+    return timed_out
+
+
+def user_activity_map():
+    """{UserId: {last_login, last_logout, logged_in}} for every user. A session
+    with no request for SESSION_IDLE_MINUTES (browser closed, token expired) is
+    closed here: shown as logged out, with the last-seen time as its logout
+    time. Sample: user_activity_map()"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        _ensure_login_columns(cur)
+        conn.commit()
+        cur.execute(
+            "UPDATE dbo.tbl_User SET IsLoggedIn = 0, LastLogoutDatetime = LastSeenDatetime "
+            "OUTPUT inserted.UserId, inserted.LastLogoutDatetime "
+            "WHERE IsLoggedIn = 1 AND (LastSeenDatetime IS NULL OR "
+            "LastSeenDatetime < DATEADD(minute, ?, GETDATE()))", -SESSION_IDLE_MINUTES)
+        timed_out = cur.fetchall()
+        conn.commit()
+        cur.execute("SELECT UserId, LastLoginDatetime, LastLogoutDatetime, IsLoggedIn FROM dbo.tbl_User")
+        fmt = lambda d: d.strftime("%d-%m-%Y %H:%M:%S") if d else ""
+        out = {r[0]: {"last_login": fmt(r[1]), "last_logout": fmt(r[2]), "logged_in": bool(r[3])}
+               for r in cur.fetchall()}
+    finally:
+        conn.close()
+    for uid, at in timed_out:
+        log_event("LOGOUT", user_id=uid, entity="USER", at=at, detail="Session timed out (no activity)")
+    return out
+
+
+def batch_download_who(batch_names):
+    """{batch: {'by', 'at', 'count'}} for the LAST download of each batch,
+    from the audit log. Sample: batch_download_who(['PIIPS_Batch_...'])"""
+    names = [n for n in (batch_names or []) if n]
+    if not names:
+        return {}
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        ph = ", ".join("?" for _ in names)
+        cur.execute(
+            f"SELECT BatchName, UserName, EventDatetime, "
+            f"ROW_NUMBER() OVER (PARTITION BY BatchName ORDER BY EventDatetime DESC, Id DESC) rn, "
+            f"COUNT(*) OVER (PARTITION BY BatchName) cnt "
+            f"FROM dbo.tbl_Audit_Event WHERE Action = 'BATCH_DOWNLOADED' AND BatchName IN ({ph})", *names)
+        out = {r[0]: {"by": r[1] or "System",
+                      "at": r[2].strftime("%d-%m-%Y %H:%M:%S") if r[2] else "", "count": r[4]}
+               for r in cur.fetchall() if r[3] == 1}
+        # A batch downloaded BEFORE downloads were tracked per user has a date
+        # in tbl_BatchDownload but no audit row: still show when.
+        if _table_exists(cur, "tbl_BatchDownload"):
+            cur.execute(
+                f"SELECT BatchName, LastDownloadedAt, DownloadCount FROM dbo.tbl_BatchDownload "
+                f"WHERE BatchName IN ({ph})", *names)
+            for name, at, cnt in cur.fetchall():
+                if name not in out:
+                    out[name] = {"by": "Not recorded (downloaded before tracking)",
+                                 "at": at.strftime("%d-%m-%Y %H:%M:%S") if at else "", "count": cnt}
+        return out
+    finally:
+        conn.close()
+
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ import MailSettings from "./MailSettings";
 import Announcement from "./Announcement";
 import Manuals from "./Manuals";
 import Publish from "./Publish";
-import { getConfig, getVersion, getRoleMenus, setToken, getToken } from "./api";
+import { getConfig, getVersion, getRoleMenus, setToken, getToken, logoutSession } from "./api";
 import { MENU } from "./menuConfig";
 
 // Fallback used until /api/role-menus answers (and if it ever fails) - also
@@ -229,7 +229,11 @@ export default function App() {
         />;
   }
 
-  const logout = () => { localStorage.removeItem("piips_user"); setToken(""); setUser(null); setAuthView("login"); };
+  const logout = async () => {
+    // Tell the server first (it stamps the logout time and cancels the token).
+    try { await logoutSession(); } catch { /* signing out anyway */ }
+    localStorage.removeItem("piips_user"); setToken(""); setUser(null); setAuthView("login");
+  };
 
   // A freshly-created account, or one that just went through Forgot
   // password, must set its own password before doing anything else.
