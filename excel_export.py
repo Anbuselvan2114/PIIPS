@@ -243,6 +243,10 @@ def _link_override(sheet, col, inv, item):
             return doc_no
         if col == "Line No.":
             return line_no
+        if col == "Type" and (item or {}).get("_charge"):
+            # A freight/courier charge stays a "Charge (Item)" line; every
+            # other line's Type is the template's own Purchase Line value.
+            return item.get("Type", "")
         freight = _freight_line_override(sheet, col, inv, item)
         if freight is not None:
             return freight

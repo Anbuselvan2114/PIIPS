@@ -1368,6 +1368,17 @@ def extract(header_rows, footer_rows, page_width):
                     paren = re.match(r"^\([^)]*\)\s*", remainder)
                     if paren:
                         remainder = remainder[paren.end():].strip(" :,-.")
+                    # A heading like "Buyer Information:"/"Consignee Details:"
+                    # (bare "buyer"/"consignee" marker, no "information"/
+                    # "detail" of its own in SECTION_MARKERS - unlike
+                    # "customer detail" above) leaves a generic caption
+                    # word as the "remainder", e.g. "Buyer Information:" ->
+                    # "Information" - real content, not this - never the
+                    # party's actual name/address (see Hewlett Packard.pdf's
+                    # own "Buyer Information:"/"Customer Information" -
+                    # wrongly became buyer_name "Information").
+                    if remainder.lower() in ("information", "info", "details", "detail"):
+                        remainder = ""
                     if not remainder or not any(c.isalpha() for c in remainder):
                         # Nothing usable after the marker - some layouts
                         # print it the other way round instead, the row's

@@ -11,6 +11,67 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### One-time migration: re-check DATA MISMATCH invoices for the Description fix
+
+- On first start after this update, every invoice currently at DATA MISMATCH
+  is re-OCR'd with the fixed extraction (previous entry below). Only an
+  invoice whose Description(s) actually changed - and whose item count
+  didn't (a different count means the fix changed which rows exist, not
+  just their text, so it's skipped rather than guessed at) - has its
+  `tbl_Purchase_Line.[Description]` corrected and its status re-validated
+  (Service First for PART, the same field gate a NAV vendor code correction
+  uses for SERVICE). It may still end up DATA MISMATCH, just for a
+  different, genuine reason unrelated to extraction. Runs once (config.json's
+  `line_description_continuation_fix_done`), logged per invoice, never
+  blocks startup.
+
+### Purchase Line Description: a trailing spec line got shifted to the next item
+
+- When a vendor prints each item's own serial + values on one row and a
+  second, plain spec line right below it (e.g. AVS/26-27/00668: "1
+  MOTHERBOARD ... 9,800.00" / "HP 280 PRO G6 MICROTOWER PC RCTO"), that spec
+  line was being reassigned to the FOLLOWING item's Description instead of
+  staying on the item it's actually printed under - losing it from item 1
+  and gluing it onto item 2's, ahead of item 2's own name. Fixed: that
+  reassignment now only happens for the layout it was actually built for (a
+  vendor whose values sit in the middle of a wrapped multi-line cell, so the
+  item's Amount is still unknown at that point) - a spec line under an item
+  that already has its Amount stays with that item.
+- Checked against a 40-file random sample - item counts unchanged everywhere.
+
+### Buyer/Ship-to Name and State: a generic section heading was mistaken for data
+
+- A party block captioned "Buyer Information:"/"Consignee Information:" (no
+  real name text on that same line, e.g. Hewlett Packard.pdf) was reading the
+  caption's own trailing word - "Information" - as the party's Name. Fixed:
+  that caption filler is recognized and skipped, so the actual name (on the
+  next line) is picked up instead.
+- A layout that prints the label and the state code on one line with no
+  spelled-out name of its own (e.g. "STATE CODE 33", the real name "TAMIL
+  NADU" on the line above) was left with the bare word "State" as the State
+  Name, which then blocked the usual GSTIN/state-code fallback from filling
+  in the real name. Fixed: that bare label is now treated as unstated, so the
+  correct name ("Tamil Nadu") is filled in from the code as normal.
+- Checked against a 35-file random sample plus the SHWETMANI ENTERPRISES
+  case this logic already had a regression test for in its own comments - no
+  other invoice's Buyer/Seller/Consignee Name or State changed.
+
+### Batch status when invoices are at different stages
+
+- Once every counted invoice has reached at least Loaded, the batch shows the
+  **least advanced** stage: 3 Loaded + 2 Posted is "Loaded", 3 Posted + 2
+  Completed is "Posted". "In Progress" now only means some invoices have not
+  reached Loaded yet.
+
+### Purchase Line "Type" is now a template field
+
+- The line `Type` (previously always the fixed "Item") is set on the **Template**
+  screen, per template, like Location Code. Freight/courier charge lines stay
+  "Charge (Item)".
+- On first start the app unmaps the old `Type` mapping and gives every existing
+  template `Type = Item`, so nothing changes until a template is edited. A new
+  template must fill in `Type`; left blank the lines show it as missing.
+
 ### Who did what, and when - stored, not shown
 
 Nothing is displayed for this yet; it is recorded in the database for reporting.
