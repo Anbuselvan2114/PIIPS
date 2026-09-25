@@ -5597,31 +5597,37 @@ _audit_ready = False
 
 # tbl_Purchase_Tracker: who / when / from where for the values people ask about.
 TRACKER_AUDIT_COLUMNS = [
-    ("BuyerOrderByID", "INT NULL"), ("BuyerOrderByName", "NVARCHAR(100) NULL"),
+    ("BuyerOrderByID", "INT NULL"),
     ("BuyerOrderDatetime", "DATETIME NULL"), ("BuyerOrderSource", "NVARCHAR(30) NULL"),
-    ("VendorCodeByID", "INT NULL"), ("VendorCodeByName", "NVARCHAR(100) NULL"),
+    ("VendorCodeByID", "INT NULL"),
     ("VendorCodeDatetime", "DATETIME NULL"), ("VendorCodeSource", "NVARCHAR(30) NULL"),
     ("LoadedByID", "INT NULL"), ("LoadedDatetime", "DATETIME NULL"),
     ("PostedByID", "INT NULL"), ("PostedDatetime", "DATETIME NULL"),
     ("CompletedByID", "INT NULL"), ("CompletedDatetime", "DATETIME NULL"),
-    ("DownloadedByID", "INT NULL"), ("DownloadedByName", "NVARCHAR(100) NULL"),
-    ("DownloadedDatetime", "DATETIME NULL"),
-    ("LastStatusByID", "INT NULL"), ("LastStatusByName", "NVARCHAR(100) NULL"),
-    ("LastStatusDatetime", "DATETIME NULL"),
+    ("DownloadedByID", "INT NULL"), ("DownloadedDatetime", "DATETIME NULL"),
+    ("LastStatusByID", "INT NULL"), ("LastStatusDatetime", "DATETIME NULL"),
+]
+
+# The first cut also kept a user-NAME copy next to every ID; the ID + datetime
+# pair is enough (the name is one join to tbl_User), so those columns are dropped.
+_OBSOLETE_NAME_COLUMNS = [
+    ("tbl_Purchase_Tracker", "BuyerOrderByName"), ("tbl_Purchase_Tracker", "VendorCodeByName"),
+    ("tbl_Purchase_Tracker", "DownloadedByName"), ("tbl_Purchase_Tracker", "LastStatusByName"),
+    ("tbl_BatchDownload", "LastDownloadedByName"),
+    ("tbl_Purchase_Header", "BuyerOrderNoUpdatedBy"), ("tbl_Purchase_Header", "NavVendorCodeUpdatedBy"),
+    ("tbl_Purchase_Line", "PartDescriptionUpdatedBy"),
+    ("tbl_Audit_Event", "UserName"),
 ]
 
 
 # Who / when for the two header values people ask about, and for a part
 # description edited on Part Description Mapping.
 HEADER_AUDIT_COLUMNS = [
-    ("BuyerOrderNoUpdatedByID", "INT NULL"), ("BuyerOrderNoUpdatedBy", "NVARCHAR(100) NULL"),
-    ("BuyerOrderNoUpdatedDatetime", "DATETIME NULL"),
-    ("NavVendorCodeUpdatedByID", "INT NULL"), ("NavVendorCodeUpdatedBy", "NVARCHAR(100) NULL"),
-    ("NavVendorCodeUpdatedDatetime", "DATETIME NULL"),
+    ("BuyerOrderNoUpdatedByID", "INT NULL"), ("BuyerOrderNoUpdatedDatetime", "DATETIME NULL"),
+    ("NavVendorCodeUpdatedByID", "INT NULL"), ("NavVendorCodeUpdatedDatetime", "DATETIME NULL"),
 ]
 LINE_AUDIT_COLUMNS = [
-    ("PartDescriptionUpdatedByID", "INT NULL"), ("PartDescriptionUpdatedBy", "NVARCHAR(100) NULL"),
-    ("PartDescriptionUpdatedDatetime", "DATETIME NULL"),
+    ("PartDescriptionUpdatedByID", "INT NULL"), ("PartDescriptionUpdatedDatetime", "DATETIME NULL"),
 ]
 
 
@@ -5646,9 +5652,9 @@ def _stamp_header(cur, action, header_id, user_id, name, at):
     _ensure_header_line_audit_columns(cur)
     prefix = "BuyerOrderNo" if action.startswith("BUYER_ORDER") else "NavVendorCode"
     cur.execute(
-        f"UPDATE dbo.tbl_Purchase_Header SET {prefix}UpdatedByID = ?, {prefix}UpdatedBy = ?, "
+        f"UPDATE dbo.tbl_Purchase_Header SET {prefix}UpdatedByID = ?, "
         f"{prefix}UpdatedDatetime = ISNULL(?, GETDATE()) WHERE Id = ?",
-        user_id, name, at, header_id)
+        user_id, at, header_id)
 
 
 def _stamp_tracker(cur, action, header_id, batch, user_id, name, at, to_status, detail):
@@ -5657,23 +5663,23 @@ def _stamp_tracker(cur, action, header_id, batch, user_id, name, at, to_status, 
     src_of = lambda d: "Service First" if "Service First" in (d or "") else "PDF"
     if action in ("BUYER_ORDER_SET", "BUYER_ORDER_UPDATED") and header_id:
         cur.execute(
-            "UPDATE dbo.tbl_Purchase_Tracker SET BuyerOrderByID = ?, BuyerOrderByName = ?, "
+            "UPDATE dbo.tbl_Purchase_Tracker SET BuyerOrderByID = ?, "
             "BuyerOrderDatetime = ISNULL(?, GETDATE()), BuyerOrderSource = ? WHERE Purchase_Header_ID = ?",
-            user_id, name, at, "MANUAL" if action == "BUYER_ORDER_UPDATED" else "PDF", header_id)
+            user_id, at, "MANUAL" if action == "BUYER_ORDER_UPDATED" else "PDF", header_id)
     elif action in ("VENDOR_CODE_SET", "VENDOR_CODE_UPDATED") and header_id:
         cur.execute(
-            "UPDATE dbo.tbl_Purchase_Tracker SET VendorCodeByID = ?, VendorCodeByName = ?, "
+            "UPDATE dbo.tbl_Purchase_Tracker SET VendorCodeByID = ?, "
             "VendorCodeDatetime = ISNULL(?, GETDATE()), VendorCodeSource = ? WHERE Purchase_Header_ID = ?",
-            user_id, name, at, "MANUAL" if action == "VENDOR_CODE_UPDATED" else src_of(detail), header_id)
+            user_id, at, "MANUAL" if action == "VENDOR_CODE_UPDATED" else src_of(detail), header_id)
     elif action == "BATCH_DOWNLOADED" and batch:
         cur.execute(
-            "UPDATE dbo.tbl_Purchase_Tracker SET DownloadedByID = ?, DownloadedByName = ?, "
-            "DownloadedDatetime = ISNULL(?, GETDATE()) WHERE BatchName = ?", user_id, name, at, batch)
+            "UPDATE dbo.tbl_Purchase_Tracker SET DownloadedByID = ?, "
+            "DownloadedDatetime = ISNULL(?, GETDATE()) WHERE BatchName = ?", user_id, at, batch)
         cur.execute("IF OBJECT_ID('dbo.tbl_BatchDownload') IS NOT NULL "
-                    "UPDATE dbo.tbl_BatchDownload SET LastDownloadedByID = ?, LastDownloadedByName = ? "
-                    "WHERE BatchName = ?", user_id, name, batch)
+                    "UPDATE dbo.tbl_BatchDownload SET LastDownloadedByID = ? WHERE BatchName = ?",
+                    user_id, batch)
     elif header_id and action in ("STATUS_CHANGED", "REJECTED", "EXCLUDED", "RE_INCLUDED", "PROCESSED"):
-        sets, args = ["LastStatusByID = ?", "LastStatusByName = ?", "LastStatusDatetime = ISNULL(?, GETDATE())"], [user_id, name, at]
+        sets, args = ["LastStatusByID = ?", "LastStatusDatetime = ISNULL(?, GETDATE())"], [user_id, at]
         stage = {"LOADED": "Loaded", "POSTED": "Posted", "COMPLETED": "Completed"}.get(to_status or "")
         if stage and action == "STATUS_CHANGED":
             sets += [f"{stage}ByID = ?", f"{stage}Datetime = ISNULL(?, GETDATE())"]
@@ -5698,7 +5704,6 @@ def ensure_audit_table():
                     Id                 BIGINT IDENTITY(1,1) PRIMARY KEY,
                     EventDatetime      DATETIME NOT NULL DEFAULT GETDATE(),
                     UserId             INT NULL,
-                    UserName           NVARCHAR(100) NULL,
                     Entity             NVARCHAR(10) NOT NULL,       -- INVOICE | BATCH | USER
                     BatchName          NVARCHAR(200) NULL,
                     Purchase_Header_ID INT NULL,
@@ -5719,11 +5724,14 @@ def ensure_audit_table():
         for col, ddl in TRACKER_AUDIT_COLUMNS:
             cur.execute("IF COL_LENGTH('dbo.tbl_Purchase_Tracker', ?) IS NULL "
                         "EXEC('ALTER TABLE dbo.tbl_Purchase_Tracker ADD [' + ? + '] ' + ?)", col, col, ddl)
-        for col, ddl in (("LastDownloadedByID", "INT NULL"), ("LastDownloadedByName", "NVARCHAR(100) NULL")):
+        for col, ddl in (("LastDownloadedByID", "INT NULL"),):
             cur.execute("IF OBJECT_ID('dbo.tbl_BatchDownload') IS NOT NULL AND "
                         "COL_LENGTH('dbo.tbl_BatchDownload', ?) IS NULL "
                         "EXEC('ALTER TABLE dbo.tbl_BatchDownload ADD [' + ? + '] ' + ?)", col, col, ddl)
         _ensure_header_line_audit_columns(cur)
+        for table, col in _OBSOLETE_NAME_COLUMNS:
+            cur.execute("IF COL_LENGTH('dbo.' + ?, ?) IS NOT NULL EXEC('ALTER TABLE dbo.' + ? + ' DROP COLUMN [' + ? + ']')",
+                        table, col, table, col)
         conn.commit()
         _audit_ready = True
     finally:
@@ -5767,16 +5775,12 @@ def log_event(action, header_id=None, batch=None, file_name=None, invoice_no=Non
                 file_name = file_name if file_name is not None else f
                 batch = batch if batch is not None else b
                 invoice_no = invoice_no if invoice_no is not None else i
-            name = "System"
-            if user_id:
-                cur.execute("SELECT UserName FROM dbo.tbl_User WHERE UserId = ?", user_id)
-                r = cur.fetchone()
-                name = r[0] if r else f"user #{user_id}"
+            name = None     # the ID is what is stored; the name is one join to tbl_User
             cur.execute(
-                "INSERT INTO dbo.tbl_Audit_Event (EventDatetime, UserId, UserName, Entity, BatchName, "
+                "INSERT INTO dbo.tbl_Audit_Event (EventDatetime, UserId, Entity, BatchName, "
                 "Purchase_Header_ID, FileName, InvoiceNo, Action, FromStatus, ToStatus, Detail) "
-                "VALUES (ISNULL(?, GETDATE()), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                at, user_id, name, entity, batch, header_id, file_name,
+                "VALUES (ISNULL(?, GETDATE()), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                at, user_id, entity, batch, header_id, file_name,
                 (str(invoice_no)[:100] if invoice_no else None), action,
                 from_status, to_status, (detail or "")[:600] or None)
             _stamp_tracker(cur, action, header_id, batch, user_id, name, at, to_status, detail)
@@ -5876,11 +5880,6 @@ def record_part_description_update(purchase_order_no, description, user_id=None,
         try:
             cur = conn.cursor()
             _ensure_header_line_audit_columns(cur)
-            name = "System"
-            if user_id:
-                cur.execute("SELECT UserName FROM dbo.tbl_User WHERE UserId = ?", user_id)
-                r = cur.fetchone()
-                name = r[0] if r else f"user #{user_id}"
             cur.execute(
                 "SELECT l.Id, l.Purchase_Header_ID, l.[Description] FROM dbo.tbl_Purchase_Line l "
                 "JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID "
@@ -5890,8 +5889,8 @@ def record_part_description_update(purchase_order_no, description, user_id=None,
             for lid, _hid in hits:
                 cur.execute(
                     "UPDATE dbo.tbl_Purchase_Line SET PartDescriptionUpdatedByID = ?, "
-                    "PartDescriptionUpdatedBy = ?, PartDescriptionUpdatedDatetime = GETDATE() WHERE Id = ?",
-                    user_id, name, lid)
+                    "PartDescriptionUpdatedDatetime = GETDATE() WHERE Id = ?",
+                    user_id, lid)
             for hid in sorted({h for _l, h in hits}):
                 log_event("PART_DESCRIPTION_UPDATED", header_id=hid, user_id=user_id, _cur=cur,
                           detail=f"Part description set to '{(description or '').strip()[:200]}' on Part "
@@ -5914,26 +5913,27 @@ def get_audit(header_id=None, batch=None, user=None, action=None, entity=None,
     ensure_audit_table()
     where, args = [], []
     if header_id:
-        where.append("Purchase_Header_ID = ?"); args.append(int(header_id))
+        where.append("a.Purchase_Header_ID = ?"); args.append(int(header_id))
     if batch:
-        where.append("BatchName = ?"); args.append(batch)
+        where.append("a.BatchName = ?"); args.append(batch)
     if user:
-        where.append("UserName = ?"); args.append(user)
+        where.append("u.UserName = ?"); args.append(user)
     if action:
-        where.append("Action = ?"); args.append(action)
+        where.append("a.Action = ?"); args.append(action)
     if entity:
-        where.append("Entity = ?"); args.append(entity)
+        where.append("a.Entity = ?"); args.append(entity)
     if date_from:
-        where.append("EventDatetime >= ?"); args.append(date_from)
+        where.append("a.EventDatetime >= ?"); args.append(date_from)
     if date_to:
-        where.append("EventDatetime < DATEADD(day, 1, CAST(? AS DATE))"); args.append(date_to)
+        where.append("a.EventDatetime < DATEADD(day, 1, CAST(? AS DATE))"); args.append(date_to)
     if search:
-        where.append("(FileName LIKE ? OR InvoiceNo LIKE ? OR BatchName LIKE ? OR Detail LIKE ? OR UserName LIKE ?)")
+        where.append("(a.FileName LIKE ? OR a.InvoiceNo LIKE ? OR a.BatchName LIKE ? OR a.Detail LIKE ? OR u.UserName LIKE ?)")
         args.extend([f"%{search}%"] * 5)
-    sql = ("SELECT TOP (?) Id, EventDatetime, UserId, UserName, Entity, BatchName, Purchase_Header_ID, "
-           "FileName, InvoiceNo, Action, FromStatus, ToStatus, Detail FROM dbo.tbl_Audit_Event"
+    sql = ("SELECT TOP (?) a.Id, a.EventDatetime, a.UserId, ISNULL(u.UserName, 'System') AS UserName, a.Entity, "
+           "a.BatchName, a.Purchase_Header_ID, a.FileName, a.InvoiceNo, a.Action, a.FromStatus, a.ToStatus, a.Detail "
+           "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId"
            + (" WHERE " + " AND ".join(where) if where else "")
-           + " ORDER BY EventDatetime DESC, Id DESC")
+           + " ORDER BY a.EventDatetime DESC, a.Id DESC")
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -5956,7 +5956,7 @@ def audit_filter_options():
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT DISTINCT UserName FROM dbo.tbl_Audit_Event WHERE UserName IS NOT NULL ORDER BY 1")
+        cur.execute("SELECT DISTINCT u.UserName FROM dbo.tbl_Audit_Event a JOIN dbo.tbl_User u ON u.UserId = a.UserId ORDER BY 1")
         users = [r[0] for r in cur.fetchall()]
         cur.execute("SELECT DISTINCT Action FROM dbo.tbl_Audit_Event ORDER BY 1")
         return {"users": users, "actions": [r[0] for r in cur.fetchall()]}
@@ -6092,10 +6092,11 @@ def batch_download_who(batch_names):
         cur = conn.cursor()
         ph = ", ".join("?" for _ in names)
         cur.execute(
-            f"SELECT BatchName, UserName, EventDatetime, "
-            f"ROW_NUMBER() OVER (PARTITION BY BatchName ORDER BY EventDatetime DESC, Id DESC) rn, "
-            f"COUNT(*) OVER (PARTITION BY BatchName) cnt "
-            f"FROM dbo.tbl_Audit_Event WHERE Action = 'BATCH_DOWNLOADED' AND BatchName IN ({ph})", *names)
+            f"SELECT a.BatchName, u.UserName, a.EventDatetime, "
+            f"ROW_NUMBER() OVER (PARTITION BY a.BatchName ORDER BY a.EventDatetime DESC, a.Id DESC) rn, "
+            f"COUNT(*) OVER (PARTITION BY a.BatchName) cnt "
+            f"FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+            f"WHERE a.Action = 'BATCH_DOWNLOADED' AND a.BatchName IN ({ph})", *names)
         out = {r[0]: {"by": r[1] or "System",
                       "at": r[2].strftime("%d-%m-%Y %H:%M:%S") if r[2] else "", "count": r[4]}
                for r in cur.fetchall() if r[3] == 1}

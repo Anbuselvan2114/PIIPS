@@ -14,6 +14,8 @@ sub-versions.
 ### Who did what, and when - stored, not shown
 
 Nothing is displayed for this yet; it is recorded in the database for reporting.
+Every tracked value keeps just the user **ID** and the **datetime** (the name is one
+join to `tbl_User`).
 
 - **Tracker (`tbl_Purchase_Tracker`), one row per file:** who / when / source for
   the Buyer Order No (`PDF` read automatically, or `MANUAL` keyed in on Buyer
@@ -23,12 +25,12 @@ Nothing is displayed for this yet; it is recorded in the database for reporting.
   A value that arrived automatically is recorded against the person who
   STARTED the process, at the process time.
 - **Header (`tbl_Purchase_Header`):** who / when the Buyer Order No was last set
-  or changed, and who / when the NAV Vendor Code was (`BuyerOrderNoUpdatedBy`,
-  `BuyerOrderNoUpdatedDatetime`, `NavVendorCodeUpdatedBy`,
+  or changed, and who / when the NAV Vendor Code was (`BuyerOrderNoUpdatedByID` +
+  `BuyerOrderNoUpdatedDatetime`, `NavVendorCodeUpdatedByID` +
   `NavVendorCodeUpdatedDatetime`; the person who started the process for
   values read automatically).
 - **Lines (`tbl_Purchase_Line`):** who / when a part description was updated on
-  Part Description Mapping (`PartDescriptionUpdatedBy`,
+  Part Description Mapping (`PartDescriptionUpdatedByID` +
   `PartDescriptionUpdatedDatetime`) on the invoice lines that carry that
   description for the PO. None of these columns appear in the Excel export.
 - **Batches (`tbl_BatchDownload`):** who last downloaded the batch (with the
