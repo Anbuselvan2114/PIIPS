@@ -252,6 +252,18 @@ def _parse_state(value):
 
     name = re.split(r",?\s*code|\(", value, flags=re.IGNORECASE)[0].strip(" ,:")
 
+    # A layout that prints the label and the code on ONE line with no name
+    # of its own at all (e.g. "STATE CODE 33", the real state name "TAMIL
+    # NADU" sitting on the PRECEDING line instead - see Hewlett Packard.pdf)
+    # leaves nothing but the bare label word once "code ..." is split off -
+    # not a real name, same idea as the "Not Applicable" guard above. Blank
+    # it out so the numeric code still resolves the correct name via
+    # STATE_CODES/GSTIN downstream, instead of the literal word "State"
+    # blocking that fallback (it's non-blank, so nothing downstream ever
+    # overwrites it).
+    if name.lower() == "state":
+        name = ""
+
     return name, code
 
 

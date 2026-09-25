@@ -940,7 +940,7 @@ def _batch_is_cleared(counts):
 def _batch_status_and_lock(counts, downloaded, ever_reincluded=False):
     """(batch_status, locked) derived from a batch's {status: count} map and
     whether it's ever been downloaded. Precedence: Excluded > Completed >
-    Loaded/Posted (uniform) > In Progress > Downloaded > Created. The label
+    Loaded/Posted (all at least Loaded) > In Progress > Downloaded > Created. The label
     is always computed from the batch's currently-INCLUDED invoices -
     Excluded ones are ignored entirely (see _BATCH_IGNORED_STATUSES) and
     never lock the batch or move its label off of what the remaining
@@ -949,13 +949,15 @@ def _batch_status_and_lock(counts, downloaded, ever_reincluded=False):
     - Downloaded: the Excel has been pulled at least once, nothing moved on
       (an Excluded invoice sitting alongside all-Ready-To-Load invoices
       does NOT change this - it's ignored).
-    - Loaded / Posted: every invoice outside _BATCH_IGNORED_STATUSES has
-      reached that SAME single stage (see _batch_is_cleared) - e.g. one
-      Loaded invoice plus any number of Excluded/Data Mismatch/Duplicate/
-      New Template invoices still counts as "Loaded".
+    - Loaded / Posted / Completed: every invoice outside
+      _BATCH_IGNORED_STATUSES has reached at least Loaded (see
+      _batch_is_cleared); the label is the LEAST advanced stage among them -
+      3 Loaded + 2 Posted is "Loaded", 3 Posted + 2 Completed is "Posted".
+      One Loaded invoice plus any number of Excluded/Data Mismatch/
+      Duplicate/New Template invoices still counts as "Loaded".
     - In Progress: at least one invoice (outside _BATCH_IGNORED_STATUSES)
       has reached Loaded/Posted/Completed/Rejected but NOT every one has
-      reached the SAME stage (see batch_is_locked/_batch_is_cleared) - real,
+      reached Loaded yet (see batch_is_locked/_batch_is_cleared) - real,
       partial progress. No more downloading or Document No./Entry No.
       renumbering for the WHOLE batch, since part of its sequence may
       already be committed. A batch where NOTHING has moved past Ready To
@@ -987,8 +989,10 @@ def _batch_status_and_lock(counts, downloaded, ever_reincluded=False):
 
     counted_total = sum(c for s, c in counts.items() if s not in _BATCH_IGNORED_STATUSES)
     reached = {s for s in ("LOADED", "POSTED", "COMPLETED") if counts.get(s, 0) > 0}
-    if counted_total > 0 and len(reached) == 1 and _batch_is_cleared(counts):
-        return next(iter(reached)), locked
+    if counted_total > 0 and reached and _batch_is_cleared(counts):
+        # Every counted invoice is at least Loaded: the batch shows the
+        # least advanced stage among them (3 Loaded + 2 Posted = Loaded).
+        return next(s for s in ("LOADED", "POSTED", "COMPLETED") if s in reached), locked
     if ever_reincluded:
         return "DOWNLOADED", locked
     if locked:
@@ -4601,6 +4605,38 @@ def get_field_mapping():
         return out
     finally:
         conn.close()
+
+
+def migrate_line_type_to_template():
+    """Purchase Line "Type" used to be mapped to the invoice's own "Type"
+    field (always "Item" for a normal line). It is now a Template value like
+    Location Code: unmap it and give every active template "Item" so existing
+    templates keep producing the same lines until someone edits them.
+    Idempotent - does nothing once the column is no longer mapped.
+    Sample: migrate_line_type_to_template()"""
+    ensure_menu_schema()
+    if (get_field_mapping().get("Purchase Line") or {}).get("Type") is None:
+        return False
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE dbo.tbl_FieldMapping SET IsActive = 0, ModifiedDatetime = GETDATE() "
+            "WHERE SheetName = 'Purchase Line' AND ColumnName = 'Type' AND IsActive = 1")
+        cur.execute(
+            "UPDATE sv SET StaticValue = 'Item', IsActive = 1, ModifiedDatetime = GETDATE() "
+            "FROM dbo.tbl_TemplateStaticValue sv JOIN dbo.tbl_Template t ON t.Id = sv.TemplateId "
+            "WHERE t.IsActive = 1 AND sv.SheetName = 'Purchase Line' AND sv.ColumnName = 'Type' "
+            "AND (sv.IsActive = 0 OR ISNULL(LTRIM(RTRIM(sv.StaticValue)), '') = '')")
+        cur.execute(
+            "INSERT INTO dbo.tbl_TemplateStaticValue (TemplateId, SheetName, ColumnName, StaticValue) "
+            "SELECT t.Id, 'Purchase Line', 'Type', 'Item' FROM dbo.tbl_Template t WHERE t.IsActive = 1 "
+            "AND NOT EXISTS (SELECT 1 FROM dbo.tbl_TemplateStaticValue sv WHERE sv.TemplateId = t.Id "
+            "AND sv.SheetName = 'Purchase Line' AND sv.ColumnName = 'Type')")
+        conn.commit()
+    finally:
+        conn.close()
+    return True
 
 
 def save_field_mapping(mapping, user_id=None):

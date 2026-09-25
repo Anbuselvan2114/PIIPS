@@ -11,6 +11,39 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### Buyer/Ship-to Name and State: a generic section heading was mistaken for data
+
+- A party block captioned "Buyer Information:"/"Consignee Information:" (no
+  real name text on that same line, e.g. Hewlett Packard.pdf) was reading the
+  caption's own trailing word - "Information" - as the party's Name. Fixed:
+  that caption filler is recognized and skipped, so the actual name (on the
+  next line) is picked up instead.
+- A layout that prints the label and the state code on one line with no
+  spelled-out name of its own (e.g. "STATE CODE 33", the real name "TAMIL
+  NADU" on the line above) was left with the bare word "State" as the State
+  Name, which then blocked the usual GSTIN/state-code fallback from filling
+  in the real name. Fixed: that bare label is now treated as unstated, so the
+  correct name ("Tamil Nadu") is filled in from the code as normal.
+- Checked against a 35-file random sample plus the SHWETMANI ENTERPRISES
+  case this logic already had a regression test for in its own comments - no
+  other invoice's Buyer/Seller/Consignee Name or State changed.
+
+### Batch status when invoices are at different stages
+
+- Once every counted invoice has reached at least Loaded, the batch shows the
+  **least advanced** stage: 3 Loaded + 2 Posted is "Loaded", 3 Posted + 2
+  Completed is "Posted". "In Progress" now only means some invoices have not
+  reached Loaded yet.
+
+### Purchase Line "Type" is now a template field
+
+- The line `Type` (previously always the fixed "Item") is set on the **Template**
+  screen, per template, like Location Code. Freight/courier charge lines stay
+  "Charge (Item)".
+- On first start the app unmaps the old `Type` mapping and gives every existing
+  template `Type = Item`, so nothing changes until a template is edited. A new
+  template must fill in `Type`; left blank the lines show it as missing.
+
 ### Who did what, and when - stored, not shown
 
 Nothing is displayed for this yet; it is recorded in the database for reporting.

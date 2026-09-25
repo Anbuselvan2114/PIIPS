@@ -78,6 +78,7 @@ def _bootstrap_menu_storage():
         if (config_store.load_config().get("db_connection") or "").strip():
             database.migrate_menu_json(BASE_DIR)
             database.migrate_template_invoice_type()
+            database.migrate_line_type_to_template()
             database.init_mail_settings_table()
             database.ensure_default_super_admin()
             database.ensure_default_viewer()
