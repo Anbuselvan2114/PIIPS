@@ -2110,6 +2110,10 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
         return generic
 
     if not user or not user["IsActive"] or not user.get("Email"):
+        # The caller always gets the same reply (no account enumeration); the
+        # reason is logged for whoever runs the server.
+        print(f"[forgot-password] no reset sent: no active account with an email "
+              f"for username={username!r} email={email!r}")
         return generic
 
     temp_password = database.generate_temp_password()
@@ -2123,8 +2127,11 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
             user["Email"], "Your PIIPS password was reset",
             mailer.password_reset_email_html(user["UserName"], temp_password, _base_url(request)),
         )
-    except mailer.MailError:
-        pass  # generic response either way - the password was still reset
+    except mailer.MailError as exc:
+        # Same reply either way - the password WAS reset - but say why the mail
+        # never arrived (SMTP not configured / login refused / unreachable).
+        print(f"[forgot-password] password reset for {user['UserName']!r} but the email "
+              f"could not be sent: {exc}")
 
     return generic
 
