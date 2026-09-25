@@ -1032,7 +1032,7 @@ class PartDescriptionSaveModel(BaseModel):
 
 
 @app.post("/api/part-description-update/save")
-def part_description_update_save(payload: PartDescriptionSaveModel):
+def part_description_update_save(payload: PartDescriptionSaveModel, request: Request):
     """Push a corrected description for one Service First part back to SF -
     Part Description Mapping menu's Update button (UpdateInvoiceDescription-
     InPurchaseLine). part_no_map_id is stores_SparePurchaseLine.PartNoMapID
@@ -1071,6 +1071,11 @@ def part_description_update_save(payload: PartDescriptionSaveModel):
                 )
     try:
         result = service_api.update_invoice_description(payload.part_no_map_id, payload.description)
+        # Who / when for the matching Purchase Line rows (best effort).
+        import database
+        database.record_part_description_update(
+            payload.purchase_order_no, desc, request.scope.get("state", {}).get("user_id"),
+            payload.part_no_map_id)
         return {"result": result}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Service First update failed: {exc}")
@@ -1317,7 +1322,7 @@ def lifecycle_reject(payload: RejectModel):
 
 
 @app.get("/api/batches/download")
-def download_batch(batch: str, doc_no: Optional[str] = None, entry_no: Optional[str] = None):
+def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, entry_no: Optional[str] = None):
     """Rebuild the Excel for a batch from the 3 DB tables, on demand.
     Optional doc_no / entry_no override the Document No. / Entry No.
     sequence used in the export (Dashboard > Batches inputs) — see
@@ -1463,7 +1468,7 @@ def download_batch(batch: str, doc_no: Optional[str] = None, entry_no: Optional[
                 raise HTTPException(status_code=400, detail=str(exc))
 
     try:
-        database.mark_batch_downloaded(name)
+        database.mark_batch_downloaded(name, user_id=request.scope.get("state", {}).get("user_id"))
     except Exception:  # noqa: BLE001 - best-effort, download still succeeds
         import traceback
         traceback.print_exc()
@@ -2048,7 +2053,20 @@ def api_login(payload: LoginModel, request: Request):
             detail="Invalid username or password, or the account is inactive.",
         )
     security.clear_attempts(throttle_key)
+    database.record_login(user["user_id"])
     return {**user, "token": security.issue_token(user["user_id"])}
+
+@app.post("/api/logout")
+def api_logout(request: Request):
+    """Sign the caller out: stamp the logout time, mark them offline and make
+    their token unusable."""
+    import database
+    state = request.scope.get("state", {})
+    database.record_logout(state.get("user_id"))
+    if state.get("token"):
+        security.revoke_token(state["token"])
+    return {"ok": True}
+
 
 
 @app.post("/api/forgot-password")

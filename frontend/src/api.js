@@ -307,6 +307,9 @@ export const changePassword = (user_id, current_password, new_password) =>
 
 export const getUsers = () => request("/api/users");
 
+// Sign out on the server too (stamps the logout time, cancels the token).
+export const logoutSession = () => request("/api/logout", { method: "POST", body: "{}" });
+
 export const createUser = (username, email, user_type_id, created_by, password) =>
   request("/api/users", {
     method: "POST",
