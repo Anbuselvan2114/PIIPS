@@ -170,6 +170,12 @@ export const savePartDescription = (part_no_map_id, description, purchase_order_
     body: JSON.stringify({ part_no_map_id, description, purchase_order_no, user_id }),
   });
 
+export const revalidateAllDataMismatch = (user_id) =>
+  request("/api/part-description-update/revalidate-all", {
+    method: "POST",
+    body: JSON.stringify({ user_id }),
+  });
+
 export const advanceLifecycle = (stage, header_ids, user_id) =>
   request("/api/lifecycle/advance", {
     method: "POST",

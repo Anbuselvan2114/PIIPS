@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { getPartDescriptionUpdateItems, savePartDescription } from "./api";
+import { getPartDescriptionUpdateItems, savePartDescription, revalidateAllDataMismatch } from "./api";
 import { DataTable, PdfModal } from "./components";
 
 // Service First's own purchase-line records for every Buyer's Order No
@@ -15,6 +15,7 @@ export default function PartDescriptionUpdate({ user }) {
   const [msg, setMsg] = useState(null);
   const [drafts, setDrafts] = useState({});   // SpareRequestID+PartID -> typed description
   const [saving, setSaving] = useState(null);
+  const [rechecking, setRechecking] = useState(false);
   const [pdfFile, setPdfFile] = useState(null);
   const [openSuggest, setOpenSuggest] = useState(null);   // row._key with its suggestion dropdown open
   const [suggestPos, setSuggestPos] = useState(null);   // {top, left, width} of that textarea, viewport-relative
@@ -74,6 +75,31 @@ export default function PartDescriptionUpdate({ user }) {
   // Refresh click.
   const silentRefresh = () =>
     getPartDescriptionUpdateItems().then((r) => setRows(r.items || [])).catch(() => {});
+
+  // A description confirmed on Service First's own side - not through THIS
+  // screen's own Update button, which now re-checks its invoice right away -
+  // leaves that invoice sitting at DATA MISMATCH forever with nothing to
+  // ever re-check it. This sweeps every current DATA MISMATCH/PENDING IN SF
+  // invoice against Service First right now, catching up that backlog.
+  const recheckAll = async () => {
+    setRechecking(true); setError(null); setMsg(null);
+    try {
+      const res = await revalidateAllDataMismatch(user?.user_id);
+      const moved = res?.moved || [];
+      setMsg(
+        `Checked ${res?.checked ?? 0} invoice(s) against Service First.` +
+        (moved.length
+          ? ` ${moved.length} moved forward: ` +
+            moved.map((m) => `${m.file_name} (${m.from_status} → ${m.new_status})`).join(", ")
+          : " None moved - nothing new to resolve yet.")
+      );
+      await silentRefresh();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setRechecking(false);
+    }
+  };
 
   const rowKey = (r, i) => `${r.SpareRequestID ?? ""}-${r.PartID ?? i}`;
   // Invoice No. lives nested inside PdfInvoices (one row can have several
@@ -310,8 +336,17 @@ export default function PartDescriptionUpdate({ user }) {
         <div className="card-title-row">
           <h3>Part Description Mapping In Service First</h3>
           <div style={{ flex: 1 }} />
+          <button className="btn btn-subtle btn-sm" disabled={rechecking} onClick={recheckAll}>
+            {rechecking ? "Rechecking…" : "Recheck All"}
+          </button>
           <button className="btn btn-subtle btn-sm" onClick={load}>Refresh</button>
         </div>
+        <p className="hint" style={{ marginTop: 0 }}>
+          "Recheck All" re-checks every current DATA MISMATCH/PENDING IN SF
+          invoice against Service First right now - use it if a description
+          was confirmed directly on Service First rather than via this
+          screen's own Update button.
+        </p>
         <p className="hint" style={{ marginTop: 0 }}>
           Service First's own purchase-line records for every Buyer's Order No
           currently at DATA MISMATCH - compare against the invoice's own

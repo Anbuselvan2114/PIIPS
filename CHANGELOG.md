@@ -11,6 +11,31 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### Part Description Mapping: the suggestion dropdown was missing options
+
+- A PO's suggestion dropdown was trimmed to hide any of the invoice's own
+  descriptions already claimed by a DIFFERENT, already-resolved part on
+  that PO - meant to stop picking an already-used description, but it
+  applied to every row on the PO (resolved or still pending), so a PO with
+  most of its parts already resolved could leave only one, or zero, options
+  visible anywhere. That guard was always redundant: picking an
+  already-claimed description is - and always was - blocked separately,
+  client-side (descriptionUsedElsewhereInPo, grayed out in the dropdown,
+  re-checked server-side before ever saving). Removed the trim: every row
+  now shows every one of its invoice's descriptions.
+
+### Part Description Mapping: "Recheck All" button for the pre-fix backlog
+
+- A description confirmed directly on Service First's own side (rather than
+  through this screen's Update button, which now auto-rechecks its own
+  invoice right away) left that invoice sitting at DATA MISMATCH forever,
+  with nothing to ever notice and re-check it - real backlog seen right
+  after publishing today's auto-recheck fix, since it only covers a FUTURE
+  Update click, not every already-confirmed one sitting there from before.
+- New "Recheck All" button re-checks every current DATA MISMATCH/PENDING IN
+  SF invoice against Service First right now, on demand - safe to run any
+  time, reports how many it checked and which ones actually moved forward.
+
 ### Stale unresolved invoices now get 31 days before auto-parking, not 10
 
 - `STALE_STATUS_EXPIRY_DAYS` (database.py) is now 31, not 10. A Data

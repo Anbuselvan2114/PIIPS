@@ -2123,6 +2123,39 @@ def revalidate_data_mismatch_header(header_id, user_id=None):
             "is_active": verdict.get("is_active", False), "reason": verdict.get("reason", "")}
 
 
+def revalidate_all_data_mismatch(user_id=None):
+    """Re-run Service First for EVERY invoice currently at DATA MISMATCH or
+    PENDING IN SF (revalidate_data_mismatch_header, one at a time) -
+    a repeatable, on-demand version of what the Part Description Mapping
+    screen's Update button now does automatically for a single invoice
+    right when its description is confirmed (see
+    part_description_update_save). Exists because confirming a description
+    directly on Service First's own side (not through that Update button -
+    e.g. by someone else, or before that auto-recheck existed) leaves the
+    invoice sitting there forever with nothing to ever notice the fix and
+    re-check it - this is the catch-up sweep for exactly that backlog, safe
+    to run any time (each invoice re-validates independently; one failure
+    is logged and skipped, never aborts the rest).
+    Returns {"checked": n, "moved": [{"header_id", "file_name",
+    "new_status"}, ...]} - "moved" only lists ones whose status actually
+    changed.
+    Sample: revalidate_all_data_mismatch(7)"""
+    import traceback
+    candidates = data_mismatch_headers(("DATA MISMATCH", "PENDING IN SF"))
+    moved = []
+    for c in candidates:
+        try:
+            before = c["status"]
+            res = revalidate_data_mismatch_header(c["header_id"], user_id)
+            if res and res["new_status"] != before:
+                moved.append({"header_id": c["header_id"], "file_name": res["file_name"],
+                              "from_status": before, "new_status": res["new_status"]})
+        except Exception:  # noqa: BLE001 - one bad invoice must not stop the rest
+            traceback.print_exc()
+            continue
+    return {"checked": len(candidates), "moved": moved}
+
+
 # Purchase Line columns whose value comes straight from Service First (see
 # service_api._apply_hsn_map) - the only ones revalidate_header_after_
 # description_fix ever touches on tbl_Purchase_Line itself, matched

@@ -1120,7 +1120,18 @@ def part_description_update_items():
     description (someone updated two different parts to the same text) -
     without this override, whichever part actually corresponds to the PDF
     line would look "already matched" and hide the fact that a second,
-    wrongly-duplicated part is sitting right behind it, unresolved."""
+    wrongly-duplicated part is sitting right behind it, unresolved.
+
+    PdfDescriptions is always every one of the PO's own PDF descriptions,
+    for EVERY row (not trimmed by which are already claimed elsewhere on
+    the PO) - a user reviewing one part's suggestions still needs to see
+    the invoice's other lines to tell them apart, even a currently-claimed
+    one. Actually PICKING one already claimed by a different part is what's
+    prevented, client-side (PartDescriptionUpdate.jsx's
+    descriptionUsedElsewhereInPo, re-checked server-side in
+    part_description_update_save before ever saving) - that's the real
+    conflict guard, so trimming the dropdown itself would only have hidden
+    information, never prevented anything trimming alone didn't already."""
     import database
     import service_api
     try:
@@ -1131,7 +1142,7 @@ def part_description_update_items():
         # A (PurchaseOrderNo, normalized description) claimed by more than
         # one distinct PartNoMapID is a real data conflict - flag every
         # item in the group so the frontend can call it out, and so the
-        # "already matches a PDF description" drop below never applies to
+        # "already matches a PDF description" check below never applies to
         # any of them.
         ids_by_key = {}
         for item in items:
@@ -1142,14 +1153,7 @@ def part_description_update_items():
             ids_by_key.setdefault(key, set()).add(item.get("PartNoMapID"))
         dup_keys = {k for k, ids in ids_by_key.items() if len(ids) > 1}
 
-        # First pass: which items already match a PDF description (flagged
-        # Resolved, not dropped - the screen shows a PO's parts together so
-        # a user can see how many of an invoice's lines are done vs still
-        # pending) vs. still need review - tracking each PO's resolved
-        # descriptions so the second pass can keep them out of OTHER lines'
-        # suggestion list on the same PO (see kept_items loop below for why).
-        kept_items = []
-        resolved_descs_by_po = {}
+        result = []
         for item in items:
             details = details_by_po.get(item.get("PurchaseOrderNo"), {})
             pdf_descriptions = details.get("descriptions", [])
@@ -1159,29 +1163,8 @@ def part_description_update_items():
             key = (item.get("PurchaseOrderNo"), nav_desc)
             if key in dup_keys:
                 item["DuplicateDescription"] = True
-                kept_items.append(item)
-                continue
-            if nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
-                resolved_descs_by_po.setdefault(item.get("PurchaseOrderNo"), set()).add(nav_desc)
+            elif nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
                 item["Resolved"] = True
-                kept_items.append(item)
-                continue
-            kept_items.append(item)
-
-        result = []
-        for item in kept_items:
-            po = item.get("PurchaseOrderNo")
-            resolved = resolved_descs_by_po.get(po) or set()
-            # A PO's dropdown offered every one of its PDF's item
-            # descriptions, including ones that already correctly belong to
-            # a DIFFERENT, already-resolved part on the same PO (not shown
-            # here at all) - picking one of those would just recreate the
-            # exact duplicate-description conflict flagged above. Only the
-            # descriptions genuinely still up for grabs (not already
-            # confirmed elsewhere on this PO) are offered.
-            item["PdfDescriptions"] = [
-                d for d in item["PdfDescriptions"] if _norm_desc(d) not in resolved
-            ]
             result.append(item)
 
         return {"items": result}
@@ -1269,6 +1252,26 @@ def part_description_update_save(payload: PartDescriptionSaveModel, request: Req
         return {"result": result, "revalidated": moved}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Service First update failed: {exc}")
+
+
+class RevalidateAllModel(BaseModel):
+    user_id: Optional[int] = None
+
+
+@app.post("/api/part-description-update/revalidate-all")
+def part_description_revalidate_all(payload: RevalidateAllModel):
+    """Re-check EVERY current DATA MISMATCH/PENDING IN SF invoice against
+    Service First right now (Part Description Mapping's "Recheck All"
+    button) - the catch-up sweep for a description confirmed on Service
+    First's own side before the Update button auto-rechecked (see
+    part_description_update_save), or by any other means. Safe to run any
+    time; each invoice re-validates independently."""
+    import database
+    _require_not_viewer(payload.user_id)
+    try:
+        return database.revalidate_all_data_mismatch(payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
 class BuyerOrderModel(BaseModel):
