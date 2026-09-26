@@ -168,7 +168,7 @@ export function SearchableSelect({ value, onChange, options, placeholder = "Sear
 export function DataTable({ columns, rows, searchKeys, pageSize = 10,
                             pageSizeOptions, empty, actions,
                             defaultSortKey = null, defaultSortDir = "asc",
-                            rowStyle, groupBy, renderGroupHeader }) {
+                            rowStyle, groupBy, renderGroupHeader, hideSearch }) {
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState(defaultSortKey);
   const [sortDir, setSortDir] = useState(defaultSortDir);
@@ -221,10 +221,12 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
   // to the last valid page instead of crashing - no separate reset needed.
   useEffect(() => { setPage(0); }, [query, size]);
 
-  const searchRow = (
+  const searchRow = (hideSearch && !actions) ? null : (
     <div style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
-      <input className="input" placeholder="Search…" value={query}
-             onChange={(e) => setQuery(e.target.value)} style={{ maxWidth: 260 }} />
+      {!hideSearch && (
+        <input className="input" placeholder="Search…" value={query}
+               onChange={(e) => setQuery(e.target.value)} style={{ maxWidth: 260 }} />
+      )}
       {actions}
     </div>
   );
@@ -232,7 +234,7 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
   if (!rows.length) {
     return (
       <div>
-        {actions && searchRow}
+        {!hideSearch && actions && searchRow}
         <div className="empty">{empty || "No rows."}</div>
       </div>
     );

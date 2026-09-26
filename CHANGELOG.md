@@ -11,6 +11,139 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### Invoice Search: View/Download, type-ahead suggestions, and a few polish fixes
+
+- File Name now has its own View (opens the shared PDF viewer) and
+  Download link, scoped to just that invoice's own pages the same way
+  every other PDF link in the app already is.
+- Typing in the search box now shows a live picklist of matching
+  invoices (debounced) - picking one fills the box and runs the full
+  search immediately; Enter/Search still work on their own regardless.
+- Removed the results table's own separate "Search…" box - redundant
+  with the page's own dedicated search above it.
+- A timeline entry with a blank who/when/what field now shows "Unknown"
+  there instead of a blank space.
+
+### New menu: Invoice Search
+
+- Look up an invoice by Invoice No. (or part of it) to see its file name,
+  vendor, batch, that batch's own status, the invoice's own current
+  status, and a full timeline of who did what and when (processing,
+  Buyer Order Entry, Part Description Mapping updates, Load/Post/
+  Complete, ...) - a read-only lookup, available to every role.
+- Available immediately for existing deployments too, not just new ones -
+  backfilled into every role's Screen Access on next startup, no manual
+  Super Admin step needed.
+
+### A 31-day-expired invoice's PDF could get stranded in its old folder
+
+- Parking a stale invoice as Manually Updated updates its database status
+  for every expired invoice in one commit, then moves each one's PDF into
+  the Manually Updated folder in a plain loop with no per-file error
+  handling - one file failing to move (locked/open, already moved by
+  hand, a permission issue, ...) aborted the whole loop, leaving every
+  file AFTER it stranded in its old folder even though its status already
+  said Manually Updated. Fixed: one failure is now logged and skipped,
+  never blocks the rest. Verified: a simulated failure on one of three
+  files still correctly moves the other two.
+
+### "Recheck All" / the Description migration also refreshes a stale Buyer's Order No.
+
+- A misspelt PO ("SPRUR/..." instead of "SPRPUR/...") read as confident
+  instead of doubtful by an older extraction sent the invoice to PENDING
+  IN SF instead of BUYER ORDER NO DOESN'T EXIST (seen on Avantik -
+  254.pdf) - and, since only Descriptions were ever refreshed, nothing
+  ever re-checked or corrected it afterward either.
+- reextract_and_fix_description (shared by the one-time migration and
+  "Recheck All") now also refreshes the Buyer's Order No./doubtful flag
+  from a fresh re-OCR when it differs from what's stored, moving the
+  invoice to whatever status is now correct - UNLESS a human has since
+  keyed in a correction on Buyer Order Entry (BuyerOrderSource =
+  'MANUAL'), which is never touched or reverted. Verified both paths:
+  a stale doubtful flag gets corrected and the invoice moves to BUYER
+  ORDER NO DOESN'T EXIST; a manually-corrected PO is left untouched.
+- Also fixed: a PO-only correction (no Description change) used to be
+  silently dropped - the function bailed out before ever saving the
+  corrected value or re-validating, whenever fix_purchase_line_
+  descriptions found 0 lines actually needing a Description update.
+
+### A partially-Loaded batch can be downloaded again for its remaining invoices
+
+- Previously, the moment ANY invoice in a batch reached Loaded (or Posted/
+  Completed/Rejected), the whole batch could never be downloaded again -
+  even invoices still sitting at Ready to Load (a partial Load: only some
+  of the batch was taken on to NAV so far). Those invoices had no way
+  back into an active batch short of excluding and re-uploading them.
+- Now, a locked batch can still be downloaded as long as it has invoices
+  left at Ready to Load - the export (and any custom Document No./Entry
+  No.) only ever touches those still-pending invoices; one already past
+  Ready to Load is never re-fetched, re-exported, or renumbered (verified:
+  a mixed Ready to Load + Loaded batch now downloads, and only the
+  Ready to Load invoice is ever included). A batch only refuses download
+  outright once there's genuinely nothing left to download.
+
+### Data Mismatch is no longer reprocessable by re-upload
+
+- Re-uploading a DATA MISMATCH invoice used to merge fresh extraction back
+  onto the same invoice (like Excluded/Pending In SF/New Template/
+  Unsupported still do) - but its intended fix path is now the Part
+  Description Mapping menu (correct the description/part on Service
+  First's own side, then Update or Recheck All re-validates it in place),
+  not a re-upload, which would just re-run the same extraction against the
+  same still-wrong Service First data and land right back at DATA
+  MISMATCH. A re-upload of one now falls through to DUPLICATE instead,
+  same as any other already-processed invoice. Verified: reprocessing and
+  the duplicate-detection procedure both now correctly refuse a DATA
+  MISMATCH header.
+
+### "Recheck All" now also re-OCRs, not just re-checks Service First
+
+- The one-time startup migration only ever examines each invoice ONCE - an
+  invoice processed by a stale, not-yet-restarted worker right after that
+  flag was already set (or before some later extraction fix existed) never
+  gets a second look from it, and keeps a wrong Description forever (seen
+  on Spares Bazar - 148.pdf / SPRPUR/2026/09/10-86617: the description's
+  own continuation line - "3520 Palmrest with Kbd" - never made it into
+  what was saved).
+- "Recheck All" now does the SAME re-extraction the one-time migration
+  does, for every current DATA MISMATCH/PENDING IN SF invoice, before
+  falling back to a plain Service First re-check when nothing needed
+  re-extracting - so it's no longer dependent on a one-shot flag's exact
+  timing to catch this case; it can be run again any time.
+
+### Part Description Mapping: the suggestion dropdown was missing options
+
+- A PO's suggestion dropdown was trimmed to hide any of the invoice's own
+  descriptions already claimed by a DIFFERENT, already-resolved part on
+  that PO - meant to stop picking an already-used description, but it
+  applied to every row on the PO (resolved or still pending), so a PO with
+  most of its parts already resolved could leave only one, or zero, options
+  visible anywhere. That guard was always redundant: picking an
+  already-claimed description is - and always was - blocked separately,
+  client-side (descriptionUsedElsewhereInPo, grayed out in the dropdown,
+  re-checked server-side before ever saving). Removed the trim: every row
+  now shows every one of its invoice's descriptions.
+- A second, separate cause of the same symptom: the dropdown was also
+  filtered, client-side, by the field's OWN pre-filled value - a Resolved
+  row's textarea starts full of its confirmed Service First description,
+  so the instant it was focused (before typing anything) every OTHER
+  suggestion that didn't happen to contain that exact text was hidden.
+  Now filtered only by what's actually been typed this session - focusing
+  an untouched field shows every suggestion, narrowing down only as the
+  user types something new.
+
+### Part Description Mapping: "Recheck All" button for the pre-fix backlog
+
+- A description confirmed directly on Service First's own side (rather than
+  through this screen's Update button, which now auto-rechecks its own
+  invoice right away) left that invoice sitting at DATA MISMATCH forever,
+  with nothing to ever notice and re-check it - real backlog seen right
+  after publishing today's auto-recheck fix, since it only covers a FUTURE
+  Update click, not every already-confirmed one sitting there from before.
+- New "Recheck All" button re-checks every current DATA MISMATCH/PENDING IN
+  SF invoice against Service First right now, on demand - safe to run any
+  time, reports how many it checked and which ones actually moved forward.
+
 ### Stale unresolved invoices now get 31 days before auto-parking, not 10
 
 - `STALE_STATUS_EXPIRY_DAYS` (database.py) is now 31, not 10. A Data

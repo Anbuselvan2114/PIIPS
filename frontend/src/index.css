@@ -293,6 +293,21 @@ table.tbl tbody tr.tbl-group-header td {
 table.tbl tbody tr.tbl-group-header:first-child td { border-top: none; }
 .empty { color: var(--muted); padding: 16px 2px; }
 
+/* ---- tracking-history timeline (Invoice Search) ---- */
+.timeline { position: relative; padding-left: 6px; }
+.timeline-item { position: relative; padding: 0 0 20px 26px; border-left: 2px solid var(--border); margin-left: 5px; }
+.timeline-item:last-child { border-left-color: transparent; padding-bottom: 0; }
+.timeline-dot {
+  position: absolute; left: -7px; top: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: var(--primary); border: 2px solid var(--surface);
+}
+.timeline-content { padding-top: 0; }
+.timeline-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.timeline-action { font-weight: 600; font-size: 13.5px; }
+.timeline-time { color: var(--muted); font-size: 12px; }
+.timeline-who { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.timeline-detail { font-size: 13px; margin-top: 4px; }
+
 /* ---- badges ---- */
 .badge {
   display: inline-block; padding: 3px 10px; border-radius: 999px;

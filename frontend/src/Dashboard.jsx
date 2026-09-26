@@ -396,14 +396,17 @@ export default function Dashboard({ user }) {
   // has invoices sitting at READY TO LOAD — once everything has moved on
   // to Loaded/Posted/Completed there's nothing left to stage for NAV.
   // A batch locks the moment any invoice in it reaches Loaded/Excluded (or
-  // later) - see database._batch_status_and_lock. From then on the whole
-  // batch can no longer be downloaded or renumbered, even for invoices
-  // still sitting at Ready to Load. Batches must also clear in creation
+  // later) - see database._batch_status_and_lock - but a locked batch can
+  // still be downloaded as long as it has invoices left at Ready to Load
+  // (a partial Load: only some of the batch was taken on to NAV so far) -
+  // the download itself never re-touches or re-mints a Document No./Entry
+  // No. for one already past Ready to Load, only the still-pending ones
+  // (see app.py's download_batch). Batches must also clear in creation
   // order - blocked_by names any earlier, not-yet-cleared batch(es) this
   // one must wait on (see database.list_batches). Only one batch may be
   // Downloaded/In Progress at a time - see app.py's download_batch.
   const canDownload = (row) => (row.exportable ?? 1) > 0 && (row["st:READY TO LOAD"] ?? 0) > 0
-    && !row.locked && !(row.blocked_by || []).length
+    && !(row.blocked_by || []).length
     && !(row["st:BUYER ORDER NO DOESN'T EXIST"] ?? 0)
     && !(row["st:DATA MISMATCH"] ?? 0)
     && !batches.some((b) => b.batch !== row.batch
@@ -473,8 +476,8 @@ export default function Dashboard({ user }) {
         </button>
       ) : (
         <span className="muted"
-              title={row.locked
-                ? "This batch has an invoice already Loaded, Excluded, Posted, Completed, or Rejected — it can no longer be downloaded or renumbered."
+              title={(row.locked && !(row["st:READY TO LOAD"] ?? 0))
+                ? "This batch has an invoice already Loaded, Excluded, Posted, Completed, or Rejected, and nothing left at Ready to Load — there's nothing left to download."
                 : (row.blocked_by || []).length
                 ? `Waiting on earlier batch(es) to be Loaded, Posted, or Completed first: ${row.blocked_by.join(", ")}`
                 : (row["st:BUYER ORDER NO DOESN'T EXIST"] ?? 0)

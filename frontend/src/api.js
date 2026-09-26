@@ -120,6 +120,12 @@ export const getInvoicesByBatch = (batch) =>
 export const getInvoiceFieldCheck = (headerId) =>
   request(`/api/invoices/${encodeURIComponent(headerId)}/fields`);
 
+export const searchInvoices = (q) =>
+  request(`/api/invoices/search?q=${encodeURIComponent(q)}`);
+
+export const getInvoiceHistory = (headerId) =>
+  request(`/api/invoices/${encodeURIComponent(headerId)}/history`);
+
 export const invoicePdfUrl = (file, page, pageEnd) =>
   withToken(
     `${API_BASE}/api/invoices/pdf?file=${encodeURIComponent(file)}` +
@@ -168,6 +174,12 @@ export const savePartDescription = (part_no_map_id, description, purchase_order_
   request("/api/part-description-update/save", {
     method: "POST",
     body: JSON.stringify({ part_no_map_id, description, purchase_order_no, user_id }),
+  });
+
+export const revalidateAllDataMismatch = (user_id) =>
+  request("/api/part-description-update/revalidate-all", {
+    method: "POST",
+    body: JSON.stringify({ user_id }),
   });
 
 export const advanceLifecycle = (stage, header_ids, user_id) =>

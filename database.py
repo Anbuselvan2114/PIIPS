@@ -765,26 +765,34 @@ def get_processed_invoices():
 
 # Statuses an existing header may be re-processed FROM (in place, same
 # header/batch/No.) instead of the re-upload being parked as a DUPLICATE -
-# see reprocess_reworkable_header. All five represent an invoice that never
+# see reprocess_reworkable_header. Each represents an invoice that never
 # reached a real, final outcome the first time - Excluded is a deliberate
 # drop (a real re-inclusion - see _mark_batch_reincluded); Pending In SF
-# just means the part hadn't reached Service First yet; Data Mismatch and
-# New Template mean the data/format wasn't usable last time; Unsupported
-# means the format matched but something essential (e.g. the Vendor
-# Invoice No.) couldn't be read - in every case, a fresh upload deserves a
-# fresh look rather than being told it's a duplicate of itself. This
-# re-processing only ever happens when a USER deliberately re-uploads that
-# exact file and starts a run - nothing here pulls a file back in on its
-# own (see processor.py's main loop, which is the only caller, driven by
-# whatever the user just uploaded).
-# MANUALLY UPDATED is deliberately NOT in this list - it's what Data
-# Mismatch/Excluded/New Template becomes once usp_ExpireStaleUnresolved
-# parks it as permanently unresolved (Pending In SF is NOT swept by that
-# expiry - a re-upload can still merge into it as before); unlike the
-# five statuses below, a re-upload of a Manually Updated invoice must
-# fall through to DUPLICATE, never merge back in.
+# just means the part hadn't reached Service First yet; New Template means
+# the format wasn't usable last time; Unsupported means the format matched
+# but something essential (e.g. the Vendor Invoice No.) couldn't be read -
+# in every case, a fresh upload deserves a fresh look rather than being
+# told it's a duplicate of itself. This re-processing only ever happens
+# when a USER deliberately re-uploads that exact file and starts a run -
+# nothing here pulls a file back in on its own (see processor.py's main
+# loop, which is the only caller, driven by whatever the user just
+# uploaded).
+# DATA MISMATCH is deliberately NOT in this list - its intended fix path
+# is the Part Description Mapping menu (correct the description/part on
+# Service First's own side, then Update or Recheck All re-validates it in
+# place), not a re-upload; re-uploading the same PDF would just re-run the
+# same extraction against the same still-wrong Service First data and land
+# right back at DATA MISMATCH, so a re-upload now falls through to
+# DUPLICATE like any other already-processed invoice, steering the user
+# back to Part Description Mapping instead of a pointless reprocess.
+# MANUALLY UPDATED is likewise NOT in this list - it's what Excluded/New
+# Template (or, before today, Data Mismatch) becomes once
+# usp_ExpireStaleUnresolved parks it as permanently unresolved (Pending In
+# SF is NOT swept by that expiry - a re-upload can still merge into it as
+# before); a re-upload of a Manually Updated invoice must fall through to
+# DUPLICATE, never merge back in.
 # KEEP IN SYNC with usp_GetProcessedInvoices' own copy of this list.
-_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "DATA MISMATCH", "NEW TEMPLATE", "UNSUPPORTED")
+_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "NEW TEMPLATE", "UNSUPPORTED")
 
 
 def reprocess_reworkable_header(existing_header_id, new_header_id):
@@ -1829,6 +1837,27 @@ def _table_exists(cur, table):
     return cur.fetchone() is not None
 
 
+def search_invoices_by_number(query, limit=200):
+    """Invoices whose Invoice No. contains `query` (Invoice Search menu) -
+    same display shape as _invoice_list (file name, vendor, batch, file
+    status, ...), plus each row's own batch_status (see list_batches -
+    CREATED/DOWNLOADED/IN PROGRESS/LOADED/POSTED/COMPLETED/EXCLUDED), so a
+    user can see which batch an invoice is in and how that batch itself is
+    progressing without a separate lookup. Blank query returns nothing (no
+    "browse everything" mode - this is a targeted lookup by number).
+    Sample: search_invoices_by_number('AVS/26-27/00668')"""
+    q = (query or "").strip()
+    if not q:
+        return []
+    rows = _invoice_list("h.InvoiceNo LIKE ?", [f"%{q}%"])[:limit]
+    if not rows:
+        return rows
+    batch_status_by_name = {b["batch"]: b["batch_status"] for b in list_batches()}
+    for r in rows:
+        r["batch_status"] = batch_status_by_name.get(r["batch"], "")
+    return rows
+
+
 def invoices_by_status(status_id):
     """Invoices whose tracker status is `status_id` (pie-slice pop-up).
     Sample: invoices_by_status(5)"""
@@ -1873,12 +1902,12 @@ def invoices_by_statuses(status_names, active_only=False):
 # a one-time seed, not read on every request, so a stale key here only
 # matters for a brand new deployment's first run.
 _ROLE_MENU_DEFAULTS = {
-    "admin": ["dashboard", "input", "manual", "buyerorder", "vendorcode", "partdescupdate",
+    "admin": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate",
               "load", "post", "complete",
               "configuration", "apiconfig", "template", "createfield", "users"],
-    "user": ["dashboard", "input", "manual", "buyerorder", "vendorcode", "partdescupdate", "load"],
-    "accounts": ["dashboard", "input", "manual", "post", "complete"],
-    "viewer": ["dashboard", "input", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
+    "user": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load"],
+    "accounts": ["dashboard", "input", "manual", "invoicesearch", "post", "complete"],
+    "viewer": ["dashboard", "input", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
 }
 
 
@@ -2121,6 +2150,210 @@ def revalidate_data_mismatch_header(header_id, user_id=None):
               detail="Re-checked against Service First after a Part Description Mapping update")
     return {"file_name": file_name, "new_status": verdict["status"],
             "is_active": verdict.get("is_active", False), "reason": verdict.get("reason", "")}
+
+
+def _buyer_order_is_manual(header_id):
+    """True if this header's CURRENT Buyer's Order No. was keyed in by a
+    human on Buyer Order Entry (BuyerOrderSource = 'MANUAL' - see
+    _stamp_tracker), never a PDF/OCR value - reextract_and_fix_description
+    must never silently revert that with a fresh re-OCR's own reading.
+    Sample: _buyer_order_is_manual(7353)"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT BuyerOrderSource FROM dbo.tbl_Purchase_Tracker WHERE Purchase_Header_ID = ?",
+            header_id)
+        row = cur.fetchone()
+        return bool(row and (row[0] or "").strip().upper() == "MANUAL")
+    finally:
+        conn.close()
+
+
+def reextract_and_fix_description(candidate, ocr=None, output_folder=None):
+    """Re-OCR one DATA MISMATCH/PENDING IN SF candidate (a dict shaped like
+    one of data_mismatch_headers()'s own rows) with today's extraction, and
+    correct whichever of these actually changed, then re-validate the
+    invoice (Service First for PART, the mandatory-field gate for SERVICE),
+    rebuilding only its Reservation Entry rows and status/IsActive
+    (revalidate_header_after_description_fix) - never BatchName, [No.], or
+    [Entry No.]:
+      - Purchase Line Description(s) (fix_purchase_line_descriptions) -
+        only when the item count is unchanged (a different count means
+        today's fix also changed WHICH rows exist, not just their text -
+        too different to positionally match, skipped rather than guessed
+        at) and at least one Description actually differs from what's
+        stored.
+      - The Buyer's Order No. / doubtful flag - just as easily wrong in an
+        old extraction as a Description (e.g. a misspelt "SPRUR/..." read
+        as a confident PO instead of doubtful, so the invoice went to
+        PENDING IN SF instead of BUYER ORDER NO DOESN'T EXIST) - refreshed
+        the same way, UNLESS a human has since confirmed/corrected it on
+        Buyer Order Entry (_buyer_order_is_manual), which must never be
+        silently reverted by a later re-OCR.
+
+    Shared by the one-time startup migration (app.py's
+    _run_line_description_continuation_fix_migration_impl) and the
+    on-demand "Recheck All" sweep (revalidate_all_data_mismatch) - the
+    one-time migration only ever examines each invoice ONCE, ever (its own
+    config.json flag), so an invoice processed by a stale, not-yet-
+    restarted worker AFTER that flag was already set (or before some LATER
+    extraction fix existed) never gets a second look from it; "Recheck
+    All" gives a user a way to ask for that second look themselves, any
+    time, without waiting on a fresh one-time flag that will never fire
+    again on an environment that already completed it.
+
+    Returns None if nothing changed (still current, or a PDF/JSON is
+    missing, or the item count changed with nothing else to fix either),
+    else {"header_id", "file_name", "lines_changed", "new_status"}.
+    Sample: reextract_and_fix_description(data_mismatch_headers()[0])"""
+    import config_store
+    import excel_export
+    import service_api
+    import template_store
+    from ocr_engine import OCREngine
+    from invoice_schema import build_invoice_json
+
+    header_id, fname, json_path = candidate["header_id"], candidate["file_name"], candidate["source_json"]
+    invoice_type = candidate["invoice_type"]
+    if not json_path or not os.path.isfile(json_path):
+        return None
+    path = config_store.find_pdf(fname)
+    if not path:
+        return None
+
+    cfg = config_store.load_config()
+    allow_scanned = bool(cfg.get(
+        f"allow_scanned_pdfs_{invoice_type.lower()}"
+        if invoice_type in ("PART", "SERVICE") else "allow_scanned_pdfs_part"
+    ))
+    ocr = ocr or OCREngine()
+    ocr_result = ocr.read_pdf(path, allow_scanned=allow_scanned)
+    invoice_groups = ocr_result.get("Invoices") or [ocr_result]
+    fresh = build_invoice_json(invoice_groups[0], path)
+    new_items = fresh.get("items") or []
+
+    with open(json_path, "r", encoding="utf-8") as fp:
+        data = json.load(fp)
+    old_items = data.get("items") or []
+
+    # A different item count means today's fix also changed WHICH rows
+    # exist, not just their text - too different to positionally match
+    # Descriptions, skipped rather than guessed at (the PO check below is
+    # independent and still runs either way).
+    items_changed = len(old_items) == len(new_items) and not all(
+        (o.get("Description") or "").strip() == (n.get("Description") or "").strip()
+        for o, n in zip(old_items, new_items)
+    )
+
+    old_po = (data.get("buyer_order_no") or "").strip()
+    new_po = (fresh.get("buyer_order_no") or "").strip()
+    new_doubtful = bool(fresh.get("buyer_order_doubtful"))
+    po_changed = (
+        not _buyer_order_is_manual(header_id)
+        and (new_po != old_po or new_doubtful != bool(data.get("buyer_order_doubtful")))
+    )
+
+    if not items_changed and not po_changed:
+        return None  # nothing this re-extraction is meant to touch changed
+
+    if items_changed:
+        data["items"] = new_items
+    if po_changed:
+        data["buyer_order_no"] = new_po
+        data["buyer_order_doubtful"] = new_doubtful
+
+    if output_folder is None:
+        output_folder = (config_store.folders(create=False) or {}).get("output", "")
+    static, _ = template_store.static_for_path(output_folder, json_path)
+    data["_static"] = static
+    with open(json_path, "w", encoding="utf-8") as fp:
+        json.dump(data, fp, indent=4, ensure_ascii=False)
+
+    if invoice_type == "SERVICE":
+        field_mapping = excel_export.load_mapping()
+        grouped = excel_export.build_rows_grouped([data])
+        group = grouped["groups"][0] if grouped["groups"] else {"header": {}, "lines": [], "reservations": []}
+        header_for_check = dict(group.get("header", {}))
+        header_for_check["InvoiceNo"] = data.get("invoice_no", "")
+        missing = excel_export.missing_required_fields(
+            header_for_check, group.get("lines", []), group.get("reservations", []),
+            field_mapping, invoice_type="SERVICE",
+        )
+        missing_names = sorted({m["field"] for m in missing})
+        verdict = (
+            {"status": "DATA MISMATCH", "is_active": False, "is_synced": False,
+             "reason": "Missing required field(s): " + ", ".join(missing_names)}
+            if missing_names else
+            {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
+        )
+    else:
+        verdict = service_api.enrich_invoice(data)
+
+    lines_changed = fix_purchase_line_descriptions(header_id, new_items) if items_changed else 0
+    revalidate_header_after_description_fix(header_id, data, verdict)
+    detail_parts = []
+    if items_changed:
+        detail_parts.append("Purchase Line Description corrected (continuation-line extraction fix)")
+    if po_changed:
+        detail_parts.append(f"Buyer's Order No. corrected ('{old_po or '(blank)'}' -> '{new_po or '(blank)'}')")
+    log_event(
+        "STATUS_CHANGED", header_id=header_id, to_status=verdict["status"],
+        detail=" and ".join(detail_parts) + ", re-validated")
+    return {"header_id": header_id, "file_name": fname, "lines_changed": lines_changed, "new_status": verdict["status"]}
+
+
+def revalidate_all_data_mismatch(user_id=None):
+    """Re-check EVERY invoice currently at DATA MISMATCH or PENDING IN SF,
+    both ways at once - a repeatable, on-demand version of what the Part
+    Description Mapping screen's Update button now does automatically for
+    a single invoice right when its description is confirmed (see
+    part_description_update_save):
+      1. Re-OCR it (reextract_and_fix_description) - catches an invoice
+         whose Description was never actually fixed, e.g. because a stale
+         worker processed it after the one-time migration's flag was
+         already set, or before some later extraction fix existed.
+      2. If that made no change, re-run Service First anyway
+         (revalidate_data_mismatch_header) - catches a description
+         confirmed directly on Service First's own side (not through this
+         screen's Update button - e.g. by someone else, or before that
+         auto-recheck existed), which step 1 has nothing to fix but Service
+         First itself may now resolve.
+    Safe to run any time; each invoice re-validates independently, one
+    failure is logged and skipped, never aborts the rest.
+    Returns {"checked": n, "moved": [{"header_id", "file_name",
+    "from_status", "new_status"}, ...]} - "moved" only lists ones whose
+    status actually changed.
+    Sample: revalidate_all_data_mismatch(7)"""
+    import traceback
+    from ocr_engine import OCREngine
+    import config_store
+
+    candidates = data_mismatch_headers(("DATA MISMATCH", "PENDING IN SF"))
+    moved = []
+    ocr = OCREngine() if candidates else None
+    output_folder = (config_store.folders(create=False) or {}).get("output", "")
+    for c in candidates:
+        before = c["status"]
+        try:
+            reextracted = reextract_and_fix_description(c, ocr=ocr, output_folder=output_folder)
+        except Exception:  # noqa: BLE001 - one bad invoice must not stop the rest
+            traceback.print_exc()
+            reextracted = None
+        try:
+            if reextracted:
+                if reextracted["new_status"] != before:
+                    moved.append({"header_id": c["header_id"], "file_name": reextracted["file_name"],
+                                  "from_status": before, "new_status": reextracted["new_status"]})
+            else:
+                res = revalidate_data_mismatch_header(c["header_id"], user_id)
+                if res and res["new_status"] != before:
+                    moved.append({"header_id": c["header_id"], "file_name": res["file_name"],
+                                  "from_status": before, "new_status": res["new_status"]})
+        except Exception:  # noqa: BLE001 - one bad invoice must not stop the rest
+            traceback.print_exc()
+            continue
+    return {"checked": len(candidates), "moved": moved}
 
 
 # Purchase Line columns whose value comes straight from Service First (see
@@ -4243,18 +4476,21 @@ _MENU_PROC_DDL = [
         -- StatusID = 0 means the file was reset (moved to New_Format) and may
         -- be uploaded again by anyone, so it is NOT treated as a duplicate.
         -- Same for a file whose linked invoice is currently in any of
-        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/New
-        -- Template/Unsupported) - KEEP THIS LIST IN SYNC with database.
+        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/New Template/
+        -- Unsupported) - KEEP THIS LIST IN SYNC with database.
         -- _REPROCESSABLE_STATUSES. Re-uploading one of these is a deliberate
         -- correction (see processor.py/reprocess_reworkable_header), not a
         -- duplicate, so it must reach processing rather than being silently
-        -- skipped here before it ever gets that far.
+        -- skipped here before it ever gets that far. DATA MISMATCH is
+        -- deliberately excluded from this list - its fix path is Part
+        -- Description Mapping, not a re-upload (see _REPROCESSABLE_STATUSES'
+        -- own comment) - so a re-upload of one now IS treated as a duplicate.
         SELECT r.RelPath, r.FileName, r.InitiatedByID, u.UserName AS InitiatedByName,
                r.InitiatedDatetime
         FROM ranked r
         LEFT JOIN dbo.tbl_user u ON u.UserId = r.InitiatedByID
         WHERE r.rn = 1 AND ISNULL(r.StatusID, -1) <> 0
-          AND ISNULL(r.StatusName, '') NOT IN ('EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE', 'UNSUPPORTED');
+          AND ISNULL(r.StatusName, '') NOT IN ('EXCLUDED', 'PENDING IN SF', 'NEW TEMPLATE', 'UNSUPPORTED');
     END
     """,
     # ---- Reset input-file log entries (moved to New_Format) --------------
@@ -4462,8 +4698,9 @@ _MENU_PROC_DDL = [
         -- BatchName now lives on the tracker (informational for dedup).
         -- HeaderId/IsReprocessable let the caller re-process an invoice
         -- whose only existing record is in one of database.
-        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/
-        -- New Template/Unsupported), instead of flagging it as a duplicate
+        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/New Template/
+        -- Unsupported - DATA MISMATCH deliberately excluded, see that
+        -- constant's own comment), instead of flagging it as a duplicate
         -- (see database.get_processed_invoices/reprocess_reworkable_header)
         -- - KEEP THIS LIST IN SYNC with _REPROCESSABLE_STATUSES. Picks one
         -- representative header per invoice no. (MIN Id) since an invoice
@@ -4475,7 +4712,7 @@ _MENU_PROC_DDL = [
         SELECT h.InvoiceNo, MIN(pt.BatchName) AS BatchName,
                MIN(h.Id) AS HeaderId,
                MAX(CASE WHEN s.StatusName IN (
-                       'EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE', 'UNSUPPORTED'
+                       'EXCLUDED', 'PENDING IN SF', 'NEW TEMPLATE', 'UNSUPPORTED'
                    ) THEN 1 ELSE 0 END) AS IsReprocessable,
                MIN(pt.BuyerOrderNo) AS BuyerOrderNo
         FROM dbo.tbl_Purchase_Header h
@@ -4662,6 +4899,23 @@ def ensure_menu_schema(force=False):
         for ddl in _MENU_TABLE_DDL:
             cur.execute(ddl)
         conn.commit()
+
+        # A brand new deployment's tbl_RoleMenu is empty and gets the full
+        # _ROLE_MENU_DEFAULTS the first time get_role_menus() is called - but
+        # an EXISTING deployment's table already has rows, so adding a new
+        # menu key to that dict (invoicesearch) would otherwise never reach
+        # it without a Super Admin manually visiting Screen Access and
+        # re-saving. Backfill it for every configurable role whenever it's
+        # missing, so it's available everywhere immediately - safe/idempotent
+        # to run on every startup (a no-op once each role already has it).
+        cur.execute("SELECT 1 FROM sys.tables WHERE name = 'tbl_RoleMenu'")
+        if cur.fetchone():
+            for role in ("admin", "user", "accounts", "viewer"):
+                cur.execute(
+                    "IF NOT EXISTS (SELECT 1 FROM dbo.tbl_RoleMenu WHERE RoleName = ? AND MenuKey = ?) "
+                    "INSERT INTO dbo.tbl_RoleMenu (RoleName, MenuKey) VALUES (?, ?)",
+                    role, "invoicesearch", role, "invoicesearch")
+            conn.commit()
 
         # Normalise legacy table/column names BEFORE (re)creating the
         # procedures, whose static references use the final names.

@@ -248,7 +248,6 @@ def _run_line_description_continuation_fix_migration_impl():
     [Entry No.] - those stay exactly as already assigned. Best-effort per
     PDF: one failure is logged and skipped, never aborts the rest of the
     run or blocks startup."""
-    import json
     import traceback
     try:
         cfg = config_store.load_config()
@@ -258,9 +257,6 @@ def _run_line_description_continuation_fix_migration_impl():
             return  # DB not configured yet - nothing to migrate
 
         import database
-        import excel_export
-        import service_api
-        import template_store
 
         candidates = database.data_mismatch_headers(("DATA MISMATCH", "PENDING IN SF"))
         if not candidates:
@@ -270,76 +266,17 @@ def _run_line_description_continuation_fix_migration_impl():
             return
 
         from ocr_engine import OCREngine
-        from invoice_schema import build_invoice_json
 
         ocr = OCREngine()
         output_folder = (config_store.folders(create=False) or {}).get("output", "")
         fixed_lines = 0
         fixed_invoices = 0
         for c in candidates:
-            header_id, fname, json_path = c["header_id"], c["file_name"], c["source_json"]
             try:
-                if not json_path or not os.path.isfile(json_path):
-                    continue
-                path = config_store.find_pdf(fname)
-                if not path:
-                    continue
-                allow_scanned = bool(cfg.get(
-                    f"allow_scanned_pdfs_{c['invoice_type'].lower()}"
-                    if c["invoice_type"] in ("PART", "SERVICE") else "allow_scanned_pdfs_part"
-                ))
-                ocr_result = ocr.read_pdf(path, allow_scanned=allow_scanned)
-                invoice_groups = ocr_result.get("Invoices") or [ocr_result]
-                fresh = build_invoice_json(invoice_groups[0], path)
-                new_items = fresh.get("items") or []
-
-                with open(json_path, "r", encoding="utf-8") as fp:
-                    data = json.load(fp)
-                old_items = data.get("items") or []
-                if len(old_items) != len(new_items):
-                    continue  # today's fix also changed the item count - skip, don't guess
-                if all(
-                    (o.get("Description") or "").strip() == (n.get("Description") or "").strip()
-                    for o, n in zip(old_items, new_items)
-                ):
-                    continue  # nothing this migration is meant to touch changed
-
-                data["items"] = new_items
-                static, _ = template_store.static_for_path(output_folder, json_path)
-                data["_static"] = static
-                with open(json_path, "w", encoding="utf-8") as fp:
-                    json.dump(data, fp, indent=4, ensure_ascii=False)
-
-                if c["invoice_type"] == "SERVICE":
-                    field_mapping = excel_export.load_mapping()
-                    grouped = excel_export.build_rows_grouped([data])
-                    group = grouped["groups"][0] if grouped["groups"] else {"header": {}, "lines": [], "reservations": []}
-                    header_for_check = dict(group.get("header", {}))
-                    header_for_check["InvoiceNo"] = data.get("invoice_no", "")
-                    missing = excel_export.missing_required_fields(
-                        header_for_check, group.get("lines", []), group.get("reservations", []),
-                        field_mapping, invoice_type="SERVICE",
-                    )
-                    missing_names = sorted({m["field"] for m in missing})
-                    verdict = (
-                        {"status": "DATA MISMATCH", "is_active": False, "is_synced": False,
-                         "reason": "Missing required field(s): " + ", ".join(missing_names)}
-                        if missing_names else
-                        {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
-                    )
-                else:
-                    verdict = service_api.enrich_invoice(data)
-
-                n = database.fix_purchase_line_descriptions(header_id, new_items)
-                if not n:
-                    continue
-                fixed_lines += n
-                fixed_invoices += 1
-                database.revalidate_header_after_description_fix(header_id, data, verdict)
-                database.log_event(
-                    "STATUS_CHANGED", header_id=header_id, to_status=verdict["status"],
-                    detail="Purchase Line Description corrected (continuation-line extraction "
-                           "fix) and re-validated during startup migration")
+                res = database.reextract_and_fix_description(c, ocr=ocr, output_folder=output_folder)
+                if res:
+                    fixed_lines += res["lines_changed"]
+                    fixed_invoices += 1
             except Exception:  # noqa: BLE001 - one bad PDF must not stop the rest
                 traceback.print_exc()
                 continue
@@ -931,6 +868,29 @@ def invoices_by_status(status_id: int):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+@app.get("/api/invoices/search")
+def invoices_search(q: str = ""):
+    """Invoice Search menu: invoices whose Invoice No. contains `q`, each
+    with its file name/vendor/batch/batch status/file status."""
+    import database
+    try:
+        return {"invoices": database.search_invoices_by_number(q)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/invoices/{header_id}/history")
+def invoice_history(header_id: int):
+    """Who did what and when for one invoice (Invoice Search menu's
+    tracking-history timeline) - every audit event recorded for it, newest
+    first."""
+    import database
+    try:
+        return {"events": database.get_audit(header_id=header_id, limit=500)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 @app.get("/api/invoices/{header_id}/fields")
 def invoice_field_check(header_id: int):
     """Field-by-field mandatory-data breakdown for one invoice (Dashboard
@@ -1120,7 +1080,18 @@ def part_description_update_items():
     description (someone updated two different parts to the same text) -
     without this override, whichever part actually corresponds to the PDF
     line would look "already matched" and hide the fact that a second,
-    wrongly-duplicated part is sitting right behind it, unresolved."""
+    wrongly-duplicated part is sitting right behind it, unresolved.
+
+    PdfDescriptions is always every one of the PO's own PDF descriptions,
+    for EVERY row (not trimmed by which are already claimed elsewhere on
+    the PO) - a user reviewing one part's suggestions still needs to see
+    the invoice's other lines to tell them apart, even a currently-claimed
+    one. Actually PICKING one already claimed by a different part is what's
+    prevented, client-side (PartDescriptionUpdate.jsx's
+    descriptionUsedElsewhereInPo, re-checked server-side in
+    part_description_update_save before ever saving) - that's the real
+    conflict guard, so trimming the dropdown itself would only have hidden
+    information, never prevented anything trimming alone didn't already."""
     import database
     import service_api
     try:
@@ -1131,7 +1102,7 @@ def part_description_update_items():
         # A (PurchaseOrderNo, normalized description) claimed by more than
         # one distinct PartNoMapID is a real data conflict - flag every
         # item in the group so the frontend can call it out, and so the
-        # "already matches a PDF description" drop below never applies to
+        # "already matches a PDF description" check below never applies to
         # any of them.
         ids_by_key = {}
         for item in items:
@@ -1142,14 +1113,7 @@ def part_description_update_items():
             ids_by_key.setdefault(key, set()).add(item.get("PartNoMapID"))
         dup_keys = {k for k, ids in ids_by_key.items() if len(ids) > 1}
 
-        # First pass: which items already match a PDF description (flagged
-        # Resolved, not dropped - the screen shows a PO's parts together so
-        # a user can see how many of an invoice's lines are done vs still
-        # pending) vs. still need review - tracking each PO's resolved
-        # descriptions so the second pass can keep them out of OTHER lines'
-        # suggestion list on the same PO (see kept_items loop below for why).
-        kept_items = []
-        resolved_descs_by_po = {}
+        result = []
         for item in items:
             details = details_by_po.get(item.get("PurchaseOrderNo"), {})
             pdf_descriptions = details.get("descriptions", [])
@@ -1159,29 +1123,8 @@ def part_description_update_items():
             key = (item.get("PurchaseOrderNo"), nav_desc)
             if key in dup_keys:
                 item["DuplicateDescription"] = True
-                kept_items.append(item)
-                continue
-            if nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
-                resolved_descs_by_po.setdefault(item.get("PurchaseOrderNo"), set()).add(nav_desc)
+            elif nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
                 item["Resolved"] = True
-                kept_items.append(item)
-                continue
-            kept_items.append(item)
-
-        result = []
-        for item in kept_items:
-            po = item.get("PurchaseOrderNo")
-            resolved = resolved_descs_by_po.get(po) or set()
-            # A PO's dropdown offered every one of its PDF's item
-            # descriptions, including ones that already correctly belong to
-            # a DIFFERENT, already-resolved part on the same PO (not shown
-            # here at all) - picking one of those would just recreate the
-            # exact duplicate-description conflict flagged above. Only the
-            # descriptions genuinely still up for grabs (not already
-            # confirmed elsewhere on this PO) are offered.
-            item["PdfDescriptions"] = [
-                d for d in item["PdfDescriptions"] if _norm_desc(d) not in resolved
-            ]
             result.append(item)
 
         return {"items": result}
@@ -1269,6 +1212,26 @@ def part_description_update_save(payload: PartDescriptionSaveModel, request: Req
         return {"result": result, "revalidated": moved}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Service First update failed: {exc}")
+
+
+class RevalidateAllModel(BaseModel):
+    user_id: Optional[int] = None
+
+
+@app.post("/api/part-description-update/revalidate-all")
+def part_description_revalidate_all(payload: RevalidateAllModel):
+    """Re-check EVERY current DATA MISMATCH/PENDING IN SF invoice against
+    Service First right now (Part Description Mapping's "Recheck All"
+    button) - the catch-up sweep for a description confirmed on Service
+    First's own side before the Update button auto-rechecked (see
+    part_description_update_save), or by any other means. Safe to run any
+    time; each invoice re-validates independently."""
+    import database
+    _require_not_viewer(payload.user_id)
+    try:
+        return database.revalidate_all_data_mismatch(payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
 class BuyerOrderModel(BaseModel):
@@ -1538,17 +1501,28 @@ def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, e
     start_entry_no = _to_int(entry_no, "entry_no")
 
     locked = database.is_batch_locked(name)
-    if locked:
+    all_batches = database.list_batches()
+    this_batch = next((b for b in all_batches if b.get("batch") == name), None)
+    pending = (this_batch or {}).get("counts", {}).get("READY TO LOAD", 0)
+
+    # A locked batch (something in it already Loaded/Posted/Completed/
+    # Rejected) still refuses a download once there's nothing LEFT to
+    # download - but if some invoices are still sitting at Ready to Load
+    # (a partial Load: some of the batch was taken on to NAV, some wasn't),
+    # the remaining ones must still be reachable. usp_FetchBatch already
+    # only ever fetches invoices NOT YET past Ready to Load, so this can
+    # never re-touch or re-mint a Document No./Entry No. for one that's
+    # already Loaded+ - only the still-pending ones are ever exported or
+    # renumbered here, regardless of the batch's own lock state.
+    if locked and not pending:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Batch '{name}' has an invoice already Loaded, Excluded, "
-                "Posted, Completed, or Rejected — it can no longer be "
-                "downloaded or have its Document No./Entry No. renumbered."
+                "Posted, Completed, or Rejected, and nothing left at Ready "
+                "to Load - there's nothing left to download."
             ),
         )
-
-    all_batches = database.list_batches()
 
     # An invoice still parked at Buyer Order No Doesn't Exist has nothing
     # usable for Navision yet - block the whole batch's download rather
