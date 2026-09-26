@@ -1,6 +1,6 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoicePdfUrl, getActiveAnnouncements, announcementImageUrl } from "./api";
+import { invoicePdfUrl, getActiveAnnouncements, announcementImageUrl, getActiveJob } from "./api";
 
 // PIIPS logo — a monogram "P" (source: logo/PIIPS-logo.svg) on an indigo-to-
 // magenta gradient badge; the P's counter doubles as a precision-target dot,
@@ -40,6 +40,21 @@ export function Logo({ size = 40 }) {
   );
 }
 
+// Plain stroke-based eye / eye-slash glyphs - a crisp, theme-colored SVG
+// renders identically everywhere, unlike an emoji (👁️/🙈), which varies
+// wildly in size/style across OS emoji sets and looked out of place next
+// to the rest of the UI's clean line icons.
+function _EyeIcon({ off }) {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z" />
+      <circle cx="12" cy="12" r="3" />
+      {off && <line x1="2" y1="2" x2="22" y2="22" />}
+    </svg>
+  );
+}
+
 // Password field with a show/hide toggle ("eye" button) - drop-in
 // replacement for a bare <input type="password">. `icon` is optional (a
 // leading glyph like Login.jsx's 🔒); omitted, it's just the input + toggle.
@@ -57,20 +72,106 @@ export function PasswordInput({
               aria-label={show ? "Hide password" : "Show password"}
               title={show ? "Hide password" : "Show password"}
               style={{ background: "none", border: "none", cursor: disabled ? "not-allowed" : "pointer",
-                       padding: 0, color: "var(--muted)", fontSize: 16, lineHeight: 1, flex: "0 0 auto" }}>
-        {show ? "🙈" : "👁️"}
+                       padding: 0, display: "flex", alignItems: "center", color: "var(--muted)",
+                       flex: "0 0 auto" }}>
+        <_EyeIcon off={show} />
       </button>
+    </div>
+  );
+}
+
+// Type-and-search <select> replacement: an input that filters `options`
+// (an array of strings) as you type, with a click/keyboard-navigable
+// dropdown below it. Stays a PICKER, not free text - blurring without
+// landing on an exact option reverts the text to `value`, so the parent
+// only ever sees one of `options` (or "") through onChange, same
+// contract a plain <select> has. Built for File Explorer's Template
+// dropdown (which can grow to many entries a native <select> makes
+// tedious to scan) but generic enough for any string-option picker.
+export function SearchableSelect({ value, onChange, options, placeholder = "Search…", disabled, emptyLabel }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState(value || "");
+  const [activeIdx, setActiveIdx] = useState(-1);
+  const blurTimer = useRef(null);
+
+  // Reflect an externally-changed `value` into the displayed text, but
+  // never fight the user while they're actively typing/filtering.
+  useEffect(() => { if (!open) setQuery(value || ""); }, [value, open]);
+  useEffect(() => () => clearTimeout(blurTimer.current), []);
+
+  const q = query.trim().toLowerCase();
+  const filtered = useMemo(
+    () => options.filter((o) => !q || o.toLowerCase().includes(q)),
+    [options, q]
+  );
+
+  const commit = (v) => { onChange(v); setQuery(v); setOpen(false); setActiveIdx(-1); };
+  const revert = () => { setQuery(value || ""); setOpen(false); setActiveIdx(-1); };
+
+  return (
+    <div style={{ position: "relative" }}>
+      <input
+        className="input"
+        value={query}
+        placeholder={placeholder}
+        disabled={disabled}
+        onFocus={() => { setQuery(value || ""); setOpen(true); setActiveIdx(-1); }}
+        onChange={(e) => { setQuery(e.target.value); setOpen(true); setActiveIdx(-1); }}
+        onBlur={() => {
+          // Delayed so a suggestion's onMouseDown (which fires first)
+          // still registers before this closes/reverts the field.
+          blurTimer.current = setTimeout(revert, 150);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") { revert(); e.currentTarget.blur(); }
+          else if (e.key === "ArrowDown") { e.preventDefault(); setOpen(true); setActiveIdx((i) => Math.min(i + 1, filtered.length - 1)); }
+          else if (e.key === "ArrowUp") { e.preventDefault(); setActiveIdx((i) => Math.max(i - 1, 0)); }
+          else if (e.key === "Enter") { e.preventDefault(); if (activeIdx >= 0 && filtered[activeIdx]) commit(filtered[activeIdx]); }
+        }} />
+      {open && filtered.length > 0 && (
+        <div style={{
+          position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50,
+          background: "var(--surface)", border: "1px solid var(--border)",
+          borderRadius: "var(--radius-sm)", marginTop: 2, maxHeight: 220,
+          overflowY: "auto", boxShadow: "0 8px 24px rgba(0,0,0,.12)",
+        }}>
+          {filtered.map((o, i) => (
+            <div key={o} onMouseDown={() => commit(o)}
+                 onMouseEnter={() => setActiveIdx(i)}
+                 className={`searchable-select-option${i === activeIdx ? " active" : ""}`}>
+              {o}
+            </div>
+          ))}
+        </div>
+      )}
+      {open && filtered.length === 0 && emptyLabel && (
+        <div style={{
+          position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50,
+          background: "var(--surface)", border: "1px solid var(--border)",
+          borderRadius: "var(--radius-sm)", marginTop: 2, boxShadow: "0 8px 24px rgba(0,0,0,.12)",
+        }}>
+          <div className="searchable-select-option" style={{ color: "var(--muted)", cursor: "default" }}>
+            {emptyLabel}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 // Generic table: search box, click-to-sort headers, 10-row pagination.
 // columns: [{ key, label, render?(row), sortable? }]
+// defaultSortKey/defaultSortDir: sort applied up front (shown pre-sorted,
+// with the header's arrow already lit) instead of leaving it unsorted
+// until the user clicks a header - use when the rows' own incoming order
+// isn't a reliable enough guarantee on its own for the caller's intent.
 export function DataTable({ columns, rows, searchKeys, pageSize = 10,
-                            pageSizeOptions, empty, actions }) {
+                            pageSizeOptions, empty, actions,
+                            defaultSortKey = null, defaultSortDir = "asc",
+                            rowStyle, groupBy, renderGroupHeader, hideSearch }) {
   const [query, setQuery] = useState("");
-  const [sortKey, setSortKey] = useState(null);
-  const [sortDir, setSortDir] = useState("asc");
+  const [sortKey, setSortKey] = useState(defaultSortKey);
+  const [sortDir, setSortDir] = useState(defaultSortDir);
   const [page, setPage] = useState(0);
   // When pageSizeOptions is given, the user can change rows-per-page (incl.
   // "All"); otherwise the fixed `pageSize` prop is used.
@@ -109,12 +210,23 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
     else { setSortKey(key); setSortDir("asc"); }
   };
 
-  useEffect(() => { setPage(0); }, [query, rows, size]);
+  // Reset to page 1 on a new search or page-size change - NOT on every
+  // `rows` prop change. A caller typically rebuilds that array fresh on
+  // every render (e.g. Dashboard's batchRows = batches.map(...)), so an
+  // unrelated re-render elsewhere on the page (typing into a Doc No./
+  // Entry No. input, say) was giving `rows` a new reference each
+  // keystroke and silently bouncing the table back to page 1 even though
+  // nothing about its own data changed. If the row count genuinely
+  // shrinks out from under the current page, `cur` below already clamps
+  // to the last valid page instead of crashing - no separate reset needed.
+  useEffect(() => { setPage(0); }, [query, size]);
 
-  const searchRow = (
+  const searchRow = (hideSearch && !actions) ? null : (
     <div style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
-      <input className="input" placeholder="Search…" value={query}
-             onChange={(e) => setQuery(e.target.value)} style={{ maxWidth: 260 }} />
+      {!hideSearch && (
+        <input className="input" placeholder="Search…" value={query}
+               onChange={(e) => setQuery(e.target.value)} style={{ maxWidth: 260 }} />
+      )}
       {actions}
     </div>
   );
@@ -122,7 +234,7 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
   if (!rows.length) {
     return (
       <div>
-        {actions && searchRow}
+        {!hideSearch && actions && searchRow}
         <div className="empty">{empty || "No rows."}</div>
       </div>
     );
@@ -145,13 +257,31 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
             </tr>
           </thead>
           <tbody>
-            {view.map((row, i) => (
-              <tr key={row._key ?? i}>
-                {columns.map((c) => (
-                  <td key={c.key}>{c.render ? c.render(row) : (row[c.key] ?? "—")}</td>
-                ))}
-              </tr>
-            ))}
+            {view.map((row, i) => {
+              // A visible banner row whenever the group key changes from the
+              // row before it - only meaningful when same-group rows are
+              // actually adjacent (the caller sorts by that same key, e.g.
+              // defaultSortKey matching groupBy - see PartDescriptionUpdate),
+              // otherwise this still degrades gracefully into one banner per
+              // occurrence rather than crashing or hiding rows.
+              const groupKey = groupBy ? groupBy(row) : null;
+              const prevGroupKey = groupBy && i > 0 ? groupBy(view[i - 1]) : undefined;
+              const showGroupHeader = groupBy && groupKey !== prevGroupKey;
+              return (
+                <Fragment key={row._key ?? i}>
+                  {showGroupHeader && renderGroupHeader && (
+                    <tr className="tbl-group-header">
+                      <td colSpan={columns.length}>{renderGroupHeader(groupKey, row)}</td>
+                    </tr>
+                  )}
+                  <tr style={rowStyle ? rowStyle(row) : undefined}>
+                    {columns.map((c) => (
+                      <td key={c.key}>{c.render ? c.render(row) : (row[c.key] ?? "—")}</td>
+                    ))}
+                  </tr>
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -183,6 +313,121 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
   );
 }
 
+// A progress bar split into one piece per step: every file is a piece, and
+// (process runs) a final extra piece is the Service First sync + save - so a
+// 100-file run shows 101 pieces and only fills the last one when the run is
+// really complete. `done` pieces are filled left to right; with files being
+// extracted in parallel the fill advances as each one finishes. The last
+// piece pulses while its step is running.
+// ONE bar for the whole run, split into pieces: a first piece for "Sorting &
+// preparing files" (scanning, sorting original/scanned/photo, loading invoices
+// and templates, starting workers), one piece per file, and a last piece for
+// the Service First sync / save. Every piece is a small 0-100% bar of its own
+// and they all look the same; the first and last just get a wider slot on a
+// long run so their progress is visible next to hundreds of 1-2 px file pieces.
+const EDGE_SHARE = 0.05;                       // each end piece's share of a long bar
+export const isPreparing = (job) => (job?.stage || "").startsWith("Preparing");
+
+export function runPercent(job) {
+  const segs = job?.segments || [];
+  if (segs.length < 3) return job?.percent ?? 0;
+  const mid = segs.slice(1, -1);
+  const w = segs.length > 22 ? EDGE_SHARE : 1 / segs.length;
+  const avg = mid.reduce((s, v) => s + v, 0) / mid.length;
+  const pct = Math.round(w * segs[0] + (1 - 2 * w) * avg + w * segs[segs.length - 1]);
+  return job?.status === "completed" ? 100 : Math.min(pct, 99);
+}
+
+export function RunBar({ job }) {
+  const segs = job?.segments || [];
+  const n = segs.length;
+  return (
+    <div className="run-bars">
+      {n >= 3
+        ? <SegmentedProgress total={n} done={job.processed} segments={segs}
+                             kinds={job.segment_kinds} syncStep />
+        : <SegmentedProgress total={1} done={0} segments={[segs[0] ?? 0]} syncStep={false} />}
+    </div>
+  );
+}
+
+// One small bar per piece: 0..100% each. Files extracted in parallel fill side
+// by side; the whole bar fills left to right. Pieces all look identical.
+export function SegmentedProgress({ total, done, segments, kinds, syncStep = false, failed = false }) {
+  const n = Math.max(0, total || 0);
+  if (!n) return <div className="progress"><div className="progress-bar" style={{ width: "0%" }} /></div>;
+  const pct = (i) => (segments && segments.length === n ? segments[i] : 0);
+  const cells = [];
+  for (let i = 0; i < n; i++) {
+    const p = Math.max(0, Math.min(100, pct(i)));
+    const kindName = kinds && kinds.length === n ? ["original PDF", "scanned", "photographed"][kinds[i]] : "";
+    const what = !syncStep ? "Sorting & preparing files"
+      : i === 0 ? "Sorting & preparing files"
+      : i === n - 1 ? "Service First sync & save"
+      : `File ${i} of ${n - 2}${kindName ? ` (${kindName})` : ""}`;
+    cells.push(
+      <span key={i} className="seg" title={`${what} — ${p}%`}>
+        <span className={`seg-fill${failed ? " seg-failed" : ""}`} style={{ width: `${p}%` }} />
+      </span>
+    );
+  }
+  const edge = syncStep && n > 22 ? `${EDGE_SHARE * 100}% ` : "";
+  const cols = edge
+    ? `${edge}repeat(${n - 2}, minmax(0, 1fr)) ${edge.trim()}`
+    : `repeat(${n}, minmax(0, 1fr))`;
+  const gap = n > 250 ? 0 : n > 110 ? 1 : 2;
+  return (
+    <div className={`seg-progress${n > 250 ? " seg-dense" : ""}`}
+         style={{ gridTemplateColumns: cols, gap }}
+         role="progressbar" aria-valuemin={0} aria-valuemax={100}>
+      {cells}
+    </div>
+  );
+}
+
+
+// Slim, app-wide progress strip for the invoice-processing run that is
+// currently going - whoever started it. Only one process run can exist at a
+// time, so every signed-in user (on any screen) sees the same live bar, who
+// started it, and knows Start is unavailable until it finishes. Hidden when
+// nothing is running (and on the Dashboard, which shows the full card).
+export function JobBanner({ hidden = false }) {
+  const [job, setJob] = useState(null);
+  useEffect(() => {
+    let stop = false;
+    let timer = null;
+    const tick = async () => {
+      let next = null;
+      try {
+        const j = await getActiveJob("process", true);
+        if (j && (j.status === "running" || j.status === "pending")) next = j;
+      } catch { /* server briefly unreachable - keep the last view */ next = undefined; }
+      if (stop) return;
+      if (next !== undefined) setJob(next);
+      timer = setTimeout(tick, next ? 1000 : 3000);
+    };
+    tick();
+    return () => { stop = true; clearTimeout(timer); };
+  }, []);
+  if (!job || hidden) return null;
+  const files = job.file_total ?? job.total;
+  const phase = job.stage ? job.stage.toLowerCase() : "working";
+  return (
+    <div className="job-banner">
+      <div className="progress-meta" style={{ marginBottom: 6 }}>
+        <span>
+          <strong>Invoice processing in progress</strong>
+          {job.started_by_name ? ` — started by ${job.started_by_name}` : ""}
+          {" · "}{phase}
+        </span>
+        <span>{files && !isPreparing(job) ? `${Math.min(job.processed, files)}/${files} files · ` : ""}{runPercent(job)}%</span>
+      </div>
+      <RunBar job={job} />
+    </div>
+  );
+}
+
+
 export function Modal({ title, onClose, children, width = 1000 }) {
   return (
     <div onClick={onClose}
@@ -203,11 +448,22 @@ export function Modal({ title, onClose, children, width = 1000 }) {
 }
 
 // PDF/image viewer pop-up (opened by clicking an invoice number).
-export function PdfModal({ file, onClose }) {
+export function PdfModal({ file, page, pageEnd, onClose }) {
+  // A vendor can print more than one invoice in a single PDF (e.g. 2
+  // invoices, 1 per page, all sharing one uploaded file), or one invoice
+  // can itself span several pages - every row for the SAME file_name
+  // otherwise looks identical, so without a page (range) the viewer would
+  // always open at page 1 (and a save/download from it would include
+  // every page, or miss the invoice's own later pages) regardless of
+  // which invoice's row was actually clicked. Passing `page`/`pageEnd`
+  // through to invoicePdfUrl has the backend extract and serve just that
+  // page range instead of the whole file (see app.py's invoice_pdf) - so
+  // both viewing and downloading are already scoped to the right
+  // invoice, no client-side page-jump needed.
   return (
     <Modal title={file} onClose={onClose} width={1100}>
       <div style={{ height: "75vh" }}>
-        <iframe title={file} src={invoicePdfUrl(file)}
+        <iframe title={file} src={invoicePdfUrl(file, page, pageEnd)}
                 style={{ width: "100%", height: "100%", border: "none", borderRadius: 8 }} />
       </div>
     </Modal>
@@ -324,12 +580,21 @@ export function AnnouncementBell() {
       <button onClick={openPopup} title="Announcements"
               style={{ position: "relative", background: "none", border: "none", cursor: "pointer",
                        fontSize: 19, lineHeight: 1, padding: 6, color: "var(--text)" }}>
-        🔔
+        <span style={{
+          display: "inline-block", transformOrigin: "50% 0%",
+          animation: unread.length > 0 ? "piips-bell-ring 2.4s ease-in-out infinite" : "none",
+        }}>
+          🔔
+        </span>
         {unread.length > 0 && (
           <span style={{
-            position: "absolute", top: 2, right: 2, width: 9, height: 9, borderRadius: "50%",
-            background: "var(--danger)", border: "2px solid var(--surface)",
-          }} />
+            position: "absolute", top: 0, right: 0, minWidth: 15, height: 15, padding: "0 3px",
+            borderRadius: 8, background: "var(--danger)", border: "2px solid var(--surface)",
+            color: "#fff", fontSize: 10, fontWeight: 700, lineHeight: "11px", textAlign: "center",
+            animation: "piips-badge-pulse 1.6s ease-in-out infinite",
+          }}>
+            {unread.length > 9 ? "9+" : unread.length}
+          </span>
         )}
       </button>
 

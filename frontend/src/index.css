@@ -6,6 +6,22 @@
   from { opacity: 0; transform: scale(.94) translateY(6px); }
   to { opacity: 1; transform: scale(1) translateY(0); }
 }
+/* Announcement bell: rings briefly at the start of each cycle, then holds
+   still for the rest of it, so it reads as an occasional ring rather than
+   a constant, distracting wobble. */
+@keyframes piips-bell-ring {
+  0%, 100% { transform: rotate(0deg); }
+  1% { transform: rotate(14deg); }
+  2% { transform: rotate(-12deg); }
+  3% { transform: rotate(10deg); }
+  4% { transform: rotate(-8deg); }
+  5% { transform: rotate(4deg); }
+  6% { transform: rotate(0deg); }
+}
+@keyframes piips-badge-pulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(220,38,38,.55); }
+  50% { transform: scale(1.18); box-shadow: 0 0 0 4px rgba(220,38,38,0); }
+}
 
 :root {
   --bg: #eef1f6;
@@ -226,6 +242,11 @@ textarea { height: auto; min-height: 80px; padding: 10px 12px; }
 
 input:disabled, select:disabled { background: var(--surface-2); color: var(--muted); cursor: not-allowed; }
 
+/* type-and-search dropdown (SearchableSelect) - a <select> replacement
+   for a long/growing option list, e.g. File Explorer's Template picker */
+.searchable-select-option { padding: 7px 12px; cursor: pointer; font-size: 14px; }
+.searchable-select-option:hover, .searchable-select-option.active { background: var(--surface-2); }
+
 /* generic input with a leading icon */
 .input-group {
   display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 40px;
@@ -265,7 +286,27 @@ table.tbl th {
 table.tbl td { padding: 11px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
 table.tbl tbody tr:last-child td { border-bottom: none; }
 table.tbl tbody tr:hover { background: var(--surface-2); }
+table.tbl tbody tr.tbl-group-header td {
+  background: var(--surface-2); font-weight: 600; padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+table.tbl tbody tr.tbl-group-header:first-child td { border-top: none; }
 .empty { color: var(--muted); padding: 16px 2px; }
+
+/* ---- tracking-history timeline (Invoice Search) ---- */
+.timeline { position: relative; padding-left: 6px; }
+.timeline-item { position: relative; padding: 0 0 20px 26px; border-left: 2px solid var(--border); margin-left: 5px; }
+.timeline-item:last-child { border-left-color: transparent; padding-bottom: 0; }
+.timeline-dot {
+  position: absolute; left: -7px; top: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: var(--primary); border: 2px solid var(--surface);
+}
+.timeline-content { padding-top: 0; }
+.timeline-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.timeline-action { font-weight: 600; font-size: 13.5px; }
+.timeline-time { color: var(--muted); font-size: 12px; }
+.timeline-who { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.timeline-detail { font-size: 13px; margin-top: 4px; }
 
 /* ---- badges ---- */
 .badge {
@@ -288,6 +329,19 @@ table.tbl tbody tr:hover { background: var(--surface-2); }
 .progress { height: 16px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
 .progress-bar { height: 100%; background: var(--primary); transition: width .4s ease; border-radius: 999px; }
 .progress-bar.failed { background: var(--danger); }
+.job-banner { background: var(--card, #fff); border: 1px solid var(--border, #e2e8f0);
+  border-radius: var(--radius-sm, 8px); padding: 10px 14px; margin-bottom: 16px; }
+
+/* one small bar per file (+ one for the final sync step), all identical */
+.run-bar-caption { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.seg-progress { display: grid; gap: 2px; height: 16px; width: 100%; }
+/* hundreds of pieces: no gaps or rounding - a thin light divider instead */
+.seg-dense .seg { border-radius: 0; box-shadow: inset -1px 0 0 rgba(255, 255, 255, .55); }
+.seg { position: relative; overflow: hidden; background: #e2e8f0; border-radius: 2px; min-width: 0; }
+.seg-fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--primary);
+  transition: width .35s ease; }
+.seg-fill.seg-failed { background: var(--danger); }
+
 .progress-meta { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
 
 /* ---- dropzone ---- */

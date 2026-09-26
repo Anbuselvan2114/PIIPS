@@ -6,23 +6,49 @@ engine, maps the result into the downstream invoice schema and writes
 one <pdf>.json per file. Progress is tracked in memory so the frontend
 can poll it and drive a live progress bar.
 
-Processing runs on a worker thread (PaddleOCR is CPU bound and not
-thread-safe, so only one job runs at a time).
+Processing runs on a worker thread (only one job per mode at a time). The
+per-file extraction itself is fanned out to a small pool of worker
+PROCESSES (PaddleOCR is CPU bound and not thread-safe, so the parallelism is
+per process - see extract_worker.py); everything after extraction (format
+match, duplicate check, Service First sync, DB save) stays sequential and in
+file order so results are deterministic.
+
+Progress is measured in steps: one per file, plus - in process mode - one
+final step for the Service First sync / DB save. A 100-file run therefore
+reports 101 steps and only reads 100% once that last step is done.
 """
 
 import json
+import multiprocessing
 import os
+import re
 import shutil
 import threading
 import traceback
 import uuid
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime
 
+import extract_worker
 from ocr_engine import OCREngine
 from invoice_schema import build_invoice_json, resolve_payment_terms, add_days_to_date
 from format_model import FormatModel
 import template_store
 import service_api
+
+# On a scanned/OCR'd page, a missing PDF-sourced field is normally left as
+# DATA MISMATCH (see _save_batch_to_db) - far more likely this one
+# document's own numbers being misread than the template itself needing
+# work. These particular fields are the exception: each one comes off a
+# whole table column or address block (not a single OCR'd character), so a
+# blank here means that column/block wasn't picked up from the page at
+# all - a template gap training can fix, not scattered OCR noise. Routed
+# to NEW TEMPLATE instead in that case, same as a born-digital page.
+SCANNED_CRITICAL_PDF_FIELDS = {
+    "Buy-from Address", "Pay-to Address", "GST Order Address State", "State",
+    "Quantity", "Direct Unit Cost", "Line Amount", "GST Base Amount",
+}
 
 
 class ProcessingJob:
@@ -49,13 +75,24 @@ class ProcessingJob:
         self.export_file = ""            # generated Excel (process mode)
         self.db_saved = {}               # {table: rows_inserted} (process mode)
         self.batch_name = ""             # batch saved to the DB (process mode)
-        self._doc_seq = 0                # running Document No. sequence
         # Purchase-tracker attribution: who clicked Start, and when.
         self.started_by = started_by
+        self.started_by_name = ""        # shown to every other user watching this run
         self.started_at = datetime.now()
 
         self.status = "pending"          # pending | running | completed | failed
-        self.total = 0
+        # Steps (each drawn as one piece of the progress bar): in process mode
+        # a leading "preparing" piece, one per file, and a final Service First
+        # sync / save piece; in train mode just one per file. Process mode
+        # starts at 1 so the bar exists the instant Start is clicked.
+        self.total = 1 if mode == "process" else 0
+        self.prep_progress = 0           # 0..100 of the leading "preparing" piece
+        self.scanned = False             # Input folder scanned -> file pieces known
+        self.file_kind = {}              # path -> 0 original / 1 scanned / 2 photo
+        self.file_total = 0              # files only
+        self.file_order = []             # source paths, in the order the pieces are drawn
+        self.file_progress = {}          # path -> 0..100 (that file's own bar)
+        self.sync_progress = 0           # 0..100 of the final Service First sync / save piece
         self.processed = 0
         self.current_file = ""
         self.stage = ""                  # Extracting | Syncing | Processing (per file)
@@ -67,28 +104,108 @@ class ProcessingJob:
 
     # -- progress snapshots ------------------------------------------------
 
+    def _segments(self):
+        """Per-piece progress, 0..100 each: one per file in order, then (process
+        mode) the final sync piece. Caller holds the lock."""
+        if self.file_order:
+            segs = [self.file_progress.get(p, 0) for p in self.file_order]
+        else:
+            # Files are known (Input folder scanned) but still being sorted
+            # into original / scanned / photo: draw the full set of pieces
+            # already, all empty, so the bar is split from the very start.
+            segs = [0] * self.file_total
+        if self.mode == "process":
+            segs.insert(0, self.prep_progress)
+            if self.file_total or self.scanned:
+                segs.append(self.sync_progress)
+        return segs
+
     def _percent(self):
         if self.total <= 0:
             return 0
+        segs = self._segments()
+        if segs and len(segs) == self.total:
+            # Overall progress is the average of every piece's own bar, so it
+            # moves smoothly while several files extract at once - and stays
+            # under 100 until the run is really finished.
+            pct = round(sum(segs) / len(segs))
+            return 100 if self.status == "completed" else min(pct, 99)
         return round(self.processed / self.total * 100)
 
-    def status_dict(self):
+    def set_file_progress(self, path, pct):
+        """Record one file's own progress (never backwards, 99 max until its
+        extraction has actually finished). Sample: job.set_file_progress(p, 40)"""
+        with self._lock:
+            if path in self.file_progress and self.file_progress[path] < 100:
+                self.file_progress[path] = max(self.file_progress[path], min(int(pct), 99))
+
+    def finish_file(self, path):
+        with self._lock:
+            if path in self.file_progress:
+                self.file_progress[path] = 100
+
+    def segment_kinds(self):
+        """Kind of every piece, aligned with _segments(): -1 preparing,
+        0 original PDF, 1 scanned, 2 photographed, -2 final sync. Caller
+        holds the lock."""
+        kinds = ([self.file_kind.get(p, 0) for p in self.file_order]
+                 if self.file_order else [0] * self.file_total)
+        if self.mode == "process":
+            kinds.insert(0, -1)
+            if self.file_total or self.scanned:
+                kinds.append(-2)
+        return kinds
+
+    def set_prep(self, pct, stage=None):
+        """Advance the leading "preparing" piece (and say what is happening).
+        Sample: job.set_prep(40, "Preparing (loading processed invoices)")"""
+        with self._lock:
+            self.prep_progress = max(self.prep_progress, min(int(pct), 100))
+            if stage:
+                self.stage = stage
+                self.current_file = ""
+
+    def set_sync_progress(self, pct):
+        with self._lock:
+            self.sync_progress = max(self.sync_progress, min(int(pct), 100))
+
+    def status_dict(self, brief=False):
         """Lightweight snapshot for polling (no extracted JSON payload).
-        Sample: job.status_dict()"""
+        `brief=True` also leaves out the per-file result list and errors - a
+        run of hundreds of files makes those large, and every signed-in
+        user's screen polls this once a second while a run is going.
+        Sample: job.status_dict(brief=True)"""
 
         with self._lock:
-            return {
+            snapshot = {
                 "job_id": self.job_id,
                 "mode": self.mode,
                 "status": self.status,
                 "total": self.total,
+                "file_total": self.file_total,
+                "started_by": self.started_by,
+                "started_by_name": self.started_by_name,
+                "started_at": self.started_at.isoformat(timespec="seconds"),
                 "processed": self.processed,
                 "percent": self._percent(),
+                # one 0..100 value per piece of the segmented bar
+                "segments": self._segments(),
+                # what each piece is: -1 preparing, 0 original, 1 scanned,
+                # 2 photo, -2 final sync (tooltips)
+                "segment_kinds": self.segment_kinds(),
+                # how many files are being extracted at this very moment
+                "active_files": sum(
+                    1 for v in self.file_progress.values() if 0 < v < 100
+                ),
                 "current_file": self.current_file,
                 "stage": self.stage,
                 "error": self.error,
                 "export_file": self.export_file,
                 "batch_name": self.batch_name,
+            }
+            if brief:
+                return snapshot
+            snapshot.update({
                 "results": [
                     {
                         "file": r["file"],
@@ -105,7 +222,8 @@ class ProcessingJob:
                     for r in self.results
                 ],
                 "errors": list(self.errors),
-            }
+            })
+            return snapshot
 
     def result_dict(self):
         """Full snapshot including each file's extracted JSON.
@@ -169,9 +287,21 @@ class JobManager:
             current = self._jobs.get(self._active.get(mode))
 
             if current and current.status in ("pending", "running"):
-                return None, f"A {mode} job is already running. Please wait for it to finish."
+                who = f" (started by {current.started_by_name})" if current.started_by_name else ""
+                return None, (
+                    f"A {mode} job is already running{who}. "
+                    "Please wait for it to finish - its progress is shown on every screen."
+                )
 
             job_id = uuid.uuid4().hex[:12]
+            starter = ""
+            if started_by:
+                try:
+                    import database
+                    info = database.get_username_and_role(started_by)
+                    starter = (info or {}).get("username") or ""
+                except Exception:  # noqa: BLE001 - the name is cosmetic
+                    starter = ""
             job = ProcessingJob(
                 job_id,
                 source_folder,
@@ -183,6 +313,7 @@ class JobManager:
                 started_by=started_by,
             )
 
+            job.started_by_name = starter
             self._jobs[job_id] = job
             self._active[mode] = job_id
 
@@ -209,6 +340,7 @@ class JobManager:
             # Process mode scans Input recursively (PDFs live in
             # <Input>/<entity>/<template>/ subfolders); train mode scans the
             # flat New_Format folder.
+            job.set_prep(3, "Preparing (scanning the Input folder)")
             source_files = []
             if job.mode == "process":
                 for root, _dirs, files in os.walk(job.source_folder):
@@ -221,8 +353,25 @@ class JobManager:
                         source_files.append(os.path.join(job.source_folder, f))
             source_files.sort()
 
+            kinds = {p: 0 for p in source_files}
             with job._lock:
-                job.total = len(source_files)
+                job.file_total = len(source_files)
+                # Process mode has two extra steps: the leading "preparing"
+                # piece and the final Service First sync + database save.
+                job.total = len(source_files) + (2 if job.mode == "process" else 0)
+            if job.mode == "process":
+                job.set_prep(15, "Preparing (found %d files)" % len(source_files))
+                # Draw the pieces original PDFs first, then scanned, then
+                # photographed ones - and, inside each group, smallest file
+                # first (processing order itself is unchanged).
+                kinds = self._classify_files(job, source_files)
+            with job._lock:
+                job.file_order = sorted(
+                    source_files, key=lambda p: (kinds[p], self._file_size(p), p)
+                )
+                job.file_progress = {p: 0 for p in source_files}
+                job.file_kind = kinds
+                job.scanned = True
 
             os.makedirs(job.output_folder, exist_ok=True)
             if job.unknown_folder:
@@ -231,8 +380,30 @@ class JobManager:
             # Process mode: assign this run's batch name and load the set of
             # invoices already saved in earlier batches (for de-duplication).
             invoice_map = {}
+            # One Start run scans every template's Input subfolder at once,
+            # so it can easily contain files for several different
+            # Templates - each gets its OWN batch (via _batch_name_for
+            # below, keyed on that file's own template key) instead of all
+            # being lumped into one shared batch just because they were
+            # processed in the same click.
+            batch_names_by_tkey = {}
+
+            def _batch_name_for(tkey):
+                """This run's batch name for template key `tkey` (""/None
+                for a file with no resolvable template) - same key always
+                reuses the same batch name within this run; a first-seen
+                key mints a new one from the run's base timestamp name."""
+                if tkey not in batch_names_by_tkey:
+                    if tkey:
+                        suffix = re.sub(r"[^A-Za-z0-9]+", "_", tkey).strip("_")
+                        batch_names_by_tkey[tkey] = f"{job.batch_name}_{suffix}"
+                    else:
+                        batch_names_by_tkey[tkey] = job.batch_name
+                return batch_names_by_tkey[tkey]
+
             if job.mode == "process":
                 job.batch_name = "PIIPS_Batch_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+                job.set_prep(20, "Preparing (loading already-processed invoices)")
                 try:
                     import config_store
                     if (config_store.load_config().get("db_connection") or "").strip():
@@ -240,9 +411,46 @@ class JobManager:
                         invoice_map = database.get_processed_invoices()
                 except Exception:  # noqa: BLE001
                     traceback.print_exc()
+                job.set_prep(55, "Preparing (loading trained templates)")
 
-            ocr = OCREngine()
             fmt_model = FormatModel()
+            if job.mode == "process":
+                job.set_prep(70, "Preparing (starting extraction workers)")
+
+            # Super Admin toggles (config_store's "allow_scanned_pdfs_part"/
+            # "_service") for whether a scanned/photocopied invoice of that
+            # type gets OCR-extracted instead of rejected outright - see
+            # ocr_engine.read_pdf's own docstring for the full rationale.
+            # Loaded once per run, not per file.
+            try:
+                import config_store
+                _scan_cfg = config_store.load_config()
+                allow_scanned_part = bool(_scan_cfg.get("allow_scanned_pdfs_part"))
+                allow_scanned_service = bool(_scan_cfg.get("allow_scanned_pdfs_service"))
+            except Exception:  # noqa: BLE001 - default to the safe/off behaviour
+                allow_scanned_part = False
+                allow_scanned_service = False
+
+            def _allow_scanned_for(src_path):
+                """Whether a scanned/photocopied file at `src_path` may be
+                OCR-extracted, per the Super Admin toggle for its type."""
+                if job.mode == "train":
+                    # New_Format is a flat folder - no <entity>/<invoice_type>
+                    # structure to resolve the type from - so a scanned file
+                    # is OCR'd as long as EITHER type's toggle is on, so it
+                    # can still be learned as a trained format instead of
+                    # being stuck as permanently unsupported.
+                    return allow_scanned_part or allow_scanned_service
+                invoice_type_here = template_store.invoice_type_for_path(
+                    job.source_folder, src_path
+                )
+                if invoice_type_here == "SERVICE":
+                    return allow_scanned_service
+                if invoice_type_here == "PART":
+                    return allow_scanned_part
+                # Type unresolvable from this path - conservative default,
+                # matching the original off-by-default behaviour.
+                return False
 
             def _finish_group(ctx, verdict):
                 """Complete one invoice given its verdict (computed
@@ -279,10 +487,14 @@ class JobManager:
                 for it in data.get("items", []):
                     line_no = it.get("Line_No", "")
                     it["Document Type"] = ctx["doc_type"]
-                    it["Document No."] = ctx["doc_no"]
+                    # [Document No.] / [Source ID] are deliberately blank
+                    # until the Excel is downloaded (see fetch_batch,
+                    # which mints and saves the real one) - never a real
+                    # value here.
+                    it["Document No."] = ""
                     it["Source Type"] = "39"
                     it["Source Subtype"] = ctx["doc_type"]
-                    it["Source ID"] = ctx["doc_no"]
+                    it["Source ID"] = ""
                     it["Source Ref. No."] = line_no
 
                 # Write the JSON into Output mirroring the Input template
@@ -309,6 +521,15 @@ class JobManager:
                 # invoices' freight/charge lines without a separate lookup.
                 data["_invoice_type"] = ctx["invoice_type"]
 
+                # This file's own batch: same template key -> same batch
+                # (reused across every file for that template in this run),
+                # different key -> a distinct batch, so files uploaded under
+                # different Templates never share a batch just because they
+                # happened to be processed by the same Start click. Files
+                # with no resolvable template (tkey blank) fall back to the
+                # run's shared base batch - there's no template to split by.
+                rec_batch_name = _batch_name_for(ctx["tkey"] or "")
+
                 rec = {
                     "file": ctx["filename"],
                     # Path relative to the Input root, matching the upload
@@ -319,7 +540,7 @@ class JobManager:
                     "output": out_path,
                     "format": ctx["fmt_name"],
                     "format_status": "matched" if ctx["fmt_name"] else "unmatched",
-                    "batch": job.batch_name,
+                    "batch": rec_batch_name,
                     "data": data,
                     # Service First verdict -> per-invoice tracker status /
                     # IsActive / IsSynced, applied in _save_to_db.
@@ -339,17 +560,22 @@ class JobManager:
             # batched fetch_sf_batch()/apply_sf_batch() call after this loop.
             pending = []
 
-            for src_path in source_files:
+            for src_path, extracted in self._extract_stream(
+                job, source_files, _allow_scanned_for
+            ):
 
                 filename = os.path.basename(src_path)
 
                 with job._lock:
-                    job.current_file = filename
                     job.stage = "Extracting"
 
                 try:
 
-                    ocr_result = ocr.read_pdf(src_path)
+                    # `extracted` is the file's OCR result, or the exception
+                    # its extraction raised (in a worker process or here).
+                    if isinstance(extracted, BaseException):
+                        raise extracted
+                    ocr_result = extracted
 
                     if job.mode == "train":
 
@@ -398,6 +624,16 @@ class JobManager:
                             data["Template_Name"] = fmt_name
                             data["Template"] = fmt_name
 
+                            # Whole-document flag from ocr_engine.read_pdf -
+                            # used below (Final data-completeness gate) so a
+                            # missing PDF-sourced field routes to NEW
+                            # TEMPLATE only for a born-digital page; on a
+                            # scanned/OCR'd one it's far more likely this
+                            # one document's own numbers were misread than
+                            # that the (already-matched) template itself
+                            # needs work.
+                            data["_is_scanned"] = bool(ocr_result.get("IsScanned"))
+
                             # GST Vendor Type is derived, not extracted:
                             # a seller with a readable GSTIN is GST
                             # Registered, otherwise Unregistered.
@@ -417,31 +653,38 @@ class JobManager:
                                 job.source_folder, src_path
                             )
 
-                            # ---- BC relationship keys (Header/Line/Reservation) ----
-                            job._doc_seq += 1
-                            po_fmt = static.get("PO_Number_Format", "") or ""
+                            # SERVICE never has a genuine Buyer's Order No.
+                            # at all (see the SERVICE branch further down -
+                            # no SF/PO-driven verdict logic runs for it) -
+                            # build_invoice_json still reads whatever text
+                            # happened to match the "Buyer's Order No."
+                            # label/SPRPUR pattern regardless of invoice
+                            # type (it has no type awareness of its own),
+                            # so a PART-style label appearing incidentally
+                            # on a SERVICE vendor's template (or a stray
+                            # OCR misread) can leave a bogus value behind -
+                            # always force it blank here instead.
+                            if invoice_type == "SERVICE":
+                                data["buyer_order_no"] = ""
+                                data["buyer_order_doubtful"] = False
+
+                            # ---- BC relationship key (Header/Line/Reservation) ----
+                            # PO_Number_Format is resolved live from the
+                            # template at download time now (see
+                            # database._po_number_format_for_header), not
+                            # stored here - Document No./No./Source ID stay
+                            # blank until then too (see save_grouped).
                             doc_type = (
                                 static.get("Purchase Header", {}).get("Document Type")
                                 or static.get("Purchase Line", {}).get("Document Type")
                                 or "Order"
                             )
-                            doc_no = (
-                                f"{po_fmt}{job._doc_seq:06d}" if po_fmt
-                                else (data.get("invoice_no") or f"DOC{job._doc_seq:06d}")
-                            )
                             data["Document Type"] = doc_type
-                            data["Document No."] = doc_no
-                            # Kept separately (not just parsed back out of
-                            # Document No.) so a Dashboard renumber later
-                            # can rebuild "prefix + new sequence" even for
-                            # a header whose invoice_no fallback doesn't
-                            # look like "PREFIX000123" at all.
-                            data["PO_Number_Format"] = po_fmt
 
                             ctx = {
                                 "data": data, "filename": filename, "rel": rel,
                                 "fmt_name": fmt_name, "doc_type": doc_type,
-                                "doc_no": doc_no, "invoice_type": invoice_type,
+                                "invoice_type": invoice_type,
                                 "group_idx": group_idx, "multi": multi,
                                 "src_path": src_path, "inv_no": inv_no,
                                 "static": static, "tkey": tkey,
@@ -459,25 +702,27 @@ class JobManager:
                             # PDF into the DUPLICATE folder the same way it
                             # does for every other status.
                             #
-                            # Exception: if that existing record is
-                            # currently Excluded, a re-upload is treated as
-                            # a deliberate correction, not a duplicate - its
-                            # Header/Tracker rows are updated in place (same
-                            # Id, not a new-looking record) and its Line/
-                            # Reservation rows are replaced with this run's
-                            # fresh data, once this group's own save
-                            # completes below (see _save_to_db's post-save
-                            # reconciliation pass, database.
-                            # reprocess_excluded_header) - so this run falls
-                            # through to normal processing here instead of
-                            # being parked as DUPLICATE.
+                            # Exception: if that existing record is currently
+                            # Excluded, Pending In SF, New Template, or
+                            # Unsupported (database._REPROCESSABLE_STATUSES) -
+                            # it never reached a real final outcome - a
+                            # deliberate re-upload is treated as a retry, not
+                            # a duplicate - its Header/Tracker rows are
+                            # updated in place (same Id, not a new-looking
+                            # record) and its Line/Reservation rows are
+                            # replaced with this run's fresh data, once this
+                            # group's own save completes below (see
+                            # _save_to_db's post-save reconciliation pass,
+                            # database.reprocess_reworkable_header) - so this
+                            # run falls through to normal processing here
+                            # instead of being parked as DUPLICATE.
                             match_key = (
                                 inv_no,
                                 str(data.get("buyer_order_no") or "").strip().lower(),
                             )
                             if match_key in invoice_map:
                                 existing = invoice_map[match_key]
-                                if existing.get("excluded") and existing.get("header_id"):
+                                if existing.get("reprocessable") and existing.get("header_id"):
                                     ctx["_reprocess_into_header_id"] = existing["header_id"]
                                     del invoice_map[match_key]
                                 else:
@@ -498,23 +743,56 @@ class JobManager:
                             # until the batched Service First call below.
                             if inv_no:
                                 invoice_map[match_key] = {
-                                    "batch": job.batch_name, "header_id": None, "excluded": False,
+                                    "batch": _batch_name_for(tkey or ""), "header_id": None, "reprocessable": False,
                                 }
 
-                            if fmt_name is None or not inv_no:
+                            # A PART invoice with no real "Item" line at all
+                            # (only Charge (Item)/freight lines, or nothing)
+                            # means the table layout wasn't actually
+                            # understood, even though the format matched by
+                            # GSTIN - the parts themselves got lost, not
+                            # just some field on them. Trusting that as a
+                            # genuine (empty) invoice would save a PART
+                            # purchase with no parts on it; treated the same
+                            # as an unrecognized format instead.
+                            no_real_items = (
+                                invoice_type == "PART"
+                                and not any(not it.get("_charge") for it in data.get("items", []))
+                            )
+                            # A scanned page whose format DID match an
+                            # already-trained one, but whose Vendor Invoice
+                            # No. still couldn't be read, isn't a training
+                            # gap - the template is already known, so
+                            # retraining it wouldn't fix anything. It's this
+                            # one scan's own poor OCR quality, the same
+                            # class of problem as a corrupt/unreadable PDF -
+                            # reject it as UNSUPPORTED (via the same
+                            # exception path every other unreadable file
+                            # already takes) instead of parking it as a
+                            # misleading "needs training".
+                            if fmt_name is not None and not inv_no and data.get("_is_scanned"):
+                                raise ValueError(
+                                    "Vendor Invoice No. could not be read from this scan "
+                                    "(the format itself is already trained) — unsupported."
+                                )
+                            if fmt_name is None or not inv_no or no_real_items:
                                 # Either the format itself is unrecognized,
-                                # or no Vendor Invoice No. could be read off
-                                # this PDF at all - neither leaves anything
-                                # trustworthy to hand to Service First or to
-                                # generate a real Document No. from. Park it
-                                # as NEW TEMPLATE instead of guessing;
-                                # new_format=True below still triggers the
-                                # same New_Format training-copy as the
-                                # per-item "SF doesn't know this part" case.
+                                # no Vendor Invoice No. could be read off
+                                # this PDF at all, or (PART only) no real
+                                # item line was found - none of these leave
+                                # anything trustworthy to hand to Service
+                                # First or to generate a real Document No.
+                                # from. Park it as NEW TEMPLATE instead of
+                                # guessing; new_format=True below still
+                                # triggers the same New_Format training-copy
+                                # as the per-item "SF doesn't know this
+                                # part" case.
                                 reason = (
                                     "Unrecognized invoice format — needs training"
                                     if fmt_name is None else
                                     "Vendor Invoice No. not extracted — needs training"
+                                    if not inv_no else
+                                    "No item line found on a PART invoice — needs training"
                                 )
                                 verdict = {"status": "NEW TEMPLATE", "is_active": False,
                                            "is_synced": False, "new_format": True,
@@ -524,8 +802,30 @@ class JobManager:
                                 # SERVICE invoices never carry a Buyer Order
                                 # No. and have no Service First / reservation
                                 # concept — skip the SF calls and the
-                                # PO-driven verdict logic; ready for Load as-is.
-                                verdict = {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
+                                # PO-driven verdict logic. Service First is
+                                # never called for SERVICE, so the NAV vendor
+                                # code has no automatic source either — it's
+                                # hand-written onto the scanned PDF instead
+                                # (see anchor_extract.py's "Vendor Code"
+                                # field) and, like a missing Buyer Order No.
+                                # on a PART invoice, parks the invoice in its
+                                # own manual-entry workflow when absent.
+                                # A garbled handwritten reading (see
+                                # vendor_code.py) is filled in with its best
+                                # guess but flagged doubtful - park it in the
+                                # same review queue as a genuinely missing
+                                # code so a user can confirm it, same as a
+                                # doubtful SPRPUR PO does for PART.
+                                if not str(data.get("Nav_VendorCode") or "").strip():
+                                    verdict = {"status": "NAV VENDOR CODE DOESN'T EXIST",
+                                               "is_active": False, "is_synced": False,
+                                               "reason": "Nav vendor code is empty in pdf"}
+                                elif data.get("vendor_code_doubtful"):
+                                    verdict = {"status": "NAV VENDOR CODE DOESN'T EXIST",
+                                               "is_active": False, "is_synced": False,
+                                               "reason": "Nav vendor code format is doubtful — please verify"}
+                                else:
+                                    verdict = {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
                                 records.append(_finish_group(ctx, verdict))
                             else:
                                 # Don't call Service First per invoice -
@@ -558,20 +858,23 @@ class JobManager:
                         "moved_to": moved_to,
                     }]
 
+                # (Progress is ticked when a file's EXTRACTION finishes - see
+                # _extract_stream - not here, so it reflects the parallel work.)
                 with job._lock:
                     for record in records:
                         job.results.append(record)
-                    job.processed += 1
 
             # ---- Batched Service First lookup ---------------------------
             # One GetSparePurchaseItem call and one GetHSNDetails call for
             # every PART invoice queued above, instead of that pair once
             # per invoice - a 43-file run used to mean 80+ HTTP round trips,
             # each blocking on Service First's own response time.
-            if job.mode == "process" and pending:
+            if job.mode == "process":
                 with job._lock:
                     job.current_file = ""
                     job.stage = "Syncing"
+                job.set_sync_progress(5)
+            if job.mode == "process" and pending:
                 try:
                     spare_map, hsn_map = service_api.fetch_sf_batch(
                         ctx["data"] for ctx in pending
@@ -579,7 +882,8 @@ class JobManager:
                 except Exception:  # noqa: BLE001 - best-effort, same as any single SF call failing
                     traceback.print_exc()
                     spare_map, hsn_map = {}, {}
-                for ctx in pending:
+                job.set_sync_progress(35)
+                for n_done, ctx in enumerate(pending, start=1):
                     try:
                         verdict = service_api.apply_sf_batch(ctx["data"], spare_map, hsn_map)
                         rec = _finish_group(ctx, verdict)
@@ -588,6 +892,7 @@ class JobManager:
                         rec = {"file": ctx["filename"], "status": "error", "error": str(exc)}
                     with job._lock:
                         job.results.append(rec)
+                    job.set_sync_progress(35 + 30 * n_done / len(pending))
 
             # Commit the learned model once, only after a full training run.
             if job.mode == "train":
@@ -611,12 +916,20 @@ class JobManager:
             if job.mode == "process":
                 with job._lock:
                     job.stage = "Processing"
+                job.set_sync_progress(70)
                 self._save_to_db(job)
+                job.set_sync_progress(88)
                 self._reset_moved_files(job)
                 self._resync_pending(job)
+                self._expire_stale_unresolved(job)
+                job.set_sync_progress(95)
                 self._move_by_status(job)
 
             with job._lock:
+                # The final step (Service First sync + DB save) is done.
+                job.processed = job.total
+                job.prep_progress = 100
+                job.sync_progress = 100
                 job.status = "completed"
                 job.current_file = ""
                 job.stage = ""
@@ -628,6 +941,243 @@ class JobManager:
             with job._lock:
                 job.status = "failed"
                 job.error = str(exc)
+
+    # -- file ordering -----------------------------------------------------
+
+    @staticmethod
+    def _file_size(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _classify_files(job, source_files):
+        """{path: 0 original / 1 scanned / 2 photo} for every file, filling the
+        "preparing" piece (15 -> 50%) as it goes. A born-digital PDF is told
+        apart from a scan in milliseconds; only files without a text layer are
+        rendered, a few at a time.
+        Sample: JobManager._classify_files(job, files)"""
+        from concurrent.futures import ThreadPoolExecutor
+        engine = OCREngine()
+        job.set_prep(15, "Preparing (sorting files: original, scanned, photo)")
+        kinds = {}
+        total = max(1, len(source_files))
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for done, (path, kind) in enumerate(
+                    zip(source_files, pool.map(engine.classify_file, source_files)), start=1
+                ):
+                    kinds[path] = kind
+                    if done % 5 == 0 or done == total:
+                        job.set_prep(15 + 35 * done / total)
+        except Exception:  # noqa: BLE001 - ordering is cosmetic; never fail the run
+            traceback.print_exc()
+            kinds = {p: kinds.get(p, 0) for p in source_files}
+        return kinds
+
+    # -- parallel extraction -----------------------------------------------
+
+    # Fewer files than this and spinning up worker processes (each loads its
+    # own PaddleOCR, a few seconds) costs more than it saves.
+    PARALLEL_MIN_FILES = 2
+
+    @staticmethod
+    def _worker_count(file_count):
+        """How many extraction processes to use for `file_count` files:
+        config.json's "parallel_workers" (1 = extract sequentially in this
+        process), default one per CPU core (max 8) so every core is busy.
+        Sample: JobManager._worker_count(100) -> 8"""
+        if file_count < JobManager.PARALLEL_MIN_FILES:
+            return 1
+        try:
+            import config_store
+            configured = config_store.load_config().get("parallel_workers")
+        except Exception:  # noqa: BLE001
+            configured = None
+        try:
+            workers = int(configured) if configured not in (None, "") else None
+        except (TypeError, ValueError):
+            workers = None
+        if workers is None:
+            workers = min(8, max(1, os.cpu_count() or 2))
+        return max(1, min(workers, file_count))
+
+    # The worker processes are created once and kept alive between runs: each
+    # one loads its own PaddleOCR + imports the whole extraction stack, which
+    # takes ~30 s - paid per run it would cost more than parallelism saves on
+    # a batch of born-digital PDFs (a few hundred ms each). app.py warms the
+    # pool at service start (warm_pool) so the first Start click is fast too.
+    _pool = None
+    _pool_workers = 0
+    _pool_lock = threading.Lock()
+    _progress_queue = None      # workers -> main: (path, percent) per-file progress
+    _current_job = None         # the run whose files those messages belong to
+
+    @classmethod
+    def _drain_progress(cls, queue):
+        """Feed the workers' per-file progress messages into the running job."""
+        while True:
+            try:
+                path, pct = queue.get()
+            except Exception:  # noqa: BLE001 - queue closed
+                return
+            job = cls._current_job
+            if job is not None:
+                job.set_file_progress(path, pct)
+
+    @classmethod
+    def _get_pool(cls, workers):
+        """The shared extraction pool with `workers` processes (created on
+        first use, rebuilt when the configured size changes)."""
+        with cls._pool_lock:
+            if cls._pool is not None and cls._pool_workers != workers:
+                cls._pool.shutdown(wait=False, cancel_futures=True)
+                cls._pool = None
+            if cls._pool is None:
+                threads = max(1, (os.cpu_count() or 2) // workers)
+                ctx = multiprocessing.get_context("spawn")
+                cls._progress_queue = ctx.Queue()
+                threading.Thread(
+                    target=cls._drain_progress, args=(cls._progress_queue,), daemon=True
+                ).start()
+                cls._pool = ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=ctx,
+                    initializer=extract_worker.init_worker,
+                    initargs=(threads, cls._progress_queue),
+                )
+                cls._pool_workers = workers
+            return cls._pool
+
+    @classmethod
+    def _discard_pool(cls, pool):
+        """Forget a pool that died (BrokenProcessPool) so the next run builds
+        a fresh one."""
+        with cls._pool_lock:
+            if cls._pool is pool:
+                cls._pool = None
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @classmethod
+    def warm_pool(cls):
+        """Start the extraction workers and have each one load its OCR engine
+        now, in the background, so the first run doesn't pay for it.
+        Sample: job_manager.warm_pool()"""
+        try:
+            workers = cls._worker_count(cls.PARALLEL_MIN_FILES)
+            if workers <= 1:
+                return
+            pool = cls._get_pool(workers)
+            for _ in range(workers):
+                pool.submit(extract_worker.warm)
+        except Exception:  # noqa: BLE001 - warming is best-effort
+            traceback.print_exc()
+
+    def _extract_stream(self, job, source_files, allow_fn):
+        """Yield (path, ocr_result_or_exception) for every file, IN ORDER,
+        extracting several files at once in worker processes.
+
+        Order matters downstream (the first of two identical invoices wins
+        the duplicate check), so results are consumed in submission order
+        while the workers race ahead. Progress is ticked the moment each
+        file's extraction completes - in whatever order - so the bar shows
+        the real parallel progress. If the pool can't start or dies, the
+        remaining files are extracted sequentially in this process instead.
+        Sample: for path, res in JobManager()._extract_stream(job, files, lambda p: False): ..."""
+
+        JobManager._current_job = job
+
+        def extraction_started():
+            # Preparation is over the moment files are handed to workers.
+            with job._lock:
+                job.stage = "Extracting"
+            job.set_prep(100)
+
+        def tick(path):
+            job.finish_file(path)
+            with job._lock:
+                job.processed += 1
+                job.current_file = os.path.basename(path)
+
+        engine = []
+
+        def extract_here(path):
+            if not engine:
+                engine.append(OCREngine())
+            return engine[0].read_pdf(
+                path, allow_scanned=allow_fn(path),
+                progress=lambda f, p=path: job.set_file_progress(p, int(f * 100)),
+            )
+
+        workers = self._worker_count(len(source_files))
+        pool = None
+        if workers > 1:
+            try:
+                pool = self._get_pool(workers)
+            except Exception:  # noqa: BLE001 - fall back to one process
+                traceback.print_exc()
+                pool = None
+
+        if pool is None:
+            extraction_started()
+            for path in source_files:
+                try:
+                    result = extract_here(path)
+                except Exception as exc:  # noqa: BLE001 - reported per file
+                    result = exc
+                tick(path)
+                yield path, result
+            return
+
+        futures = []
+        try:
+            # Hand files to the workers in the SAME order the progress bar draws
+            # them: original PDFs first (they finish in milliseconds), then
+            # scanned, then photographed, smallest first inside each group -
+            # so a few slow scans never make the quick originals queue behind
+            # them. (train mode has no such ordering: file order.) Results are
+            # still consumed in file order below.
+            wanted = set(source_files)
+            submit_order = [p for p in job.file_order if p in wanted] or list(source_files)
+            by_path = {}
+            for path in submit_order:
+                fut = pool.submit(extract_worker.extract_one, path, allow_fn(path))
+                fut.add_done_callback(lambda _f, p=path: tick(p))
+                by_path[path] = fut
+            futures = [by_path[path] for path in source_files]
+            extraction_started()
+
+            broken = False
+            for path, fut in zip(source_files, futures):
+                result = None
+                if not broken:
+                    try:
+                        kind, payload = fut.result()
+                        result = payload if kind == "ok" else RuntimeError(payload)
+                    except BrokenProcessPool:
+                        broken = True
+                        traceback.print_exc()
+                        self._discard_pool(pool)
+                    except Exception as exc:  # noqa: BLE001
+                        result = exc
+                if broken:
+                    # A worker died: finish the rest here rather than fail
+                    # the run (progress for these was already ticked by the
+                    # futures' own completion callbacks).
+                    try:
+                        result = extract_here(path)
+                    except Exception as exc:  # noqa: BLE001
+                        result = exc
+                yield path, result
+        finally:
+            # The pool stays alive for the next run; only work that was never
+            # started (an aborted run) is dropped.
+            for fut in futures:
+                fut.cancel()
 
     @staticmethod
     def _move(src_path, dest_folder):
@@ -669,7 +1219,13 @@ class JobManager:
     @staticmethod
     def _save_to_db(job):
         """Save each sheet's rows (mapped + static) into the DB tables.
-        Best-effort: a DB/connection failure does not fail the run."""
+        Best-effort: a DB/connection failure does not fail the run. Splits
+        this run's matched invoices by their own "batch" (see
+        _finish_group, which assigns one batch per Template) and saves each
+        group separately through _save_batch_to_db, so a single Start run
+        spanning several Templates creates one batch per Template instead
+        of lumping everything into whichever batch name the run started
+        with."""
         try:
             import config_store
             if not (config_store.load_config().get("db_connection") or "").strip():
@@ -685,6 +1241,22 @@ class JobManager:
             if not matched:
                 return
 
+            batch_groups = {}
+            for r in matched:
+                batch_groups.setdefault(r.get("batch") or job.batch_name, []).append(r)
+
+            for batch_name, batch_matched in batch_groups.items():
+                JobManager._save_batch_to_db(job, batch_name, batch_matched, excel_export, database)
+
+        except Exception:  # noqa: BLE001 - DB save is best-effort
+            traceback.print_exc()
+
+    @staticmethod
+    def _save_batch_to_db(job, batch_name, matched, excel_export, database):
+        """Save one batch's worth of already-matched invoices - the per-
+        batch body of _save_to_db, split out so one Start run can save
+        several batches (one per Template) instead of always exactly one."""
+        try:
             invoices = [r["data"] for r in matched]
             grouped = excel_export.build_rows_grouped(invoices)
 
@@ -714,12 +1286,21 @@ class JobManager:
                 "filenames": [r.get("file") for r in matched],
                 "formats": [r.get("format") for r in matched],
                 "invoice_types": [r.get("_invoice_type") for r in matched],
+                # Which of the source PDF's own physical pages this invoice
+                # came from (see ocr_engine.py's _merge_group /
+                # invoice_schema.py's _page_start/_page_end) - so the PDF
+                # viewer/download shows this invoice's whole span, not just
+                # a single (possibly wrong) page.
+                "page_starts": [(r.get("data") or {}).get("_page_start") for r in matched],
+                "page_ends": [(r.get("data") or {}).get("_page_end") for r in matched],
             }
 
             # Final data-completeness gate, checked for every invoice except
             # BUYER ORDER NO DOESN'T EXIST (that one has its own manual-entry
             # workflow — Buyer Order Entry — and can't have real Reservation
             # Entry data without a PO to look up in SF in the first place),
+            # NAV VENDOR CODE DOESN'T EXIST (same idea for SERVICE — its own
+            # manual-entry workflow, Vendor Code Entry),
             # NEW TEMPLATE (unrecognized format — nothing to check until
             # it's trained), and DUPLICATE (already-processed invoice,
             # parked purely for visibility - its own data completeness is
@@ -728,11 +1309,31 @@ class JobManager:
             #     READY TO LOAD, regardless of what Service First said
             #     (PENDING IN SF / DATA MISMATCH verdicts are provisional,
             #     not final, until the data itself is checked).
-            #   - anything missing -> DATA MISMATCH, with exactly which
-            #     field(s).
+            #   - a mandatory field whose source is the PDF itself (not
+            #     Service First/System/Template) is missing on a born-
+            #     digital page -> NEW TEMPLATE, not DATA MISMATCH: the
+            #     extraction/template failed to read something the PDF
+            #     should have stated outright (e.g. Quantity, Direct Unit
+            #     Cost, Line Amount), which is a training gap, not a
+            #     one-off data problem - copied into New_Format the same
+            #     way an unrecognized format is. On a scanned/OCR'd page
+            #     (data["_is_scanned"]) this same gap stays DATA MISMATCH
+            #     instead: the format itself already matched a trained one,
+            #     so a blank field here is far more likely this one
+            #     document's own numbers being misread by OCR than a
+            #     genuine template problem retraining could ever fix - EXCEPT
+            #     for SCANNED_CRITICAL_PDF_FIELDS, still routed to NEW
+            #     TEMPLATE even when scanned (see its own comment above).
+            #   - otherwise anything missing -> DATA MISMATCH, with exactly
+            #     which field(s) - excluding one whose only possible source
+            #     is an unset Template value (see excel_export._is_none_
+            #     source): nothing was ever configured to fill it, so its
+            #     absence isn't a real data problem.
+            field_mapping = excel_export.load_mapping()
             for i, group in enumerate(grouped["groups"]):
                 if tracker["statuses"][i] in (
-                    "BUYER ORDER NO DOESN'T EXIST", "NEW TEMPLATE", "DUPLICATE",
+                    "BUYER ORDER NO DOESN'T EXIST", "NAV VENDOR CODE DOESN'T EXIST",
+                    "NEW TEMPLATE", "DUPLICATE",
                 ):
                     continue
                 # InvoiceNo is a mandatory column but lives outside the
@@ -741,9 +1342,32 @@ class JobManager:
                 header_for_check = dict(group["header"])
                 header_for_check["InvoiceNo"] = group.get("invoice_no", "")
                 missing = excel_export.missing_required_fields(
-                    header_for_check, group["lines"], group["reservations"]
+                    header_for_check, group["lines"], group["reservations"], field_mapping,
+                    invoice_type=matched[i].get("_invoice_type"),
                 )
-                if missing:
+                missing_names = sorted({m["field"] for m in missing})
+                pdf_missing = sorted({m["field"] for m in missing if m["source"] == "PDF"})
+                is_scanned = bool((matched[i].get("data") or {}).get("_is_scanned"))
+                if pdf_missing and (
+                    not is_scanned
+                    or any(f in SCANNED_CRITICAL_PDF_FIELDS for f in pdf_missing)
+                ):
+                    tracker["statuses"][i] = "NEW TEMPLATE"
+                    tracker["isactives"][i] = False
+                    matched[i]["reason"] = (
+                        "PDF-sourced field(s) missing — needs training: " + ", ".join(pdf_missing)
+                    )
+                    rel = matched[i].get("rel") or matched[i].get("file")
+                    src = (os.path.join(job.source_folder, rel.replace("/", os.sep))
+                           if rel else None)
+                    if src and job.unknown_folder:
+                        try:
+                            JobManager._copy(src, job.unknown_folder)
+                            if job.mirror_folder:
+                                JobManager._copy(src, job.mirror_folder)
+                        except Exception:  # noqa: BLE001 - best-effort
+                            traceback.print_exc()
+                elif missing:
                     tracker["statuses"][i] = "DATA MISMATCH"
                     tracker["isactives"][i] = False
                     # Keep a more specific reason Service First already gave
@@ -753,7 +1377,7 @@ class JobManager:
                     # gap and is more actionable. Only fall back to the
                     # generic message when nothing more specific was set.
                     if not matched[i].get("reason"):
-                        matched[i]["reason"] = "Missing required field(s): " + ", ".join(missing)
+                        matched[i]["reason"] = "Missing required field(s): " + ", ".join(missing_names)
                 else:
                     tracker["statuses"][i] = "READY TO LOAD"
                     tracker["isactives"][i] = True
@@ -764,13 +1388,15 @@ class JobManager:
                 # folder the DB says it's in.
                 matched[i]["_status"] = tracker["statuses"][i]
 
-            job.db_saved = database.save_grouped(grouped, job.batch_name, tracker)
+            result = database.save_grouped(grouped, batch_name, tracker) or {}
+            for k, v in result.items():
+                job.db_saved[k] = job.db_saved.get(k, 0) + v
 
-            # Invoices that matched an Excluded record (see the main loop's
-            # duplicate check) were just inserted above as ordinary fresh
-            # rows, same as every other invoice in this batch - now merge
-            # each one back onto its existing Excluded header/tracker in
-            # place (same Id) and drop the temporary insert.
+            # Invoices that matched an Excluded/Pending In SF record (see the
+            # main loop's duplicate check) were just inserted above as
+            # ordinary fresh rows, same as every other invoice in this
+            # batch - now merge each one back onto its existing header/
+            # tracker in place (same Id) and drop the temporary insert.
             for r in matched:
                 existing_id = r.get("_reprocess_into_header_id")
                 if not existing_id:
@@ -784,14 +1410,21 @@ class JobManager:
                         "SELECT TOP 1 h.Id FROM dbo.tbl_Purchase_Header h "
                         "JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = h.Id "
                         "WHERE pt.BatchName = ? AND h.InvoiceNo = ? ORDER BY h.Id DESC",
-                        job.batch_name, inv_no,
+                        batch_name, inv_no,
                     )
                     row = cur.fetchone()
                     cur.connection.close()
                     if row:
-                        database.reprocess_excluded_header(existing_id, row[0])
+                        database.reprocess_reworkable_header(existing_id, row[0])
                 except Exception:  # noqa: BLE001 - best-effort
                     traceback.print_exc()
+
+            # Audit trail: who uploaded / processed each invoice, and the
+            # automatic Buyer Order No / NAV vendor code, all against whoever
+            # pressed Start (see database.log_processed_batch).
+            database.log_processed_batch(
+                batch_name, job.started_by,
+                job.started_at.replace(microsecond=0) if job.started_at else None)
 
         except Exception:  # noqa: BLE001 - DB save is best-effort
             traceback.print_exc()
@@ -805,12 +1438,62 @@ class JobManager:
             if not (config_store.load_config().get("db_connection") or "").strip():
                 return
             import database
-            result = database.resync_pending()
+            result = database.resync_pending(batch_name=job.batch_name, user_id=job.started_by)
             if result.get("promoted"):
                 print(f"Re-synced {result['promoted']} pending record(s)")
             with job._lock:
                 for reason in result.get("errors", []):
                     job.errors.append({"file": "(re-sync)", "invoice_no": "", "reason": reason})
+        except Exception:  # noqa: BLE001 - best-effort
+            traceback.print_exc()
+
+    @staticmethod
+    def _expire_stale_unresolved(job):
+        """Park any Data Mismatch/Excluded/New Template/Buyer Order No
+        Doesn't Exist invoice left unresolved past database.
+        STALE_STATUS_EXPIRY_DAYS as Manually Updated - permanently; it
+        stops counting toward batch status and can never be reprocessed
+        again (see database.expire_stale_unresolved).
+        Also moves each expired PDF into the Manually Updated folder - the
+        DB-only UPDATE doesn't touch the filesystem itself, and these files
+        come from earlier runs, not this job's own results (see
+        _move_by_status). Unsupported gets the same treatment by filesystem
+        age instead (config_store.expire_stale_files), since it never gets
+        a database row at all - a pure exception + file move (see the main
+        loop's UNSUPPORTED handling above)."""
+        try:
+            import config_store
+            if not (config_store.load_config().get("db_connection") or "").strip():
+                return
+            import database
+            filenames = database.expire_stale_unresolved()
+            if filenames:
+                print(f"Expired {len(filenames)} stale record(s) to Manually Updated")
+                # The DB status change above already committed per row - a
+                # file-move failure here (locked/open file, one already
+                # moved/renamed by hand, a permission issue, ...) must never
+                # abort the loop and strand every file AFTER it in its old
+                # folder despite its status already correctly saying
+                # Manually Updated. One failure is logged and skipped.
+                moved = 0
+                for fname in filenames:
+                    try:
+                        dest = config_store.move_pdf_to_status(fname, "MANUALLY UPDATED")
+                        if dest:
+                            moved += 1
+                        else:
+                            print(f"Could not locate '{fname}' on disk to move to Manually Updated")
+                    except Exception:  # noqa: BLE001 - one bad file must not stop the rest
+                        traceback.print_exc()
+                if moved != len(filenames):
+                    print(f"Moved {moved}/{len(filenames)} expired file(s) to Manually Updated "
+                          f"({len(filenames) - moved} left in their current folder - see above)")
+
+            unsupported = config_store.expire_stale_files(
+                "UNSUPPORTED", database.STALE_STATUS_EXPIRY_DAYS, "MANUALLY UPDATED"
+            )
+            if unsupported:
+                print(f"Expired {len(unsupported)} stale Unsupported file(s) to Manually Updated")
         except Exception:  # noqa: BLE001 - best-effort
             traceback.print_exc()
 

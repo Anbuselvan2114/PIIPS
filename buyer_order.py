@@ -19,6 +19,7 @@ repaired but is never trusted automatically — the caller parks the invoice so
 a user can confirm it.
 """
 
+import difflib
 import re
 
 
@@ -48,6 +49,17 @@ _ANCHOR_RE = re.compile(
     _PREFIX + r"\s*/\s*\d{4}\s*/\s*\d{2}\s*/\s*\d{2}\s*-",
     re.IGNORECASE,
 )
+
+
+# A PO whose PREFIX is misspelt ("SPRPUE/", "SPRRUR/", "SPPUR/", "SPRPUR-"...)
+# but whose remainder still has the exact PO shape year/month/day-serial.
+# The prefix is one alphanumeric word that must resemble "SPRPUR" (see
+# _PREFIX_MIN_RATIO) so an unrelated "INV/2026/04/27-1234" is never taken.
+_FUZZY_RE = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z0-9]{4,8})\s*[/\\-]\s*(\d{4})\s*[/\\-]\s*(\d{2})"
+    r"\s*[/\\-]\s*(\d{2})\s*[-–]\s*(\d{4,6})(?!\d)"
+)
+_PREFIX_MIN_RATIO = 0.6
 
 
 def _serial_after(text, pos):
@@ -98,6 +110,19 @@ def looks_like_po(value):
     return _is_strict(_normalise(value or ""))
 
 
+def resembles_po(value):
+    """True when `value` at least STARTS like a SPRPUR PO - a prefix word
+    resembling "SPRPUR" followed by a separator ("SPRPUR/2026/08/1",
+    "SPRPU/..."): a truncated/misread PO worth a human check, unlike an
+    unrelated reference ("PO-2627-101042", "MAIL", "/") that isn't a PO of
+    ours at all.
+    Sample: resembles_po('SPRPUR/2026/08/1') -> True; resembles_po('PO-2627-101042') -> False"""
+    m = re.match(r"\s*([A-Za-z0-9]{4,8})\s*[/\-]", value or "")
+    if not m:
+        return False
+    return difflib.SequenceMatcher(None, m.group(1).upper(), "SPRPUR").ratio() >= _PREFIX_MIN_RATIO
+
+
 def find_buyer_order_no(text):
     """
     Scan free OCR `text` for a SPRPUR buyer's order number.
@@ -136,5 +161,13 @@ def find_buyer_order_no(text):
     m = _LOOSE_RE.search(text)
     if m:
         return _normalise(m.group(0)), "doubtful"
+
+    # Prefix misspelt (or a separator other than "/") around an otherwise
+    # perfect year/month/day-serial tail -> also doubtful; the value is kept
+    # exactly as read so the user sees what was printed and corrects it.
+    for fm in _FUZZY_RE.finditer(text):
+        prefix = fm.group(1).upper()
+        if difflib.SequenceMatcher(None, prefix, "SPRPUR").ratio() >= _PREFIX_MIN_RATIO:
+            return _normalise(fm.group(0)), "doubtful"
 
     return "", "none"

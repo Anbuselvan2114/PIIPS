@@ -58,7 +58,14 @@ def folder_for(entity, invoice_type, name):
     return folder, base
 
 
-def save_template(entity, invoice_type, name, po_format, static, user_id=None):
+def save_template(entity, invoice_type, name, po_format, static, user_id=None, original_key=None):
+    """`original_key`, when given and different from the key this call
+    computes, is a RENAME (Template Edit screen's Template name field,
+    admin-editable): the existing folder is moved to the new name and the
+    existing DB row is updated in place - see usp_SaveTemplate. Entity and
+    Invoice Type stay fixed in the UI (only `name` is editable there), but
+    this is written generically off `original_key` in case that ever
+    changes."""
     entity = (entity or "").strip()
     invoice_type = (invoice_type or "").strip()
     name = (name or "").strip().strip("/\\ ")
@@ -73,13 +80,38 @@ def save_template(entity, invoice_type, name, po_format, static, user_id=None):
     folder, base = folder_for(entity, invoice_type, name)
     if not base:
         raise ValueError("Folder Path is not configured. Save it under Configuration first.")
-    # Create the template's folder under Input (<Input>/<entity>/<invoice_type>/<name>).
-    try:
-        os.makedirs(folder, exist_ok=True)
-    except OSError as exc:
-        raise ValueError(f"Could not create the template folder: {folder} ({exc})")
 
     key = f"{entity}\\{invoice_type}\\{name}"
+    is_rename = bool(original_key) and original_key != key
+
+    if is_rename:
+        if key in load()["Static_Values"]:
+            raise ValueError(f'A template named "{name}" already exists.')
+        old_parts = original_key.split("\\")
+        if len(old_parts) < 3:
+            raise ValueError(f"Can't resolve the current template's folder from key {original_key!r}.")
+        old_folder, _ = folder_for(old_parts[0], old_parts[1], "\\".join(old_parts[2:]))
+        if old_folder and os.path.isdir(old_folder):
+            if os.path.exists(folder):
+                raise ValueError(f"Can't rename: a folder already exists at {folder}.")
+            try:
+                os.makedirs(os.path.dirname(folder), exist_ok=True)
+                os.rename(old_folder, folder)
+            except OSError as exc:
+                raise ValueError(f"Could not rename the template folder: {exc}")
+        else:
+            # The old folder is already gone/never existed - nothing to
+            # move, just make sure the new one is there.
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError as exc:
+                raise ValueError(f"Could not create the template folder: {folder} ({exc})")
+    else:
+        # Create the template's folder under Input (<Input>/<entity>/<invoice_type>/<name>).
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(f"Could not create the template folder: {folder} ({exc})")
 
     clean_static = {
         sheet: {k: v for k, v in (static or {}).get(sheet, {}).items() if k}
@@ -87,7 +119,13 @@ def save_template(entity, invoice_type, name, po_format, static, user_id=None):
     }
 
     import database
-    database.save_template(entity, name, key, po_format or "", clean_static, user_id, invoice_type)
+    try:
+        database.save_template(entity, name, key, po_format or "", clean_static, user_id, invoice_type,
+                                old_template_key=original_key if is_rename else None)
+    except Exception as exc:  # noqa: BLE001 - most likely UQ_Template on a stale/inactive key
+        if is_rename:
+            raise ValueError(f'Could not rename to "{name}" - that key may already be in use: {exc}')
+        raise
     return key, folder
 
 

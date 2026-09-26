@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   startProcessing, getStatus, getResult, getActiveJob,
-  getBatches, batchDownloadUrl, getStatusCounts,
+  getBatches, downloadBatchFile, getStatusCounts,
   getInvoicesByStatus, getInvoicesByBatch, setInvoiceExcluded,
   getInvoiceFieldCheck,
 } from "./api";
-import { DataTable, Modal, PdfModal } from "./components";
+import { DataTable, Modal, PdfModal, RunBar, runPercent, isPreparing } from "./components";
 
 // Dark categorical palette — one fixed, distinct hue per tbl_status slot
 // (indexed by status_id). Sized past the number of statuses so colours never
@@ -106,11 +106,16 @@ export default function Dashboard({ user }) {
   const [results, setResults] = useState([]);
   const [batches, setBatches] = useState([]);
   const [batchInputs, setBatchInputs] = useState({});   // batch -> {docNo, entryNo}
+  const [batchError, setBatchError] = useState(null);
+  const [downloadingBatch, setDownloadingBatch] = useState(null);
   const [statusCounts, setStatusCounts] = useState([]);
   const [modal, setModal] = useState(null);
   const [fieldModal, setFieldModal] = useState(null);
+  // Which of the Fields popup's three tabs is showing: "header" | "lines" | "reservations".
+  const [fieldTab, setFieldTab] = useState("header");
   const [pdfFile, setPdfFile] = useState(null);
   const pollRef = useRef(null);
+  const polledRef = useRef(null);   // job id whose progress this screen is following
 
   const loadBatches = () =>
     getBatches().then((r) => setBatches(r.batches || [])).catch(() => {});
@@ -129,17 +134,30 @@ export default function Dashboard({ user }) {
       loadBatches();
       loadStatusCounts();
     })();
-    return () => clearInterval(pollRef.current);
+    // Only one process run can exist at a time, and it may have been started
+    // by ANY signed-in user: keep looking for one so everybody sees the same
+    // live bar (and a disabled Start) without reloading the page.
+    const watch = setInterval(async () => {
+      try {
+        const j = await getActiveJob("process", true);
+        if (j && (j.status === "running" || j.status === "pending") && polledRef.current !== j.job_id) {
+          setJob(j); setRunning(true); setError(null); poll(j.job_id);
+        }
+      } catch { /* server busy - try again next tick */ }
+    }, 2500);
+    return () => { clearInterval(pollRef.current); clearInterval(watch); };
   }, []);
 
   const poll = (jobId) => {
     clearInterval(pollRef.current);
+    polledRef.current = jobId;
     pollRef.current = setInterval(async () => {
       try {
-        const s = await getStatus(jobId);
+        const s = await getStatus(jobId, true);
         setJob(s);
         if (s.status === "completed" || s.status === "failed") {
           clearInterval(pollRef.current);
+          polledRef.current = null;
           setRunning(false);
           const full = await getResult(jobId);
           setResults(full.results || []);
@@ -148,13 +166,18 @@ export default function Dashboard({ user }) {
           setJob(null);
           if (s.status === "failed") setError(s.error || "Processing failed");
         }
-      } catch (e) { clearInterval(pollRef.current); setRunning(false); setError(e.message); }
+      } catch (e) { clearInterval(pollRef.current); polledRef.current = null; setRunning(false); setError(e.message); }
     }, 800);
   };
 
   const onStart = async () => {
     setError(null); setResults([]); setJob(null);
-    try { const { job_id } = await startProcessing(user?.user_id); setRunning(true); poll(job_id); }
+    // Show the bar at once (a "preparing" piece) instead of after the first
+    // poll comes back.
+    setRunning(true);
+    setJob({ status: "running", stage: "Preparing (starting)", total: 1, processed: 0, file_total: 0,
+             percent: 0, segments: [0], started_by_name: user?.username, started_by: user?.user_id });
+    try { const { job_id } = await startProcessing(user?.user_id); poll(job_id); }
     catch (e) { setError(e.message); }
   };
 
@@ -182,10 +205,15 @@ export default function Dashboard({ user }) {
 
   const openFieldCheck = async (row) => {
     if (!row.header_id) return;
-    setFieldModal({ title: `Fields — ${row.invoice_no || row.file_name}`, loading: true });
+    const title = `Fields — ${row.invoice_no || row.file_name}${row.invoice_type ? ` (${row.invoice_type})` : ""}`;
+    setFieldTab("header");
+    // A SERVICE invoice never calls Service First, so it never has any
+    // Reservation Entry rows - that tab isn't offered for it at all.
+    const isService = (row.invoice_type || "").trim().toUpperCase() === "SERVICE";
+    setFieldModal({ title, loading: true, isService });
     try {
       const r = await getInvoiceFieldCheck(row.header_id);
-      setFieldModal({ title: `Fields — ${row.invoice_no || row.file_name}`, loading: false, data: r });
+      setFieldModal({ title, loading: false, data: r, isService });
     } catch (e) {
       setFieldModal({ title: "Fields", loading: false, error: e.message });
     }
@@ -196,24 +224,70 @@ export default function Dashboard({ user }) {
     try {
       const r = await setInvoiceExcluded(row.header_id, exclude, user?.user_id);
       setModal((m) => m && ({
-        ...m,
+        ...m, error: null,
         rows: m.rows.map((x) => x.header_id === row.header_id
           ? { ...x, is_excluded: exclude, status: r.new_status || x.status } : x),
       }));
       loadStatusCounts(); loadBatches();
-    } catch (e) { setError(e.message); }
+    } catch (e) {
+      // This button lives inside the invoice-list modal - show the
+      // failure there (modal.error, right where the user is looking),
+      // not on the outer page's error banner, which sits behind the
+      // modal overlay and would go unnoticed.
+      setModal((m) => m && ({ ...m, error: e.message }));
+    }
   };
 
-  const percent = job?.percent ?? 0;
-  const stageLabel = job
-    ? `${job.stage || "Processing"}${job.current_file ? ` — ${job.current_file}` : ""} …` : "";
+  const [includingAll, setIncludingAll] = useState(false);
+  const includeAll = async () => {
+    const targets = (modal?.rows || []).filter((r) => r.is_excluded && r.header_id);
+    if (!targets.length) return;
+    setIncludingAll(true);
+    try {
+      const results = await Promise.allSettled(
+        targets.map((r) => setInvoiceExcluded(r.header_id, false, user?.user_id)));
+      const byId = new Map(targets.map((r, i) => [r.header_id, results[i]]));
+      const failed = results.filter((r) => r.status === "rejected");
+      // Shown inside this same modal (not the outer page's error banner,
+      // which sits behind the modal overlay and would go unnoticed) - the
+      // first invoice's own reason (e.g. "its batch already has an invoice
+      // Loaded...") is far more actionable than a bare failure count.
+      const failureMsg = failed.length
+        ? failed[0].reason?.message
+          + (failed.length > 1 ? ` (and ${failed.length - 1} more failed the same way)` : "")
+        : null;
+      setModal((m) => m && ({
+        ...m, error: failureMsg,
+        rows: m.rows.map((x) => {
+          const res = byId.get(x.header_id);
+          return res && res.status === "fulfilled"
+            ? { ...x, is_excluded: false, status: res.value.new_status || x.status }
+            : x;
+        }),
+      }));
+      loadStatusCounts(); loadBatches();
+    } finally { setIncludingAll(false); }
+  };
+
+  const percent = runPercent(job);
+  // Several files are extracted at once, so name the count - not one file.
+  const stageLabel = !job ? "" : job.stage === "Extracting"
+    ? `Extracting — ${Math.max(job.active_files || 0, 1)} ${(job.active_files || 0) > 1 ? "files at a time" : "file"} …`
+    : `${job.stage || "Processing"}${job.current_file ? ` — ${job.current_file}` : ""} …`;
+
+  // Long, unbroken values (file names, batch names, invoice/vendor text
+  // with no spaces to wrap at) would otherwise force the whole table wider
+  // than the modal, triggering .table-wrap's horizontal scroll - wrap them
+  // at any character instead so every column stays on one screen.
+  const wrapCellStyle = { whiteSpace: "normal", overflowWrap: "break-word", maxWidth: 220 };
 
   // clickable invoice-number cell (opens the PDF viewer)
   const invoiceCell = (row) => (
     row.file_name ? (
-      <button className="btn-link" onClick={() => setPdfFile(row.file_name)}
+      <button className="btn-link" onClick={() => setPdfFile({ file: row.file_name, page: row.page_start ?? row.page, pageEnd: row.page_end })}
               style={{ background: "none", border: "none", padding: 0, color: "var(--primary)",
-                       cursor: "pointer", textDecoration: "underline", font: "inherit" }}>
+                       cursor: "pointer", textDecoration: "underline", font: "inherit",
+                       ...wrapCellStyle }}>
         {row.invoice_no || row.file_name}
       </button>
     ) : (row.invoice_no || "—")
@@ -227,8 +301,8 @@ export default function Dashboard({ user }) {
     { key: "missing", label: "Status",
       render: (r) => (
         <div>
-          <span className={`badge ${r.missing ? "badge-warning" : "badge-success"}`}>
-            {r.missing ? "Missing" : "OK"}
+          <span className={`badge ${r.optional ? "badge-muted" : r.missing ? "badge-warning" : "badge-success"}`}>
+            {r.optional ? "Optional" : r.missing ? "Missing" : "OK"}
           </span>
           {r.reason && (
             <div className="hint" style={{ marginTop: 3 }}>{r.reason}</div>
@@ -239,11 +313,16 @@ export default function Dashboard({ user }) {
 
   const invoiceColumns = [
     { key: "invoice_no", label: "Invoice No.", render: invoiceCell },
-    { key: "file_name", label: "File" },
-    { key: "vendor", label: "Vendor" },
-    { key: "invoice_type", label: "Invoice Type" },
-    { key: "status", label: "Status" },
-    { key: "batch", label: "Batch" },
+    { key: "file_name", label: "File",
+      render: (row) => <div style={wrapCellStyle}>{row.file_name ?? "—"}</div> },
+    { key: "vendor", label: "Vendor",
+      render: (row) => <div style={wrapCellStyle}>{row.vendor ?? "—"}</div> },
+    { key: "invoice_type", label: "Invoice Type",
+      render: (row) => <div style={wrapCellStyle}>{row.invoice_type ?? "—"}</div> },
+    { key: "status", label: "Status",
+      render: (row) => <div style={wrapCellStyle}>{row.status ?? "—"}</div> },
+    { key: "batch", label: "Batch",
+      render: (row) => <div style={wrapCellStyle}>{row.batch ?? "—"}</div> },
     { key: "_fields", label: "", sortable: false,
       render: (row) => row.header_id ? (
         <button className="btn btn-subtle btn-sm" onClick={() => openFieldCheck(row)}>
@@ -316,10 +395,49 @@ export default function Dashboard({ user }) {
   // Document No / Entry No / Download only make sense while a batch still
   // has invoices sitting at READY TO LOAD — once everything has moved on
   // to Loaded/Posted/Completed there's nothing left to stage for NAV.
-  const canDownload = (row) => (row.exportable ?? 1) > 0 && (row["st:READY TO LOAD"] ?? 0) > 0;
+  // A batch locks the moment any invoice in it reaches Loaded/Excluded (or
+  // later) - see database._batch_status_and_lock - but a locked batch can
+  // still be downloaded as long as it has invoices left at Ready to Load
+  // (a partial Load: only some of the batch was taken on to NAV so far) -
+  // the download itself never re-touches or re-mints a Document No./Entry
+  // No. for one already past Ready to Load, only the still-pending ones
+  // (see app.py's download_batch). Batches must also clear in creation
+  // order - blocked_by names any earlier, not-yet-cleared batch(es) this
+  // one must wait on (see database.list_batches). Only one batch may be
+  // Downloaded/In Progress at a time - see app.py's download_batch.
+  const canDownload = (row) => (row.exportable ?? 1) > 0 && (row["st:READY TO LOAD"] ?? 0) > 0
+    && !(row.blocked_by || []).length
+    && !(row["st:BUYER ORDER NO DOESN'T EXIST"] ?? 0)
+    && !(row["st:DATA MISMATCH"] ?? 0)
+    && !batches.some((b) => b.batch !== row.batch
+      && (b.batch_status === "DOWNLOADED" || b.batch_status === "IN PROGRESS"));
+
+  // A plain link navigation can't show a clean error (a failed download,
+  // e.g. a Document No. collision, would just dump raw JSON in the
+  // browser) - fetch it instead so a rejection surfaces here as a normal
+  // Dashboard alert, and only save the file on success.
+  const doDownload = async (batch) => {
+    setBatchError(null); setDownloadingBatch(batch);
+    try {
+      const { blob, filename } = await downloadBatchFile(
+        batch, batchInputs[batch]?.docNo, batchInputs[batch]?.entryNo);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      // The backend just flipped this batch's status to Downloaded (and
+      // minted Document Nos) - refresh so the table reflects that without
+      // needing a manual page reload.
+      loadBatches();
+      loadStatusCounts();
+    } catch (e) { setBatchError(e.message); }
+    finally { setDownloadingBatch(null); }
+  };
 
   const batchColumns = [
     { key: "batch", label: "Batch Name" },
+    { key: "batch_status", label: "Batch Status", render: (row) => row.batch_status || "CREATED" },
     { key: "extracted", label: "Extracted", render: (row) => row.extracted ?? 0 },
     ...BATCH_STATUS_COLS.map(({ status, label }) => ({
       key: `st:${status}`,
@@ -352,12 +470,21 @@ export default function Dashboard({ user }) {
       ) : <span className="muted">—</span>) },
     { key: "_dl", label: "", sortable: false,
       render: (row) => (canDownload(row) ? (
-        <a className="btn btn-primary btn-sm"
-           href={batchDownloadUrl(row.batch, batchInputs[row.batch]?.docNo, batchInputs[row.batch]?.entryNo)}>
-          Download
-        </a>
+        <button className="btn btn-primary btn-sm" disabled={downloadingBatch === row.batch}
+                onClick={() => doDownload(row.batch)}>
+          {downloadingBatch === row.batch ? "Downloading…" : "Download"}
+        </button>
       ) : (
-        <span className="muted" title="No active / included invoices to export, or every invoice in this batch has already moved past Ready to Load">—</span>
+        <span className="muted"
+              title={(row.locked && !(row["st:READY TO LOAD"] ?? 0))
+                ? "This batch has an invoice already Loaded, Excluded, Posted, Completed, or Rejected, and nothing left at Ready to Load — there's nothing left to download."
+                : (row.blocked_by || []).length
+                ? `Waiting on earlier batch(es) to be Loaded, Posted, or Completed first: ${row.blocked_by.join(", ")}`
+                : (row["st:BUYER ORDER NO DOESN'T EXIST"] ?? 0)
+                ? "Kindly fill in the Buyer Order No for every invoice in this batch before downloading."
+                : (row["st:DATA MISMATCH"] ?? 0)
+                ? "Kindly resolve the Data Mismatch invoice(s) in this batch before downloading."
+                : "No active / included invoices to export, or every invoice in this batch has already moved past Ready to Load"}>—</span>
       )) },
   ];
 
@@ -371,7 +498,10 @@ export default function Dashboard({ user }) {
               <h3>Process invoices</h3>
               <div style={{ flex: 1 }} />
               <button className="btn btn-primary btn-lg" onClick={onStart} disabled={running}>
-                {running ? "Processing…" : "▶  Start"}
+                {running
+                  ? (job?.started_by_name && job.started_by !== user?.user_id
+                      ? `Processing… (started by ${job.started_by_name})` : "Processing…")
+                  : "▶  Start"}
               </button>
             </div>
             <p className="hint" style={{ margin: 0 }}>
@@ -380,10 +510,15 @@ export default function Dashboard({ user }) {
             {running && job && (
               <div style={{ marginTop: 18 }}>
                 <div className="progress-meta">
-                  <span>{stageLabel}</span>
-                  <span>{job.processed}/{job.total} · {percent}%</span>
+                  <span>
+                    {job.started_by_name ? `Started by ${job.started_by_name} · ` : ""}{stageLabel}
+                  </span>
+                  <span>
+                    {job.file_total && !isPreparing(job) ? `${Math.min(job.processed, job.file_total)}/${job.file_total} files · ` : ""}
+                    {percent}%
+                  </span>
                 </div>
-                <div className="progress"><div className="progress-bar" style={{ width: `${percent}%` }} /></div>
+                <RunBar job={job} />
               </div>
             )}
             {error && <div className="alert alert-danger" style={{ marginTop: 12 }}>{error}</div>}
@@ -394,7 +529,26 @@ export default function Dashboard({ user }) {
               <h3>Batches</h3><div style={{ flex: 1 }} />
               <button className="btn btn-subtle btn-sm" onClick={loadBatches}>Refresh</button>
             </div>
+            {(() => {
+              // Only one batch may be mid-flight (Downloaded/In Progress)
+              // at a time - see app.py's download_batch - so name whichever
+              // batch(es) are currently sitting in that state, not just the
+              // ones an ordering check (blocked_by) would report.
+              const active = batches
+                .filter((b) => b.batch_status === "DOWNLOADED" || b.batch_status === "IN PROGRESS")
+                .map((b) => b.batch);
+              if (!active.length) return null;
+              return (
+                <div className="alert alert-info" style={{ marginBottom: 12 }}>
+                  Batch {active.join(", ")} {active.length > 1 ? "are" : "is"} still Downloaded/In Progress — no other batch can be downloaded until {active.length > 1 ? "they are" : "it's"} fully Loaded, Posted, or Completed.
+                </div>
+              );
+            })()}
+            {batchError && (
+              <div className="alert alert-danger" style={{ marginBottom: 12 }}>{batchError}</div>
+            )}
             <DataTable columns={batchColumns} rows={batchRows} searchKeys={["batch", "created"]}
+                       defaultSortKey="batch" defaultSortDir="desc"
                        empty="No batches yet. Run Start to create one." />
           </div>
 
@@ -435,8 +589,16 @@ export default function Dashboard({ user }) {
       </div>
 
       {modal && (
-        <Modal title={modal.title} onClose={() => setModal(null)}>
+        <Modal title={modal.title} onClose={() => setModal(null)} width={1300}>
           {modal.error && <div className="alert alert-danger">{modal.error}</div>}
+          {modal.kind === "batch" && modal.status === "EXCLUDED"
+            && !modal.loading && modal.rows.some((r) => r.is_excluded) && (
+            <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+              <button className="btn btn-subtle btn-sm" disabled={includingAll} onClick={includeAll}>
+                {includingAll ? "Including…" : "Include All"}
+              </button>
+            </div>
+          )}
           {modal.loading ? <div className="empty">Loading…</div> : (
             <DataTable
               columns={modal.kind === "batch" ? batchModalColumns : invoiceColumns}
@@ -452,37 +614,65 @@ export default function Dashboard({ user }) {
           {fieldModal.error && <div className="alert alert-danger">{fieldModal.error}</div>}
           {fieldModal.loading ? <div className="empty">Loading…</div> : fieldModal.data && (
             <>
-              <h3 style={{ marginTop: 0 }}>Purchase Header</h3>
-              <DataTable columns={fieldCheckColumns}
-                         rows={fieldModal.data.header.map((f) => ({ ...f, _key: f.field }))}
-                         searchKeys={["field"]} pageSize={50} empty="No header data." />
+              <div className="pills">
+                {[
+                  ["header", "Purchase Header", null],
+                  ["lines", "Purchase Line", fieldModal.data.lines.length],
+                  ...(fieldModal.isService ? [] : [
+                    ["reservations", "Reservation Entry", fieldModal.data.reservations.length],
+                  ]),
+                ].map(([key, label, count]) => (
+                  <div key={key}
+                       className={`pill${fieldTab === key ? " active" : ""}`}
+                       onClick={() => setFieldTab(key)}>
+                    {label}{count != null ? ` (${count})` : ""}
+                  </div>
+                ))}
+              </div>
 
-              {fieldModal.data.lines.map((line, i) => (
-                <div key={`line-${i}`}>
-                  <h3>Purchase Line — {line.label}</h3>
-                  <DataTable columns={fieldCheckColumns}
-                             rows={line.fields.map((f) => ({ ...f, _key: f.field }))}
-                             searchKeys={["field"]} pageSize={50} empty="No line data." />
-                </div>
-              ))}
-              {!fieldModal.data.lines.length && (
-                <p className="hint">No Purchase Line rows saved for this invoice.</p>
+              {fieldTab === "header" && (
+                <DataTable columns={fieldCheckColumns}
+                           rows={fieldModal.data.header.map((f) => ({ ...f, _key: f.field }))}
+                           searchKeys={["field"]} pageSize={50} empty="No header data." />
               )}
 
-              {fieldModal.data.reservations.map((res, i) => (
-                <div key={`res-${i}`}>
-                  <h3>Reservation Entry — {res.label}</h3>
-                  <DataTable columns={fieldCheckColumns}
-                             rows={res.fields.map((f) => ({ ...f, _key: f.field }))}
-                             searchKeys={["field"]} pageSize={50} empty="No reservation data." />
-                </div>
-              ))}
+              {fieldTab === "lines" && (
+                <>
+                  {fieldModal.data.lines.map((line, i) => (
+                    <div key={`line-${i}`}>
+                      <h3 style={i === 0 ? { marginTop: 0 } : undefined}>Purchase Line — {line.label}</h3>
+                      <DataTable columns={fieldCheckColumns}
+                                 rows={line.fields.map((f) => ({ ...f, _key: f.field }))}
+                                 searchKeys={["field"]} pageSize={50} empty="No line data." />
+                    </div>
+                  ))}
+                  {!fieldModal.data.lines.length && (
+                    <p className="hint">No Purchase Line rows saved for this invoice.</p>
+                  )}
+                </>
+              )}
+
+              {fieldTab === "reservations" && !fieldModal.isService && (
+                <>
+                  {fieldModal.data.reservations.map((res, i) => (
+                    <div key={`res-${i}`}>
+                      <h3 style={i === 0 ? { marginTop: 0 } : undefined}>Reservation Entry — {res.label}</h3>
+                      <DataTable columns={fieldCheckColumns}
+                                 rows={res.fields.map((f) => ({ ...f, _key: f.field }))}
+                                 searchKeys={["field"]} pageSize={50} empty="No reservation data." />
+                    </div>
+                  ))}
+                  {!fieldModal.data.reservations.length && (
+                    <p className="hint">No Reservation Entry rows for this invoice.</p>
+                  )}
+                </>
+              )}
             </>
           )}
         </Modal>
       )}
 
-      {pdfFile && <PdfModal file={pdfFile} onClose={() => setPdfFile(null)} />}
+      {pdfFile && <PdfModal file={pdfFile.file} page={pdfFile.page} pageEnd={pdfFile.pageEnd} onClose={() => setPdfFile(null)} />}
     </div>
   );
 }

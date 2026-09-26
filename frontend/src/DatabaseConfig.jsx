@@ -6,7 +6,10 @@ import { PasswordInput } from "./components";
 // side-by-side layout.
 const stackStyle = { flexDirection: "column", alignItems: "stretch", maxWidth: 420, gap: 14 };
 
-export default function DatabaseConfig({ user }) {
+// `onSaved` is only passed by App.jsx's pre-login bootstrap screen (see
+// below) - shown when nothing is configured yet, so there's no user to be
+// logged in as. Normal post-login use (Setup menu) omits it.
+export default function DatabaseConfig({ user, onSaved }) {
   const [server, setServer] = useState("");
   const [database, setDatabase] = useState("");
   const [auth, setAuth] = useState("sql"); // sql | windows
@@ -46,6 +49,7 @@ export default function DatabaseConfig({ user }) {
       setPassword("");
       setPasswordSet(true);
       setMessage({ ok: true, text: "Connection tested and saved." });
+      if (onSaved) onSaved();
     } catch (e) {
       setMessage({ ok: false, text: e.message });
     } finally {
@@ -66,10 +70,15 @@ export default function DatabaseConfig({ user }) {
       <div className="card">
         <h3>Database configuration</h3>
         <p className="hint">
-          Point PIIPS at a SQL Server database. The connection string is stored
-          <b> encrypted</b> on the server and is never shown here in full.
-          Saving first <b>tests</b> the connection. Changing this affects the
-          whole application — an unreachable database will lock everyone out.
+          {onSaved
+            ? "No database is configured yet, so there's nothing to log into. "
+            : "Point PIIPS at a SQL Server database. "}
+          The connection string is stored <b>encrypted</b> on the server and
+          is never shown here in full. Saving first <b>tests</b> the
+          connection.
+          {onSaved
+            ? " Once it's saved, you'll be taken to the login screen."
+            : " Changing this affects the whole application — an unreachable database will lock everyone out."}
         </p>
 
         <div className="row" style={stackStyle}>

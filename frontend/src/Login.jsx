@@ -1,13 +1,21 @@
-import { useState } from "react";
-import { login } from "./api";
+import { useEffect, useState } from "react";
+import { login, getVersion } from "./api";
 import { Logo, PasswordInput } from "./components";
 
-export default function Login({ onSuccess, onForgot }) {
+// `onDbError` (from App.jsx) is called when login fails with a 5xx - a real
+// database/server problem, not just a wrong password (401) - so the user
+// is bounced back to Database Configuration instead of being stuck staring
+// at a login form that can never succeed.
+export default function Login({ onSuccess, onForgot, onDbError }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState(null);
   const [pasteBlocked, setPasteBlocked] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    getVersion().then((v) => setAppVersion(v.version)).catch(() => {});
+  }, []);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -16,6 +24,10 @@ export default function Login({ onSuccess, onForgot }) {
     try {
       onSuccess(await login(username.trim(), password));
     } catch (err) {
+      if (onDbError && err.status >= 500) {
+        onDbError();
+        return;
+      }
       setError(err.message);
     } finally {
       setBusy(false);
@@ -34,7 +46,9 @@ export default function Login({ onSuccess, onForgot }) {
           <Logo size={40} />
           <div className="auth-brand">PIIPS</div>
         </div>
-        <div className="auth-sub">Precision Intelligent Invoice Processing Suite</div>
+        <div className="auth-sub">
+          Precision Intelligent Invoice Processing Suite{appVersion ? ` v${appVersion}` : ""}
+        </div>
 
         <div className="field">
           <label className="label">User Name</label>
@@ -64,6 +78,10 @@ export default function Login({ onSuccess, onForgot }) {
 
         <div style={{ textAlign: "center", marginTop: 14 }}>
           <button type="button" className="btn-link" onClick={onForgot}>Forgot password?</button>
+        </div>
+
+        <div className="hint" style={{ textAlign: "center", marginTop: 20 }}>
+          © 2026 Precision Techserve Madras Pvt. Ltd. All Rights Reserved.
         </div>
       </form>
     </div>

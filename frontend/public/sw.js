@@ -3,8 +3,15 @@
 // always come from the network, since a stale cached response here could
 // show a wrong dashboard state or silently drop a change.
 
-const CACHE = "piips-shell-v1";
-const SHELL = ["/", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png", "/icon-maskable-512.png"];
+const CACHE = "piips-shell-v2";
+// "/" (index.html) is deliberately NOT precached/cache-first (see the fetch
+// handler below) - unlike the hashed JS/CSS it references, index.html's own
+// content changes every build (to point at that build's new hashes), so
+// cache-first here was serving an indefinitely stale shell - a rebuild
+// never took effect for an already-installed user until they manually
+// cleared site data, since the SAME cache name meant "activate" never saw
+// it as stale enough to evict.
+const SHELL = ["/manifest.webmanifest", "/icon-192.png", "/icon-512.png", "/icon-maskable-512.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -27,10 +34,28 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (url.pathname.startsWith("/api/")) return; // always network, never cached
 
-  // Cache-first for the built app shell (hashed JS/CSS filenames make this
-  // safe - a new build gets new filenames, so stale content is never served
-  // once the new index.html/manifest land), falling back to network and
-  // caching what comes back.
+  // Navigations (the "/" document itself) are network-first: always fetch
+  // the latest index.html (and cache it as the offline fallback) so a new
+  // build's hashed asset references take effect immediately for anyone
+  // online, instead of being stuck on whatever shell first got installed.
+  if (request.mode === "navigate") {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          if (response && response.ok) {
+            const copy = response.clone();
+            caches.open(CACHE).then((cache) => cache.put(request, copy));
+          }
+          return response;
+        })
+        .catch(() => caches.match(request))
+    );
+    return;
+  }
+
+  // Everything else (hashed /assets/*.js|css, icons, manifest) is safe to
+  // cache-first - a new build gets new filenames, so stale content is
+  // never served once a fresh index.html (above) starts referencing them.
   event.respondWith(
     caches.match(request).then((cached) => {
       if (cached) return cached;

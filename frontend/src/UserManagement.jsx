@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { getUsers, createUser, setUserActive, adminResetPassword } from "./api";
+import { getUsers, createUser, setUserActive, adminResetPassword, adminChangeUserType } from "./api";
 import { DataTable, confirmDialog, PasswordInput } from "./components";
 
 // Fields stacked vertically instead of the shared ".row"'s default
@@ -10,14 +10,24 @@ const stackStyle = { flexDirection: "column", alignItems: "stretch", maxWidth: 4
 export default function UserManagement({ user }) {
   const [users, setUsers] = useState([]);
   const [types, setTypes] = useState([]);
-  const [form, setForm] = useState({ username: "", email: "", user_type_id: "" });
+  const [form, setForm] = useState({ username: "", email: "", user_type_id: "", password: "" });
   const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(true);
   const [assignPw, setAssignPw] = useState({ target_user_id: "", next: "", confirm: "" });
   const [assignPwMsg, setAssignPwMsg] = useState(null);
   const [assignPwBusy, setAssignPwBusy] = useState(false);
+  const [typeEdits, setTypeEdits] = useState({});   // user_id -> pending selected type id
+  const [typeBusyId, setTypeBusyId] = useState(null);
 
   const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
+
+  // A Viewer account is set up directly by a Super Admin with a chosen
+  // password (no email, no auto-generated temp password - see app.py's
+  // api_create_user) instead of the normal emailed-temp-password flow
+  // every other type uses, so the form below swaps Email for Password
+  // when this type is selected.
+  const isViewerType = (types.find((t) => String(t.id) === String(form.user_type_id))?.name || "")
+    .trim().toLowerCase() === "viewer";
 
   const refresh = () =>
     getUsers()
@@ -38,9 +48,15 @@ export default function UserManagement({ user }) {
   const onCreate = async () => {
     setMessage(null);
     try {
-      const r = await createUser(form.username.trim(), form.email.trim(), Number(form.user_type_id), user?.user_id);
-      setMessage({ ok: true, text: `User "${form.username.trim()}" created. A temporary password was emailed to them.${emailNote(r)}` });
-      setForm({ username: "", email: "", user_type_id: types[0]?.id ?? "" });
+      const r = await createUser(
+        form.username.trim(), form.email.trim(), Number(form.user_type_id), user?.user_id,
+        isViewerType ? form.password : undefined,
+      );
+      const text = isViewerType
+        ? `User "${form.username.trim()}" created with the password you set.`
+        : `User "${form.username.trim()}" created. Their initial password is their username - they must change it at first login.${emailNote(r)}`;
+      setMessage({ ok: true, text });
+      setForm({ username: "", email: "", user_type_id: types[0]?.id ?? "", password: "" });
       refresh();
     } catch (e) { setMessage({ ok: false, text: e.message }); }
   };
@@ -59,13 +75,13 @@ export default function UserManagement({ user }) {
   };
 
   const resetPw = async (u) => {
-    const ok = await confirmDialog(`Send "${u.UserName}" a new auto-generated password by email?`, {
-      confirmLabel: "Send password",
+    const ok = await confirmDialog(`Reset "${u.UserName}" to the initial password (their username)? They must change it at next login.`, {
+      confirmLabel: "Reset password",
     });
     if (!ok) return;
     try {
       const r = await adminResetPassword(user?.user_id, u.UserId);
-      setMessage({ ok: true, text: `New password emailed to "${u.UserName}".${emailNote(r)}` });
+      setMessage({ ok: true, text: `"${u.UserName}" reset - the password is now their username; they must change it at next login.${emailNote(r)}` });
     } catch (e) { setMessage({ ok: false, text: e.message }); }
   };
 
@@ -80,9 +96,31 @@ export default function UserManagement({ user }) {
   };
 
   const assignableUsers = useMemo(
-    () => users.filter((u) => u.IsActive && canAssignFor(u)),
+    // A Super Admin can set a password for ANY user (Sadmin's own is fixed).
+    () => users.filter((u) => (isSuperAdmin ? u.UserName !== "Sadmin" : u.IsActive) && canAssignFor(u)),
     [users, isSuperAdmin, user]
   );
+
+  // Same rule as canAssignFor, applied to the role being ASSIGNED rather
+  // than who it's assigned to: an Admin may only hand out the plain
+  // User/Accounts role - never promote someone to Admin/Super Admin.
+  // Mirrors /api/users/change-type's own check (the real enforcement).
+  const assignableTypes = isSuperAdmin
+    ? types
+    : types.filter((t) => ["user", "accounts"].includes((t.name || "").toLowerCase()));
+
+  const saveType = async (u) => {
+    const newTypeId = Number(typeEdits[u.UserId]);
+    if (!newTypeId || newTypeId === u.UserTypeID) return;
+    setTypeBusyId(u.UserId);
+    try {
+      const r = await adminChangeUserType(user?.user_id, u.UserId, newTypeId);
+      setMessage({ ok: true, text: `"${u.UserName}" is now ${r.user_type_name}.` });
+      setTypeEdits((s) => { const n = { ...s }; delete n[u.UserId]; return n; });
+      refresh();
+    } catch (e) { setMessage({ ok: false, text: e.message }); }
+    finally { setTypeBusyId(null); }
+  };
 
   const onAssignPw = async (e) => {
     e.preventDefault();
@@ -92,7 +130,7 @@ export default function UserManagement({ user }) {
     setAssignPwBusy(true);
     try {
       const r = await adminResetPassword(user?.user_id, Number(assignPw.target_user_id), assignPw.next);
-      setAssignPwMsg({ ok: true, text: `Password updated for "${target?.UserName}" and emailed to them.${emailNote(r)}` });
+      setAssignPwMsg({ ok: true, text: `Password updated for "${target?.UserName}".${emailNote(r)}` });
       setAssignPw({ target_user_id: "", next: "", confirm: "" });
     } catch (e) { setAssignPwMsg({ ok: false, text: e.message }); }
     finally { setAssignPwBusy(false); }
@@ -108,7 +146,8 @@ export default function UserManagement({ user }) {
           Assign a new password for another user — {isSuperAdmin
             ? "as Super Admin you can select any user."
             : "you can select any User/Accounts account (not yourself, another Admin, or a Super Admin)."}
-          {" "}The new password is emailed to them and they must set their own on next login.
+          {isSuperAdmin ? " Any password is accepted for any user; it is emailed to them (if they have an email) and they must set their own on next login (a Viewer keeps it)."
+            : " The new password is emailed to them and they must set their own on next login."}
         </p>
         <form className="row" style={stackStyle} onSubmit={onAssignPw}>
           <div className="field">
@@ -139,9 +178,9 @@ export default function UserManagement({ user }) {
       <div className="card">
         <h3>Add user</h3>
         <p className="hint">
-          A temporary password is generated automatically and emailed to the
-          address below — the admin never sets a password directly. The user
-          is required to set their own password the first time they log in.
+          {isViewerType
+            ? "A Viewer account is read-only, so it's set up directly here with a password of your choosing instead of an emailed temporary one — no email address is needed."
+            : "The initial password is the same as the username. The user is required to set their own password the first time they log in."}
         </p>
         <div className="row" style={stackStyle}>
           <div className="field">
@@ -152,19 +191,28 @@ export default function UserManagement({ user }) {
             </div>
           </div>
           <div className="field">
-            <label className="label">Email</label>
-            <div className="input-group">
-              <span className="ico">✉</span>
-              <input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="name@precisionit.co.in" />
-            </div>
-          </div>
-          <div className="field">
             <label className="label">User Type</label>
-            <select value={form.user_type_id} onChange={(e) => setForm({ ...form, user_type_id: e.target.value })}>
+            <select value={form.user_type_id} onChange={(e) => setForm({ ...form, user_type_id: e.target.value, password: "" })}>
               {types.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
             </select>
           </div>
-          <button className="btn btn-primary" onClick={onCreate} disabled={!form.username.trim() || !form.email.trim()} style={{ alignSelf: "flex-start" }}>✚ Create user</button>
+          {isViewerType ? (
+            <div className="field">
+              <label className="label">Password</label>
+              <PasswordInput value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="Password" />
+            </div>
+          ) : (
+            <div className="field">
+              <label className="label">Email</label>
+              <div className="input-group">
+                <span className="ico">✉</span>
+                <input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="name@precisionit.co.in" />
+              </div>
+            </div>
+          )}
+          <button className="btn btn-primary" onClick={onCreate}
+                  disabled={!form.username.trim() || (isViewerType ? !form.password : !form.email.trim())}
+                  style={{ alignSelf: "flex-start" }}>✚ Create user</button>
         </div>
         {message && <div className={`alert ${message.ok ? "alert-success" : "alert-danger"}`}>{message.text}</div>}
       </div>
@@ -175,6 +223,7 @@ export default function UserManagement({ user }) {
           rows={users.map((u) => ({
             _key: u.UserId, user: u.UserName, type: u.UserTypeName || u.UserTypeID,
             email: u.Email || "—",
+            password: u.MustChangePassword ? u.UserName : "",
             active: u.IsActive ? "Active" : "Inactive", created: u.CreatedDatetime || "—", _u: u,
           }))}
           searchKeys={["user", "type", "email", "active", "created"]}
@@ -182,7 +231,32 @@ export default function UserManagement({ user }) {
           columns={[
             { key: "user", label: "User" },
             { key: "email", label: "Email" },
-            { key: "type", label: "Type" },
+            { key: "password", label: "Password", sortable: false,
+              render: (r) => r._u.MustChangePassword
+                ? <span title="First login pending - the initial password is the username, and must be changed at first login">
+                    <code>{r._u.UserName}</code> <span className="hint">(initial - change pending)</span>
+                  </span>
+                : <span className="hint" title="Passwords are stored one-way encrypted; the user chose this one">set by the user</span> },
+            { key: "type", label: "Type", sortable: false,
+              render: (r) => {
+                if (!canAssignFor(r._u)) return r.type;
+                const pending = typeEdits[r._u.UserId];
+                const changed = pending !== undefined && Number(pending) !== r._u.UserTypeID;
+                return (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <select value={pending ?? r._u.UserTypeID}
+                            onChange={(e) => setTypeEdits((s) => ({ ...s, [r._u.UserId]: e.target.value }))}>
+                      {assignableTypes.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+                    </select>
+                    {changed && (
+                      <button className="btn btn-sm btn-primary" disabled={typeBusyId === r._u.UserId}
+                              onClick={() => saveType(r._u)}>
+                        {typeBusyId === r._u.UserId ? "Saving…" : "Save"}
+                      </button>
+                    )}
+                  </div>
+                );
+              } },
             { key: "active", label: "Status",
               render: (r) => <span className={`badge ${r._u.IsActive ? "badge-success" : "badge-danger"}`}>{r.active}</span> },
             { key: "created", label: "Created" },
@@ -205,7 +279,7 @@ export default function UserManagement({ user }) {
                             : undefined}>
                     {r._u.IsActive ? "Inactivate" : "Give access"}
                   </button>
-                  {canAssignFor(r._u) && (
+                  {canAssignFor(r._u) && r._u.UserName !== "Sadmin" && (
                     <button className="btn btn-sm btn-subtle" onClick={() => resetPw(r._u)}>
                       Reset password
                     </button>

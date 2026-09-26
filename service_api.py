@@ -36,6 +36,8 @@ _session = requests.Session()
 
 _SPARE_PATH = "/api/purchase/GetSparePurchaseItem"
 _HSN_PATH = "/api/Purchase/GetHSNDetails"
+_MISMATCH_PATH = "/api/Purchase/GetPurchaseLineSpecificationMismatchRecord"
+_UPDATE_DESC_PATH = "/api/Purchase/UpdateInvoiceDescriptionInPurchaseLine"
 
 _TIMEOUT = 60
 
@@ -74,9 +76,28 @@ def _description_mismatch(nav_desc, pdf_desc):
 # Backend calls
 # ---------------------------------------------------------------------------
 
+# A single combined call covering a whole processing run's worth of POs/
+# items (as designed - see fetch_sf_batch) can run into the hundreds of
+# entries for a large run, and this backend times out or 500s on a
+# request that big well within the 60s timeout - confirmed directly
+# against the real API. Worse, get_spare_purchase_items/get_hsn_details
+# used to fail the ENTIRE request as one unit, so one slow/oversized call
+# wiped out matches for every invoice in the run, not just the
+# ones that were actually the problem. Chunking keeps each HTTP call
+# small enough to reliably succeed, and a chunk that still fails only
+# costs that chunk's own items - not everyone else's.
+_CHUNK_SIZE = 25
+
+
+def _chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def get_spare_purchase_items(order_numbers):
     """{order_no_lower: [reservation_row, ...]} for the given PO numbers.
-    Returns {} on any error or when no API URL is configured.
+    A chunk that errors is skipped (logged, not raised) so the rest of a
+    large run's chunks still get their real answer.
     Sample: get_spare_purchase_items(['SPRPUR/2026/04/27-83650'])"""
     base = _base_url()
     if not base:
@@ -89,63 +110,126 @@ def get_spare_purchase_items(order_numbers):
     if not payload:
         return {}
 
-    try:
-        resp = _session.post(base + _SPARE_PATH, json=payload, timeout=_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001 - backend optional
-        print(f"Spare purchase API error: {exc}")
-        return {}
-
-    if isinstance(data, dict):
-        rows = data.get("result", data)
-    else:
-        rows = data
-    if not isinstance(rows, list):
-        return {}
-
     grouped = {}
-    for row in rows:
-        if isinstance(row, dict):
-            key = _clean(row.get("SpareRequestOrderNumber"))
-            if key:
-                grouped.setdefault(key, []).append(row)
+    for chunk in _chunked(payload, _CHUNK_SIZE):
+        try:
+            # GetSparePurchaseItem's [HttpGet] controller still expects a
+            # JSON body (same shape as GetHSNDetails/GetPurchaseLineSpecific-
+            # ationMismatchRecord) - a POST now gets 405 (Allow: GET).
+            resp = _session.get(base + _SPARE_PATH, json=chunk, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001 - backend optional
+            print(f"Spare purchase API error (chunk of {len(chunk)}): {exc}")
+            continue
+
+        rows = data.get("result", data) if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict):
+                key = _clean(row.get("SpareRequestOrderNumber"))
+                if key:
+                    grouped.setdefault(key, []).append(row)
     return grouped
 
 
 def get_hsn_details(hsn_items):
-    """{(po_lower, part_lower): row} of HSN/item-master details. Returns {}
-    on error or when no API URL is configured.
+    """{(po_lower, part_lower): row} of HSN/item-master details. A chunk
+    that errors is skipped (logged, not raised) so the rest of a large
+    run's chunks still get their real answer.
     Sample: get_hsn_details([{'PartSpecification': 'Oil Filter', 'PurchaseOrderNo': 'SPRPUR/2026/04/27-83650'}])"""
     base = _base_url()
     if not base or not hsn_items:
         return {}
 
-    try:
-        resp = _session.post(base + _HSN_PATH, json=hsn_items, timeout=_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001 - backend optional
-        print(f"HSN details API error: {exc}")
-        return {}
-
-    if isinstance(data, dict):
-        rows = (data.get("PartViewModelList") or data.get("Data")
-                or data.get("Items") or [])
-    elif isinstance(data, list):
-        rows = data
-    else:
-        rows = []
-
     hsn_map = {}
-    for row in rows:
-        if not isinstance(row, dict):
+    for chunk in _chunked(hsn_items, _CHUNK_SIZE):
+        try:
+            # GetHSNDetails' controller is now [HttpGet] too - still expects
+            # a JSON body; a POST now gets 405 (Allow: GET).
+            resp = _session.get(base + _HSN_PATH, json=chunk, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001 - backend optional
+            print(f"HSN details API error (chunk of {len(chunk)}): {exc}")
             continue
-        po = _clean(row.get("PurchaseOrderNo"))
-        part = _clean(row.get("PartSpecification"))
-        if po and part:
-            hsn_map[(po, part)] = row
+
+        if isinstance(data, dict):
+            rows = (data.get("PartViewModelList") or data.get("Data")
+                    or data.get("Items") or [])
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            po = _clean(row.get("PurchaseOrderNo"))
+            part = _clean(row.get("PartSpecification"))
+            if po and part:
+                hsn_map[(po, part)] = row
     return hsn_map
+
+
+def get_specification_mismatch_records(order_numbers):
+    """List of Service First purchase-line records (SpareRequestID,
+    PurchaseOrderNo, PartID, PartNo, PartSpecification, UnitPrice, UnitTotal,
+    Nav_Part_Description) for the given Purchase Order numbers -
+    GetPurchaseLineSpecificationMismatchRecord, for the Part Description
+    Update menu (lets a user compare Service First's own item-master
+    description against what's on the invoice). A chunk that errors is
+    skipped (logged, not raised) so the rest of a large run's chunks still
+    get their real answer.
+    Sample: get_specification_mismatch_records(['SPRPUR/2026/04/27-83650'])"""
+    base = _base_url()
+    order_numbers = [str(n).strip() for n in (order_numbers or []) if n and str(n).strip()]
+    if not base or not order_numbers:
+        return []
+
+    payload = [{"PurchaseOrderNo": n} for n in order_numbers]
+    records = []
+    for chunk in _chunked(payload, _CHUNK_SIZE):
+        try:
+            # Unlike GetSparePurchaseItem/GetHSNDetails (POST), this endpoint
+            # is a GET that still expects a JSON body - confirmed live: POST
+            # returns 405 (Allow: GET), a bodyless GET returns 415, and GET
+            # with a JSON body returns 200 with real rows.
+            resp = _session.get(base + _MISMATCH_PATH, json=chunk, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001 - backend optional
+            print(f"Specification mismatch API error (chunk of {len(chunk)}): {exc}")
+            continue
+
+        if isinstance(data, dict):
+            rows = (data.get("PartViewModelList") or data.get("Data")
+                    or data.get("Items") or data.get("result") or [])
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
+        records.extend(row for row in rows if isinstance(row, dict))
+    return records
+
+
+def update_invoice_description(part_no_map_id, nav_part_description):
+    """Push a corrected Nav_Part_Description back to Service First for one
+    part - UpdateInvoiceDescriptionInPurchaseLine, the Part Description
+    Mapping screen's Update button. A genuine POST (confirmed live), taking
+    a single PartViewModel object (not a PartViewModelCollection/list like
+    the three GET-with-a-JSON-body endpoints) and returning {"status": int}
+    rather than echoing the model back. `part_no_map_id` is
+    stores_SparePurchaseLine.PartNoMapID (a GetPurchaseLineSpecification-
+    MismatchRecord row's own "PartNoMapID" field - NOT its "PartID").
+    Sample: update_invoice_description(126823, '8GB 1Rx16 DDR4 3200 LAPTOP RAM')"""
+    base = _base_url()
+    if not base:
+        raise RuntimeError("Service First API URL is not configured")
+    payload = {"PartNoMapID": part_no_map_id, "Nav_Part_Description": nav_part_description}
+    resp = _session.post(base + _UPDATE_DESC_PATH, json=payload, timeout=_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def apply_sf_item_defaults(rows):
@@ -205,10 +289,8 @@ def _apply_hsn_map(data, order_no, hsn_map):
     # placeholder standing in for an unconfirmed match.
     sf_active = bool(_base_url())
     items = data.get("items", []) or []
-    for item in items:
-        if item.get("_charge"):
-            continue
-        info = hsn_map.get((_clean(order_no), _clean(item.get("Description"))))
+
+    def _apply_info(item, info):
         # GetHSNDetails is the authoritative item-master lookup: no match at
         # all, or a match whose own Nav_Item_No is blank, means SF doesn't
         # recognize this line's description -> flag it as a new template
@@ -222,7 +304,7 @@ def _apply_hsn_map(data, order_no, hsn_map):
             # blank it so a saved No. always means SF actually confirmed it.
             item["ProductNo"] = ""
         if not info:
-            continue
+            return
         # Only overwrite a field when SF actually has a value for it — an SF
         # match whose own record is missing a piece (no code, no tax rate,
         # ...) must not blank out what build_invoice_json/the PDF already
@@ -244,6 +326,47 @@ def _apply_hsn_map(data, order_no, hsn_map):
         if info.get("TaxPercentage"):
             item["TaxPercentage"] = info["TaxPercentage"]
             item["GST_%"] = info["TaxPercentage"]
+
+    for item in items:
+        if item.get("_charge"):
+            continue
+        info = hsn_map.get((_clean(order_no), _clean(item.get("Description"))))
+        _apply_info(item, info)
+
+    # A vendor can print the SAME physical part twice on one PO as separate
+    # serialized units (e.g. "18.5 LED MONITOR ... RAA06UW05165" / "...
+    # RAA06UW05168", two individual monitors) - PIIPS keeps these as two
+    # Purchase Lines (each its own serial), but Service First tracks
+    # purchasing demand by PART, not by serial, so it only ever has ONE
+    # record - and one Nav_Part_Description - covering both. Whichever
+    # unit's own PDF text doesn't happen to equal that one confirmed string
+    # can never get its own GetHSNDetails match by exact text, no matter how
+    # many times a description gets "confirmed" on Part Description Mapping
+    # - only one sibling's text can ever be the confirmed one at a time. A
+    # sibling on the same PO sharing the same HSN/SAC code (the PDF's own
+    # stated code - reliable even before any match exists) and the same
+    # Rate is, in practice, the same generic part: inherit its resolved
+    # Nav Item No/HSN data too, instead of staying permanently unmatched.
+    for item in items:
+        if item.get("_charge") or not item.get("_hsn_nav_item_no_missing"):
+            continue
+        hsn = str(item.get("hsn") or "").strip()
+        if not hsn:
+            continue
+        sibling = next(
+            (
+                other for other in items
+                if other is not item and not other.get("_charge")
+                and not other.get("_hsn_nav_item_no_missing")
+                and str(other.get("hsn") or "").strip() == hsn
+                and other.get("rate") == item.get("rate")
+            ),
+            None,
+        )
+        if sibling is None:
+            continue
+        info = hsn_map.get((_clean(order_no), _clean(sibling.get("Description"))))
+        _apply_info(item, info)
 
 
 # ---------------------------------------------------------------------------
@@ -343,16 +466,34 @@ def _apply_sf_to_invoice(data, order_no, rows, hsn_map):
         # Reservation Entry.Source Ref. No. = Purchase Line.Line No. for
         # the matching Item No./No. (join key: Nav_Item_No). Preferred
         # match: by Nav_Item_No, when the HSN lookup above resolved it.
+        # Queued (not a plain {key: item} dict) because two DIFFERENT
+        # Purchase Lines can share the same Nav_Item_No - the same physical
+        # part printed as separate serialized units on one PO (see
+        # _apply_hsn_map's sibling fallback just above) - a plain dict would
+        # let the SECOND item silently overwrite the first, so every
+        # matching SF row ends up attributed to just the LAST such line,
+        # leaving the other(s) with no reservation at all even though they
+        # were just as genuinely received. Each item queues once per its own
+        # Quantity (a single line with Quantity > 1 needs that many
+        # reservation rows too), and every incoming SF row for that key
+        # claims the next queued slot in line order.
         items = [it for it in data.get("items", []) if not it.get("_charge")]
-        by_nav = {
-            _clean(it.get("Nav_Item_No")): it
-            for it in items if _clean(it.get("Nav_Item_No"))
-        }
+        by_nav = {}
+        for it in items:
+            key = _clean(it.get("Nav_Item_No"))
+            if not key:
+                continue
+            try:
+                qty = max(1, int(float(it.get("Quantity") or 1)))
+            except (TypeError, ValueError):
+                qty = 1
+            by_nav.setdefault(key, []).extend([it] * qty)
         matched = set()
         for sf in rows:
             key = _clean(sf.get("Nav_Item_No"))
-            it = by_nav.get(key)
-            if it is not None:
+            queue = by_nav.get(key)
+            if queue:
+                it = queue.pop(0)
                 sf["Line_No"] = it.get("Line_No", "")
                 matched.add(id(it))
 
@@ -413,11 +554,11 @@ def evaluate_invoice(data):
         return {"status": status, "is_active": False, "is_synced": is_synced,
                 "errors": [reason], "reason": reason}
 
-    # 16 — seller GSTIN could not be captured from the PDF.
-    if not seller_gst:
-        return fail("seller gst could nt be captured")
-
-    # 8 — no Buyer's Order No. on the PDF (nothing to look up in SF).
+    # 8 — no Buyer's Order No. on the PDF (nothing to look up in SF). Checked
+    # BEFORE the seller GSTIN: a missing PO has its own manual-entry workflow
+    # (Buyer Order Entry), so an invoice lacking one lands there even when the
+    # vendor also has no readable GSTIN, instead of being parked under a
+    # provisional status the final completeness gate turns into DATA MISMATCH.
     if not order_no:
         return fail("Buyer order no is empty in pdf", status="BUYER ORDER NO DOESN'T EXIST")
 
@@ -427,6 +568,10 @@ def evaluate_invoice(data):
     if data.get("buyer_order_doubtful"):
         return fail("Buyer order no format is doubtful — please verify",
                     status="BUYER ORDER NO DOESN'T EXIST")
+
+    # 16 — seller GSTIN could not be captured from the PDF.
+    if not seller_gst:
+        return fail("seller gst could nt be captured")
 
     # Service-First-dependent checks (only when the backend is configured).
     if _base_url():

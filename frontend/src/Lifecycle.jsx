@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { getLifecycleInvoices, advanceLifecycle } from "./api";
-import { DataTable, PdfModal } from "./components";
+import { getLifecycleInvoices, advanceLifecycle, rejectInvoice } from "./api";
+import { DataTable, PdfModal, Modal } from "./components";
 
 // Load / Post / Complete lifecycle page (one component, parameterised by
 // `stage`). Lists invoices at the stage's source status(es); the user selects
@@ -14,6 +14,11 @@ const STAGES = {
 
 export default function Lifecycle({ user, stage }) {
   const cfg = STAGES[stage] || STAGES.load;
+  const canPostOrReject = ["accounts", "admin", "super admin"]
+    .includes((user?.user_type || "").toLowerCase());
+  // Posting and rejecting are Accounts/Admin/Super Admin only; Load and
+  // Complete stay open to everyone.
+  const canAct = stage !== "post" || canPostOrReject;
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -22,6 +27,10 @@ export default function Lifecycle({ user, stage }) {
   const [batchFilter, setBatchFilter] = useState("");
   const [advancing, setAdvancing] = useState(false);
   const [pdfFile, setPdfFile] = useState(null);
+  const [rejectTarget, setRejectTarget] = useState(null); // row being rejected
+  const [rejectRemark, setRejectRemark] = useState("");
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectError, setRejectError] = useState(null);
 
   const load = () => {
     setLoading(true); setError(null); setSelected({});
@@ -37,10 +46,14 @@ export default function Lifecycle({ user, stage }) {
     () => Array.from(new Set(rows.map((r) => r.batch).filter(Boolean))).sort(),
     [rows]);
 
-  // Batch filter = "batch-wise" selection: narrow the visible rows to a batch.
-  const visible = useMemo(
-    () => (batchFilter ? rows.filter((r) => r.batch === batchFilter) : rows),
-    [rows, batchFilter]);
+  // Load has no batch filter - it only ever shows invoices that already
+  // have a real Navision Document No. (minted at Excel-download time, see
+  // database._assign_document_numbers), so there's nothing un-downloaded
+  // to filter out by batch in the first place.
+  const visible = useMemo(() => {
+    if (stage === "load") return rows.filter((r) => r.navision_doc_no);
+    return batchFilter ? rows.filter((r) => r.batch === batchFilter) : rows;
+  }, [rows, batchFilter, stage]);
 
   const selectedIds = Object.keys(selected).filter((k) => selected[k]).map(Number);
   const allVisibleSelected = visible.length > 0 && visible.every((r) => selected[r.header_id]);
@@ -57,10 +70,34 @@ export default function Lifecycle({ user, stage }) {
     setAdvancing(true); setError(null); setMsg(null);
     try {
       const r = await advanceLifecycle(stage, selectedIds, user?.user_id);
-      setMsg(`${r.count} invoice(s) → ${r.to}.`);
+      const dupes = r.duplicate_no || [];
+      if (dupes.length) {
+        const list = dupes.map((d) => d.no).join(", ");
+        setError(
+          `${dupes.length} invoice(s) blocked - Document No. already in use: ${list}. `
+          + "Resolve the duplicate (re-download with a fresh number) before loading."
+        );
+      }
+      if (r.count) setMsg(`${r.count} invoice(s) → ${r.to}.`);
       load();
     } catch (e) { setError(e.message); }
     finally { setAdvancing(false); }
+  };
+
+  const openReject = (row) => {
+    setRejectTarget(row); setRejectRemark(""); setRejectError(null);
+  };
+
+  const submitReject = async () => {
+    if (!rejectRemark.trim()) { setRejectError("A remark is required."); return; }
+    setRejecting(true); setRejectError(null);
+    try {
+      await rejectInvoice(rejectTarget.header_id, rejectRemark.trim(), user?.user_id);
+      setRejectTarget(null);
+      setMsg(`${rejectTarget.invoice_no || rejectTarget.file_name} → REJECTED BY ACCOUNTS.`);
+      load();
+    } catch (e) { setRejectError(e.message); }
+    finally { setRejecting(false); }
   };
 
   const invoiceCell = (row) => (
@@ -84,10 +121,26 @@ export default function Lifecycle({ user, stage }) {
                onChange={() => setSelected((s) => ({ ...s, [row.header_id]: !s[row.header_id] }))} />
       ) },
     { key: "invoice_no", label: "Invoice No.", render: invoiceCell },
+    ...((stage === "load" || stage === "post") ? [{
+      key: "doc_date", label: "Document Date",
+      render: (row) => row.doc_date || "—",
+    }] : []),
+    { key: "navision_doc_no", label: "Navision Document No.",
+      render: (row) => row.navision_doc_no || "—" },
     { key: "file_name", label: "File" },
     { key: "vendor", label: "Vendor" },
     { key: "status", label: "Status" },
     { key: "batch", label: "Batch" },
+    { key: "reject_remark", label: "Reject Remark",
+      render: (row) => row.reject_remark || "—" },
+    ...(stage === "post" && canPostOrReject ? [{
+      key: "_reject", sortable: false, label: "",
+      render: (row) => (
+        <button className="btn btn-danger btn-sm" onClick={() => openReject(row)}>
+          ✕ Reject
+        </button>
+      ),
+    }] : []),
   ];
 
   return (
@@ -99,24 +152,32 @@ export default function Lifecycle({ user, stage }) {
           <button className="btn btn-subtle btn-sm" onClick={load}>Refresh</button>
         </div>
         <p className="hint" style={{ marginTop: 0 }}>
-          Select invoices (individually or filter by batch) and {cfg.action.toLowerCase()}.
+          {stage === "load"
+            ? "Only invoices with a Navision Document No. (already downloaded) are shown. Select invoices and mark as loaded."
+            : `Select invoices and ${cfg.action.toLowerCase()}.`}
         </p>
 
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
-          <label className="muted" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
-            Batch
-            <select className="input" style={{ width: "auto" }} value={batchFilter}
-                    onChange={(e) => setBatchFilter(e.target.value)}>
-              <option value="">All batches</option>
-              {batches.map((b) => <option key={b} value={b}>{b}</option>)}
-            </select>
-          </label>
+          {stage !== "load" && stage !== "post" && (
+            <label className="muted" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+              Batch
+              <select className="input" style={{ width: "auto" }} value={batchFilter}
+                      onChange={(e) => setBatchFilter(e.target.value)}>
+                <option value="">All batches</option>
+                {batches.map((b) => <option key={b} value={b}>{b}</option>)}
+              </select>
+            </label>
+          )}
           <div style={{ flex: 1 }} />
           <span className="muted" style={{ fontSize: 13 }}>{selectedIds.length} selected</span>
-          <button className="btn btn-primary" disabled={advancing || !selectedIds.length}
-                  onClick={advance}>
-            {advancing ? "Working…" : cfg.action}
-          </button>
+          {canAct ? (
+            <button className="btn btn-primary" disabled={advancing || !selectedIds.length}
+                    onClick={advance}>
+              {advancing ? "Working…" : cfg.action}
+            </button>
+          ) : (
+            <span className="muted" style={{ fontSize: 13 }}>Accounts, Admin, or Super Admin access required to post.</span>
+          )}
         </div>
 
         {error && <div className="alert alert-danger" style={{ marginBottom: 12 }}>{error}</div>}
@@ -124,12 +185,35 @@ export default function Lifecycle({ user, stage }) {
 
         {loading ? <div className="empty">Loading…</div> : (
           <DataTable columns={columns} rows={visible.map((r) => ({ ...r, _key: r.header_id }))}
-                     searchKeys={["invoice_no", "file_name", "vendor", "batch", "status"]}
+                     searchKeys={["invoice_no", "navision_doc_no", "file_name", "vendor", "batch", "status"]}
                      pageSizeOptions={[10, 20, 30, "all"]}
                      empty="No invoices are eligible for this step." />
         )}
       </div>
       {pdfFile && <PdfModal file={pdfFile} onClose={() => setPdfFile(null)} />}
+      {rejectTarget && (
+        <Modal title={`Reject ${rejectTarget.invoice_no || rejectTarget.file_name}`}
+               onClose={() => (!rejecting && setRejectTarget(null))} width={480}>
+          <p className="hint" style={{ marginTop: 0 }}>
+            This invoice moves back to REJECTED BY ACCOUNTS and reappears on the Load page.
+          </p>
+          <div className="field">
+            <label className="label">Remark</label>
+            <textarea className="input" rows={4} value={rejectRemark}
+                      onChange={(e) => setRejectRemark(e.target.value)}
+                      placeholder="Why is this invoice being rejected?" autoFocus />
+          </div>
+          {rejectError && <div className="alert alert-danger" style={{ marginBottom: 12 }}>{rejectError}</div>}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+            <button className="btn btn-subtle" disabled={rejecting}
+                    onClick={() => setRejectTarget(null)}>Cancel</button>
+            <button className="btn btn-danger" disabled={rejecting || !rejectRemark.trim()}
+                    onClick={submitReject}>
+              {rejecting ? "Rejecting…" : "Reject"}
+            </button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

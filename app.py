@@ -1,32 +1,58 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import os
+import re
 import shutil
+import threading
+import traceback
 import uuid
 from datetime import datetime
+from urllib.parse import quote
 
 import config_store
+import security
 from processor import job_manager
 from format_model import FormatModel
 
 ACCEPTED_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 
+# The interactive API docs / OpenAPI schema are switched off: they publish
+# every route (including the admin ones) to anyone who can reach the site.
 app = FastAPI(
     title="Precision Intelligent Invoice Processing Suite",
-    version="2.1"
+    version="2.3",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
-# Allow the React frontend (dev server / other origin) to call the API.
+# Explicit origin allow-list: the local Vite dev server, plus the real
+# live (piips.precisionit.co.in:8010) and uat (10.0.1.210:8080)
+# deployments. allow_credentials is deliberately False: nothing in
+# api.js's fetch() calls ever sends credentials cross-origin (no
+# `credentials: "include"` anywhere - auth here is just a user_id in the
+# request body/query, not a cookie/session), so allow_origins=["*"] +
+# allow_credentials=True was a spec-disallowed combination protecting
+# nothing.
+# Token authentication + role/menu authorisation for every /api route (see
+# security.py). Added BEFORE CORS so CORS stays outermost and answers
+# preflights / decorates 401-403 responses itself.
+app.add_middleware(security.AuthMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:5173", "http://localhost:3000",
+        "https://piips.precisionit.co.in:8010",
+        "http://10.0.1.210:8080",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -43,22 +69,239 @@ def _bootstrap_menu_storage():
     import traceback
     try:
         import config_store
-        # Encrypt any legacy plaintext connection string in config.json.
-        config_store.ensure_secret_encrypted()
+        # Decrypt any legacy DPAPI-protected connection string in
+        # config.json back to plain text (db_connection is human-readable
+        # now - see config_store.save_config).
+        config_store.ensure_secret_plaintext()
 
         import database
         if (config_store.load_config().get("db_connection") or "").strip():
             database.migrate_menu_json(BASE_DIR)
             database.migrate_template_invoice_type()
+            database.migrate_line_type_to_template()
             database.init_mail_settings_table()
             database.ensure_default_super_admin()
+            database.ensure_default_viewer()
     except Exception:  # noqa: BLE001 - never block startup on DB issues
+        traceback.print_exc()
+
+
+@app.on_event("startup")
+def _warm_extraction_pool():
+    """Start the parallel-extraction worker processes in the background so
+    the first Start click isn't slowed by their ~30 s OCR-engine load."""
+    threading.Thread(target=job_manager.warm_pool, daemon=True).start()
+
+
+@app.on_event("startup")
+def _run_part_description_migration():
+    """Kicks off _run_part_description_migration_impl() in the background
+    (see its own docstring) - a startup event handler blocks the app from
+    ever becoming ready to serve requests until every handler returns, and
+    on a real live database this can mean re-OCRing a real number of PDFs
+    (each easily 10-40s for a scanned one) - left synchronous, a slow host-
+    level startup timeout could kill the process before it ever finishes,
+    over and over, without ever reaching the point where it marks itself
+    done (see _warm_extraction_pool just above for the same reasoning)."""
+    threading.Thread(target=_run_part_description_migration_impl, daemon=True).start()
+
+
+def _run_part_description_migration_impl():
+    """One-time data-quality migration, NOT a general cleanup: older
+    ocr_engine.py extraction bugs (now fixed - see EXCLUDE_KW's hsn/sac,
+    way bill, net amount, bank name, beneficiary, account no, ifsc code,
+    branch, continued, contd, computer generated invoice, rounded off
+    entries) saved corrupted text straight into tbl_Purchase_Line's own
+    [Description] for invoices processed before those fixes existed - which
+    then surfaces as a wrong/junk suggestion on the Part Description
+    Mapping screen (Part_Description_Update_Items -> PdfDescriptions).
+    Runs ONCE ever, guarded by config.json's part_description_migration_done
+    (set only after a run actually completes with a real, non-ambiguous
+    signal - see the "inconclusive" comment below): re-OCRs, with today's
+    fixed extraction, ONLY the PDFs currently backing a row this screen
+    itself would show right now (never a blanket table scan, and never an
+    invoice the screen doesn't currently flag), and overwrites ONLY the
+    [Description] column of the specific tbl_Purchase_Line row(s) that
+    PDF's own re-extraction positionally matches (see
+    database.fix_purchase_line_descriptions) - no other column, table,
+    invoice, or tracker status is touched. Best-effort per PDF: one
+    failure is logged and skipped, never aborts the rest of the run or
+    blocks startup."""
+    import traceback
+    try:
+        cfg = config_store.load_config()
+        if cfg.get("part_description_migration_done"):
+            return
+        if not (cfg.get("db_connection") or "").strip():
+            return  # DB not configured yet - nothing to migrate
+
+        import database
+
+        order_nos = database.buyer_order_nos_for_status("DATA MISMATCH")
+        if not order_nos:
+            # Nothing at DATA MISMATCH at all - determined entirely from
+            # our own DB, no dependency on Service First being reachable,
+            # so this is a safe, unambiguous "done".
+            config_store.save_config({"part_description_migration_done": True})
+            return
+
+        # The EXACT same screen logic (order_nos -> SF mismatch records ->
+        # drop-if-already-resolved) - reused as-is (not reimplemented) so
+        # the candidate set is always byte-for-byte what a user would
+        # currently see on the Part Description Mapping screen.
+        items = part_description_update_items().get("items") or []
+        if not items:
+            # Ambiguous: could genuinely mean "every PO is already
+            # resolved", or Service First being unreachable right now
+            # (get_specification_mismatch_records swallows its own errors
+            # and returns [] either way). Don't mark done on a guess - a
+            # transient SF outage at the one moment this fires must not
+            # look like "nothing to fix" forever. Retried on next startup.
+            return
+
+        candidates = {}
+        for item in items:
+            po = item.get("PurchaseOrderNo")
+            for inv in item.get("PdfInvoices") or []:
+                fname = inv.get("FileName")
+                if po and fname:
+                    candidates[(po, fname)] = True
+
+        from ocr_engine import OCREngine
+        from invoice_schema import build_invoice_json
+
+        ocr = OCREngine()
+        # Part Description Mapping is PART-only by definition (see this
+        # function's own docstring/scope), so the PART toggle is the
+        # correct one here regardless of SERVICE's own setting.
+        allow_scanned = bool(cfg.get("allow_scanned_pdfs_part"))
+        fixed_lines = 0
+        fixed_invoices = 0
+        for po, fname in candidates:
+            try:
+                header_id = database.purchase_header_id_for_invoice(po, fname, "DATA MISMATCH")
+                if not header_id:
+                    continue
+                path = config_store.find_pdf(fname)
+                if not path:
+                    continue
+                ocr_result = ocr.read_pdf(path, allow_scanned=allow_scanned)
+                invoice_groups = ocr_result.get("Invoices") or [ocr_result]
+                data = build_invoice_json(invoice_groups[0], path)
+                n = database.fix_purchase_line_descriptions(header_id, data.get("items") or [])
+                if n:
+                    fixed_lines += n
+                    fixed_invoices += 1
+            except Exception:  # noqa: BLE001 - one bad PDF must not stop the rest
+                traceback.print_exc()
+                continue
+
+        config_store.save_config({"part_description_migration_done": True})
+        print(
+            f"[part-description-migration] Corrected {fixed_lines} Purchase "
+            f"Line description(s) across {fixed_invoices} invoice(s) "
+            f"({len(candidates)} candidate(s) examined). Will not run again."
+        )
+    except Exception:  # noqa: BLE001 - never block startup
+        traceback.print_exc()
+
+
+@app.on_event("startup")
+def _run_line_description_continuation_fix_migration():
+    """Kicks off _run_line_description_continuation_fix_migration_impl() in
+    the background - same reasoning as _run_part_description_migration's own
+    wrapper just above (a startup event handler blocks the app from ever
+    becoming ready until every handler returns; this one re-OCRs a real
+    number of PDFs and calls Service First per invoice on a real live
+    database, easily long enough for a host-level startup timeout to kill
+    the process before it ever finishes and marks itself done)."""
+    threading.Thread(target=_run_line_description_continuation_fix_migration_impl, daemon=True).start()
+
+
+def _run_line_description_continuation_fix_migration_impl():
+    """One-time data-quality migration, NOT a general cleanup: a table
+    layout where each item prints its serial + full values on one row with
+    a plain spec line right below it (e.g. "1 MOTHERBOARD ... 9,800.00" /
+    "HP 280 PRO G6 MICROTOWER PC RCTO") had that spec line wrongly
+    reassigned to the NEXT item's Description instead of staying on the
+    item it's printed under - fixed in ocr_engine.py, but every invoice
+    processed before that fix already has the wrong text saved in
+    tbl_Purchase_Line. Runs ONCE ever, guarded by config.json's
+    line_description_continuation_fix_done: re-OCRs, with today's fixed
+    extraction, every PDF currently at DATA MISMATCH or PENDING IN SF
+    (database.data_mismatch_headers - never a blanket table scan; PENDING IN
+    SF is included too since an invoice parked there for an unrelated reason
+    - Service First just hasn't received the part yet - can still be
+    carrying the same bad Description from before the fix existed), and for
+    any whose freshly re-extracted Description(s) differ from what's stored
+    AND whose item count is unchanged (a different item count means today's
+    fix also changed WHICH rows exist, not just their text - too different
+    to positionally match, skipped rather than guessed at), overwrites just
+    those Description(s) (database.fix_purchase_line_descriptions - PDF-
+    sourced data only) and re-validates the invoice (Service First for PART,
+    the same mandatory-field gate a NAV vendor code correction uses for
+    SERVICE), rebuilding only its Reservation Entry rows and status/IsActive
+    (database.revalidate_header_after_description_fix - Service First-
+    sourced data only) so it moves to whatever status is now actually
+    correct - which may still be DATA MISMATCH or PENDING IN SF, just for a
+    different, genuine reason. Never touches BatchName, [No.], or
+    [Entry No.] - those stay exactly as already assigned. Best-effort per
+    PDF: one failure is logged and skipped, never aborts the rest of the
+    run or blocks startup."""
+    import traceback
+    try:
+        cfg = config_store.load_config()
+        if cfg.get("line_description_continuation_fix_done"):
+            return
+        if not (cfg.get("db_connection") or "").strip():
+            return  # DB not configured yet - nothing to migrate
+
+        import database
+
+        candidates = database.data_mismatch_headers(("DATA MISMATCH", "PENDING IN SF"))
+        if not candidates:
+            # Nothing at either status at all - determined entirely from
+            # our own DB, a safe, unambiguous "done".
+            config_store.save_config({"line_description_continuation_fix_done": True})
+            return
+
+        from ocr_engine import OCREngine
+
+        ocr = OCREngine()
+        output_folder = (config_store.folders(create=False) or {}).get("output", "")
+        fixed_lines = 0
+        fixed_invoices = 0
+        for c in candidates:
+            try:
+                res = database.reextract_and_fix_description(c, ocr=ocr, output_folder=output_folder)
+                if res:
+                    fixed_lines += res["lines_changed"]
+                    fixed_invoices += 1
+            except Exception:  # noqa: BLE001 - one bad PDF must not stop the rest
+                traceback.print_exc()
+                continue
+
+        config_store.save_config({"line_description_continuation_fix_done": True})
+        print(
+            f"[line-description-continuation-fix-migration] Corrected {fixed_lines} Purchase "
+            f"Line description(s) across {fixed_invoices} invoice(s) "
+            f"({len(candidates)} DATA MISMATCH/PENDING IN SF invoice(s) examined). Will not run again."
+        )
+    except Exception:  # noqa: BLE001 - never block startup
         traceback.print_exc()
 
 
 @app.get("/health")
 def health():
     return {"status": "Healthy"}
+
+
+@app.get("/api/version")
+def version():
+    """The running app's version - shown in the sidebar footer so the
+    version string only ever needs to change in one place (app.py's own
+    FastAPI `version=`)."""
+    return {"version": app.version}
 
 
 # ==========================================================================
@@ -72,8 +315,9 @@ class ConfigModel(BaseModel):
 
 def _public_config(cfg):
     """Config safe to send to the browser: never expose the connection
-    string (it carries the DB password). Report only whether one is set."""
-    public = {k: v for k, v in cfg.items() if k != "db_connection"}
+    string (it carries the DB password) or the token-signing secret. Report
+    only whether a connection is set."""
+    public = {k: v for k, v in cfg.items() if k not in ("db_connection", "auth_secret")}
     public["db_configured"] = bool((cfg.get("db_connection") or "").strip())
     return public
 
@@ -81,6 +325,26 @@ def _public_config(cfg):
 @app.get("/api/config")
 def get_config():
     return _public_config(config_store.load_config())
+
+
+class ScannedPdfsModel(BaseModel):
+    enabled: bool
+    invoice_type: Literal["PART", "SERVICE"]
+    user_id: Optional[int] = None
+
+
+@app.post("/api/config/scanned-pdfs")
+def set_scanned_pdfs(payload: ScannedPdfsModel):
+    """Super Admin toggle: whether a scanned/photocopied invoice of the
+    given type (PART or SERVICE, no embedded text layer) gets OCR-extracted
+    instead of rejected outright. Kept separate per invoice type so turning
+    it on for one doesn't also start OCR'ing scanned invoices of the other
+    - see config_store.DEFAULT_CONFIG's own comment for the full
+    rationale."""
+    _require_developer(payload.user_id)
+    key = f"allow_scanned_pdfs_{payload.invoice_type.lower()}"
+    config_store.save_config({key: bool(payload.enabled)})
+    return {"ok": True, key: bool(payload.enabled)}
 
 
 def _writable(path):
@@ -267,10 +531,30 @@ def _require_developer(user_id):
         raise HTTPException(status_code=403, detail="Super Admin access required.")
 
 
+def _require_not_viewer(user_id):
+    """Raise 403 if user_id is the read-only 'Viewer' role - it can see
+    every page but never change anything. A missing/unknown user_id is NOT
+    blocked here (many write endpoints are reachable before login in some
+    flows); this only ever blocks an identified Viewer."""
+    import database
+    try:
+        info = database.get_user_role(user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if info and (info["role"] or "").lower() == "viewer":
+        raise HTTPException(status_code=403, detail="Viewers have read-only access.")
+
+
 @app.get("/api/db-config")
 def get_db_config(user_id: Optional[int] = None):
     import database
-    _require_developer(user_id)
+    # Bootstrap exception: with nothing configured yet, there's no way to
+    # be logged in (auth itself needs a working DB), so the frontend's
+    # pre-login setup screen (see App.jsx) must be able to read/save this
+    # without a Super Admin session. Once a connection exists, every call
+    # goes back through the normal Super-Admin-only gate.
+    if (config_store.load_config().get("db_connection") or "").strip():
+        _require_developer(user_id)
     raw = config_store.load_config().get("db_connection") or ""
     p = database.parse_dotnet_connection(raw)
     return {
@@ -286,7 +570,12 @@ def get_db_config(user_id: Optional[int] = None):
 @app.post("/api/db-config")
 def save_db_config(payload: DbConfigModel):
     import database
-    _require_developer(payload.user_id)
+    # Same bootstrap exception as GET /api/db-config above - only skipped
+    # while nothing is configured yet. The moment a real connection exists
+    # (including the one this very call is about to save), changing it
+    # again requires an authenticated Super Admin.
+    if (config_store.load_config().get("db_connection") or "").strip():
+        _require_developer(payload.user_id)
 
     server = (payload.server or "").strip()
     db_name = (payload.database or "").strip()
@@ -446,6 +735,7 @@ class StartModel(BaseModel):
 @app.post("/api/process/start")
 def process_start(payload: Optional[StartModel] = None):
 
+    _require_not_viewer(payload.user_id if payload else None)
     folders = _require_folders()
 
     # Whoever clicks Start is the tracker's "started by".
@@ -469,7 +759,7 @@ def process_start(payload: Optional[StartModel] = None):
 
 
 @app.get("/api/job/active")
-def active_job(mode: Optional[str] = None):
+def active_job(mode: Optional[str] = None, brief: bool = False):
     """Active job (optionally for a specific mode: process | train) so the
     UI can resume progress after navigating away. Returns {"active": false}
     when there is none."""
@@ -477,7 +767,7 @@ def active_job(mode: Optional[str] = None):
     job = job_manager.active_job(mode)
     if not job:
         return {"active": False}
-    return job.status_dict()
+    return job.status_dict(brief=brief)
 
 
 @app.get("/api/batches")
@@ -537,8 +827,17 @@ def status_counts():
             n = len(files())
             if n:
                 sid = database.status_id(name) or 1
+                # Re-inserted at the SAME position it already held in
+                # `counts` (database.status_counts() lists every status,
+                # even a real-tracker-row count of 0 - see
+                # usp_StatusCounts, ordered by DisplayOrder) rather than
+                # forced to the front, so this synthetic folder-based
+                # count still respects DisplayOrder/STATUS_VALUES' order
+                # like every other status.
+                idx = next((i for i, c in enumerate(counts)
+                            if (c.get("status") or "").upper() == name), 0)
                 counts = [c for c in counts if (c.get("status") or "").upper() != name]
-                counts.insert(0, {"status_id": sid, "status": name, "count": n})
+                counts.insert(idx, {"status_id": sid, "status": name, "count": n})
         except Exception:  # noqa: BLE001 - synthetic count is best-effort
             import traceback
             traceback.print_exc()
@@ -569,6 +868,29 @@ def invoices_by_status(status_id: int):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+@app.get("/api/invoices/search")
+def invoices_search(q: str = ""):
+    """Invoice Search menu: invoices whose Invoice No. contains `q`, each
+    with its file name/vendor/batch/batch status/file status."""
+    import database
+    try:
+        return {"invoices": database.search_invoices_by_number(q)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/invoices/{header_id}/history")
+def invoice_history(header_id: int):
+    """Who did what and when for one invoice (Invoice Search menu's
+    tracking-history timeline) - every audit event recorded for it, newest
+    first."""
+    import database
+    try:
+        return {"events": database.get_audit(header_id=header_id, limit=500)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 @app.get("/api/invoices/{header_id}/fields")
 def invoice_field_check(header_id: int):
     """Field-by-field mandatory-data breakdown for one invoice (Dashboard
@@ -581,15 +903,81 @@ def invoice_field_check(header_id: int):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+def _inline_content_disposition(filename):
+    """Build a Content-Disposition header carrying BOTH a plain ASCII
+    `filename=` and an RFC 5987 `filename*=` for the same name. Starlette's
+    own FileResponse(filename=...) emits ONLY filename*= (percent-encoded)
+    whenever quote() changes the name at all - which a bare space already
+    triggers, so any invoice file name with a space (the common case here,
+    e.g. "Armtech - 1748.pdf") loses the plain fallback entirely. Most
+    browsers handle filename*= fine, but anything that only understands the
+    plain form then falls back to a name derived from the URL instead of the
+    real file name - so both forms are always sent together here."""
+    ascii_fallback = re.sub(r'[^\x20-\x7E]', "_", filename).replace('"', "'")
+    return f"inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
 @app.get("/api/invoices/pdf")
-def invoice_pdf(file: str):
-    """Serve an invoice's PDF/image inline (clicking an invoice no. in a table
-    opens it in a viewer). Located by file name across the Folder Path."""
+def invoice_pdf(file: str, page: Optional[int] = None, page_end: Optional[int] = None):
+    """Serve an invoice's PDF/image inline (clicking an invoice no./file
+    name anywhere in the app opens it in the shared PdfModal viewer, which
+    all route through this one endpoint). Located by file name across the
+    Folder Path. The real file name is always what gets used if the user
+    downloads/saves it from the viewer - see _inline_content_disposition.
+
+    `page` (1-based, start of the range) and `page_end` (1-based,
+    inclusive end - defaults to `page` when omitted) are passed whenever
+    the caller knows which of the source PDF's own pages this specific
+    invoice came from (see database._invoice_list's page_start/page_end,
+    stored from ocr_engine.py's _merge_group). A single uploaded PDF can
+    either print more than one invoice (e.g. 2 invoices, 1 per page,
+    sharing one file_name) or one invoice spanning several pages - without
+    this every one of those invoices' rows would open/download the
+    identical full multi-page file starting at page 1, regardless of which
+    invoice was actually clicked, or would only show that invoice's FIRST
+    page and silently drop the rest of a genuine multi-page invoice. When
+    given (and the file is a real multi-page PDF, not a single-page scan/
+    image), that page range is extracted into its own PDF and served
+    instead of the whole file - both viewing and downloading then show/
+    save only that invoice's own pages."""
     path = config_store.find_pdf(file)
     if not path or not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="File not found")
     media = _VIEW_MEDIA.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
-    return FileResponse(path, media_type=media, content_disposition_type="inline")
+    name = os.path.basename(path)
+
+    # No "page > 1" shortcut here: a file with 2+ invoices packed in still
+    # needs page 1 isolated from page 2 onward just as much as any later
+    # page does - skipping extraction specifically for page 1 was the bug
+    # (every OTHER invoice in the file stayed visible/downloadable from
+    # the "page 1" view). Only skips when the file turns out to have just
+    # the one page total, where extracting would just reproduce the same
+    # pages the full-file response already serves.
+    if page and media == "application/pdf":
+        end = page_end if (page_end and page_end >= page) else page
+        try:
+            import fitz  # pymupdf
+            with fitz.open(path) as src:
+                end = min(end, src.page_count)
+                if src.page_count > 1 and 1 <= page <= src.page_count:
+                    extracted = fitz.open()
+                    extracted.insert_pdf(src, from_page=page - 1, to_page=end - 1)
+                    data = extracted.tobytes()
+                    extracted.close()
+                    stem, ext = os.path.splitext(name)
+                    page_label = f"page {page}" if end == page else f"pages {page}-{end}"
+                    page_name = f"{stem} ({page_label}){ext}"
+                    return Response(
+                        content=data, media_type=media,
+                        headers={"content-disposition": _inline_content_disposition(page_name)},
+                    )
+        except Exception:  # noqa: BLE001 - extraction is a nice-to-have; fall through to the full file
+            traceback.print_exc()
+
+    return FileResponse(
+        path, media_type=media,
+        headers={"content-disposition": _inline_content_disposition(name)},
+    )
 
 
 @app.get("/api/invoices/by-batch")
@@ -615,8 +1003,14 @@ def invoices_exclude(payload: ExcludeModel):
     including restores the prior status and folder."""
     import database
     import config_store
+
+    _require_not_viewer(payload.user_id)
     try:
         res = database.set_excluded(payload.header_id, payload.exclude, payload.user_id)
+    except ValueError as exc:
+        # A later batch already relies on this one staying cleared - see
+        # database._later_batch_not_created.
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
     if not res:
@@ -643,6 +1037,203 @@ def invoices_buyer_order_missing():
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+@app.get("/api/invoices/vendor-code-missing")
+def invoices_vendor_code_missing():
+    """SERVICE invoices parked at 'NAV VENDOR CODE DOESN'T EXIST' (missing
+    from the scanned PDF) for the Vendor Code Entry menu."""
+    import database
+    try:
+        return {"invoices": database.invoices_by_statuses(
+            ["NAV VENDOR CODE DOESN'T EXIST"])}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+def _norm_desc(text):
+    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+
+@app.get("/api/part-description-update/items")
+def part_description_update_items():
+    """Service First's own purchase-line records (SpareRequestID, PartNo,
+    PartSpecification, Nav_Part_Description, pricing) for every Buyer's
+    Order No currently sitting at DATA MISMATCH - Part Description Update
+    menu, so a user can see what SF actually has on file for a PO's parts.
+    Each row also carries PdfInvoices (PIIPS's own InvoiceNo/FileName for
+    that PO - Purchase Details column) and PdfDescriptions (the invoice's
+    own saved Purchase Line Description text(s) for that PO - the screen's
+    autocomplete when typing a corrected SF description).
+
+    A row is flagged Resolved (kept, not dropped) when its own
+    Nav_Part_Description already matches one of the PDF's own descriptions
+    (whitespace/case-insensitive) - every part on a PO is shown together so
+    a user can see how many of an invoice's lines are already done vs still
+    pending, rather than a resolved one silently vanishing just because its
+    PO's overall status happens to be DATA MISMATCH for some unrelated
+    reason (a missing field elsewhere, another part on the same PO, etc.).
+    UNLESS that same description is also claimed by another, different
+    part on the same PO (see DuplicateDescription below), in which case
+    neither is ever marked Resolved: two distinct parts sharing one
+    description means the "match" is ambiguous, not resolved - e.g. an
+    invoice's own line reads "DELL3560-BEZEL" and Service First has BOTH
+    that part AND an unrelated part "0RHGDM" saved under the identical
+    description (someone updated two different parts to the same text) -
+    without this override, whichever part actually corresponds to the PDF
+    line would look "already matched" and hide the fact that a second,
+    wrongly-duplicated part is sitting right behind it, unresolved.
+
+    PdfDescriptions is always every one of the PO's own PDF descriptions,
+    for EVERY row (not trimmed by which are already claimed elsewhere on
+    the PO) - a user reviewing one part's suggestions still needs to see
+    the invoice's other lines to tell them apart, even a currently-claimed
+    one. Actually PICKING one already claimed by a different part is what's
+    prevented, client-side (PartDescriptionUpdate.jsx's
+    descriptionUsedElsewhereInPo, re-checked server-side in
+    part_description_update_save before ever saving) - that's the real
+    conflict guard, so trimming the dropdown itself would only have hidden
+    information, never prevented anything trimming alone didn't already."""
+    import database
+    import service_api
+    try:
+        order_nos = database.buyer_order_nos_for_status("DATA MISMATCH")
+        items = service_api.get_specification_mismatch_records(order_nos)
+        details_by_po = database.invoice_details_by_buyer_order(order_nos, "DATA MISMATCH")
+
+        # A (PurchaseOrderNo, normalized description) claimed by more than
+        # one distinct PartNoMapID is a real data conflict - flag every
+        # item in the group so the frontend can call it out, and so the
+        # "already matches a PDF description" check below never applies to
+        # any of them.
+        ids_by_key = {}
+        for item in items:
+            nd = _norm_desc(item.get("Nav_Part_Description"))
+            if not nd:
+                continue
+            key = (item.get("PurchaseOrderNo"), nd)
+            ids_by_key.setdefault(key, set()).add(item.get("PartNoMapID"))
+        dup_keys = {k for k, ids in ids_by_key.items() if len(ids) > 1}
+
+        result = []
+        for item in items:
+            details = details_by_po.get(item.get("PurchaseOrderNo"), {})
+            pdf_descriptions = details.get("descriptions", [])
+            item["PdfInvoices"] = details.get("invoices", [])
+            item["PdfDescriptions"] = pdf_descriptions
+            nav_desc = _norm_desc(item.get("Nav_Part_Description"))
+            key = (item.get("PurchaseOrderNo"), nav_desc)
+            if key in dup_keys:
+                item["DuplicateDescription"] = True
+            elif nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
+                item["Resolved"] = True
+            result.append(item)
+
+        return {"items": result}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+class PartDescriptionSaveModel(BaseModel):
+    part_no_map_id: int
+    description: str
+    purchase_order_no: Optional[str] = None
+    user_id: Optional[int] = None
+
+
+@app.post("/api/part-description-update/save")
+def part_description_update_save(payload: PartDescriptionSaveModel, request: Request):
+    """Push a corrected description for one Service First part back to SF -
+    Part Description Mapping menu's Update button (UpdateInvoiceDescription-
+    InPurchaseLine). part_no_map_id is stores_SparePurchaseLine.PartNoMapID
+    (from a GetPurchaseLineSpecificationMismatchRecord row's own
+    "PartNoMapID" field) - NOT its "PartID", a different column entirely on
+    the same table.
+
+    The same description must map to exactly one part per PO - the
+    frontend already blocks this client-side (PartDescriptionUpdate.jsx's
+    descriptionUsedElsewhereInPo), but that's trivially bypassed (a stale
+    build, a direct API call), and this exact conflict has already
+    happened in practice (two different real parts, e.g. "DELL3560-BEZEL"
+    and "0RHGDM", ended up saved under the identical description) - so it
+    is re-checked here too, against Service First's own current data,
+    before ever pushing the update through. Requires purchase_order_no
+    (the frontend already has it from the row being edited) - the check
+    is skipped, not blocked, when it's not supplied, so this stays
+    backward compatible with any older caller that doesn't send it yet."""
+    import service_api
+    _require_not_viewer(payload.user_id)
+    # Collapsed to single spaces (never just .strip()) before it's ever
+    # compared OR pushed to Service First - an embedded newline/double space
+    # (e.g. a suggestion picked from PdfDescriptions whose own OCR text still
+    # had one) makes PIIPS's own "already resolved" check pass (_norm_desc
+    # collapses whitespace too) while the value actually saved to Service
+    # First keeps it, so SF's OWN GetHSNDetails match against the PDF's real,
+    # single-spaced text keeps failing forever after - the invoice looks
+    # "✓ Updated" here but never actually leaves DATA MISMATCH (see
+    # ATH Printer - 2117.pdf's "CAN DR 240 PICKUP ROLLER KIT \nIMPORT").
+    desc = re.sub(r"\s+", " ", (payload.description or "")).strip()
+    if payload.purchase_order_no and desc:
+        norm = _norm_desc(desc)
+        try:
+            existing = service_api.get_specification_mismatch_records([payload.purchase_order_no])
+        except Exception:  # noqa: BLE001 - a lookup failure must not silently allow a bad save through
+            raise HTTPException(status_code=502, detail="Could not verify this description against "
+                                                          "Service First's current data - try again.")
+        for item in existing:
+            if (item.get("PartNoMapID") != payload.part_no_map_id
+                    and _norm_desc(item.get("Nav_Part_Description")) == norm):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"\"{desc}\" is already assigned to part {item.get('PartNo') or 'another part'} "
+                           f"on PO {payload.purchase_order_no} - each description can only map to one part.",
+                )
+    try:
+        result = service_api.update_invoice_description(payload.part_no_map_id, desc)
+        # Who / when for the matching Purchase Line rows (best effort).
+        import database
+        user_id = request.scope.get("state", {}).get("user_id")
+        stamped = database.record_part_description_update(
+            payload.purchase_order_no, desc, user_id, payload.part_no_map_id)
+        # This description was exactly what a DATA MISMATCH invoice on this
+        # PO was waiting on (Service First couldn't resolve its Nav Item No.
+        # against the OLD description) - now that it's corrected, re-check
+        # against Service First right away instead of leaving the invoice
+        # parked until some later, unrelated run happens to revisit it.
+        # Best-effort: a re-check failure must not fail the save itself,
+        # which already succeeded against Service First.
+        moved = []
+        for header_id in stamped.get("header_ids", []):
+            try:
+                res = database.revalidate_data_mismatch_header(header_id, user_id)
+                if res:
+                    moved.append({"header_id": header_id, **res})
+            except Exception:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+        return {"result": result, "revalidated": moved}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Service First update failed: {exc}")
+
+
+class RevalidateAllModel(BaseModel):
+    user_id: Optional[int] = None
+
+
+@app.post("/api/part-description-update/revalidate-all")
+def part_description_revalidate_all(payload: RevalidateAllModel):
+    """Re-check EVERY current DATA MISMATCH/PENDING IN SF invoice against
+    Service First right now (Part Description Mapping's "Recheck All"
+    button) - the catch-up sweep for a description confirmed on Service
+    First's own side before the Update button auto-rechecked (see
+    part_description_update_save), or by any other means. Safe to run any
+    time; each invoice re-validates independently."""
+    import database
+    _require_not_viewer(payload.user_id)
+    try:
+        return database.revalidate_all_data_mismatch(payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 class BuyerOrderModel(BaseModel):
     header_id: int
     buyer_order_no: str
@@ -656,6 +1247,7 @@ def invoices_set_buyer_order(payload: BuyerOrderModel):
     advances (Ready to Load / Extracted); the PDF moves to the new status
     folder."""
     import database
+    _require_not_viewer(payload.user_id)
     order_no = (payload.buyer_order_no or "").strip()
     if not order_no:
         raise HTTPException(status_code=400, detail="Buyer order no is required")
@@ -678,13 +1270,99 @@ def invoices_set_buyer_order(payload: BuyerOrderModel):
             "moved_to": moved}
 
 
+class VendorCodeModel(BaseModel):
+    header_id: int
+    vendor_code: str
+    user_id: Optional[int] = None
+
+
+@app.post("/api/invoices/vendor-code")
+def invoices_set_vendor_code(payload: VendorCodeModel):
+    """Manually set the NAV vendor code on a parked SERVICE invoice. Unlike
+    Buyer Order (which re-runs Service First), SERVICE never calls SF at
+    all, so filling the code is itself sufficient to become READY TO LOAD;
+    the PDF moves to the new status folder."""
+    import database
+    _require_not_viewer(payload.user_id)
+    vendor_code = (payload.vendor_code or "").strip()
+    if not vendor_code:
+        raise HTTPException(status_code=400, detail="Vendor code is required")
+    try:
+        res = database.apply_manual_vendor_code(
+            payload.header_id, vendor_code, payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not res:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    moved = ""
+    if res.get("file_name") and res.get("new_status"):
+        try:
+            moved = config_store.move_pdf_to_status(res["file_name"], res["new_status"])
+        except Exception:  # noqa: BLE001 - file move is best-effort
+            import traceback
+            traceback.print_exc()
+    return {"ok": True, "new_status": res.get("new_status"),
+            "is_active": res.get("is_active"), "reason": res.get("reason", ""),
+            "moved_to": moved}
+
+
+@app.get("/api/role-menus")
+def get_role_menus():
+    """Which menu keys each configurable role (admin/user/accounts/viewer)
+    can see - read by every logged-in client to build its own sidebar, so
+    no auth gate here beyond being reachable at all (same as /api/config).
+    Super Admin/Developer always see every menu, unconfigurable, and are
+    never part of this mapping - see database.get_role_menus."""
+    import database
+    try:
+        return {"mapping": database.get_role_menus()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+class RoleMenusModel(BaseModel):
+    mapping: dict
+    user_id: Optional[int] = None
+
+
+@app.post("/api/role-menus")
+def save_role_menus(payload: RoleMenusModel):
+    """Replace the whole role->menu mapping - Screen Access menu's Save
+    button. Super Admin only: this controls who can reach every other
+    screen (including this one), so a lower-privileged role must never be
+    able to grant itself more access."""
+    import database
+    _require_developer(payload.user_id)
+    try:
+        result = {"mapping": database.save_role_menus(payload.mapping, payload.user_id)}
+        security.forget_user()
+        return result
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 # Load / Post / Complete lifecycle. Each stage lists invoices at its source
 # status(es) and advances the selected ones to its target status.
 _LIFECYCLE = {
-    "load":     {"from": ["READY TO LOAD"],           "to": "LOADED"},
-    "post":     {"from": ["READY TO LOAD", "LOADED"], "to": "POSTED"},
-    "complete": {"from": ["POSTED"],                  "to": "COMPLETED"},
+    "load":     {"from": ["READY TO LOAD", "REJECTED BY ACCOUNTS"], "to": "LOADED"},
+    "post":     {"from": ["LOADED"],  "to": "POSTED"},
+    "complete": {"from": ["POSTED"],  "to": "COMPLETED"},
 }
+
+
+_POST_ROLES = {"accounts", "admin", "super admin"}
+
+
+def _require_post_access(user_id):
+    """Raise 403 unless user_id is an active Accounts, Admin, or Super Admin
+    user (the Post page's mark-as-posted and reject actions)."""
+    import database
+    try:
+        info = database.get_user_role(user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not info or not info["active"] or (info["role"] or "").lower() not in _POST_ROLES:
+        raise HTTPException(status_code=403, detail="Accounts, Admin, or Super Admin access required.")
 
 
 @app.get("/api/lifecycle/invoices")
@@ -714,10 +1392,16 @@ def lifecycle_advance(payload: LifecycleModel):
     (Load→LOADED, Post→POSTED, Complete→COMPLETED) and move each PDF into its
     new status folder. Posted/Completed invoices are also archived into
     <Folder Path>/ALL_INVOICES as "<Invoice No.>_<Vendor Name>.pdf" (a copy,
-    the original stays in its status folder)."""
+    the original stays in its status folder). On Load, any invoice whose
+    [No.] duplicates another invoice's is silently excluded from the
+    advance (see database.advance_status) and reported back in
+    'duplicate_no' so the caller can alert on it."""
     stage = (payload.stage or "").lower()
     if stage not in _LIFECYCLE:
         raise HTTPException(status_code=400, detail="Unknown stage")
+    _require_not_viewer(payload.user_id)
+    if stage == "post":
+        _require_post_access(payload.user_id)
     spec = _LIFECYCLE[stage]
     import database
     try:
@@ -751,11 +1435,47 @@ def lifecycle_advance(payload: LifecycleModel):
             import traceback
             traceback.print_exc()
 
-    return {"ok": True, "count": res.get("count", 0), "to": spec["to"]}
+    return {"ok": True, "count": res.get("count", 0), "to": spec["to"],
+            "duplicate_no": res.get("duplicate_no", [])}
+
+
+class RejectModel(BaseModel):
+    header_id: int
+    remark: str
+    user_id: Optional[int] = None
+
+
+@app.post("/api/lifecycle/reject")
+def lifecycle_reject(payload: RejectModel):
+    """Accounts/Admin/Super Admin: reject one LOADED invoice, on the Post
+    page, back to REJECTED BY ACCOUNTS with a required remark. The invoice
+    reappears on the Load page (alongside READY TO LOAD) with the remark
+    visible, for another attempt."""
+    import database
+    _require_post_access(payload.user_id)
+    remark = (payload.remark or "").strip()
+    if not remark:
+        raise HTTPException(status_code=400, detail="A remark is required to reject an invoice.")
+    try:
+        res = database.reject_invoice(payload.header_id, remark, payload.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not res:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    moved = ""
+    if res.get("file_name"):
+        try:
+            moved = config_store.move_pdf_to_status(res["file_name"], "REJECTED BY ACCOUNTS")
+        except Exception:  # noqa: BLE001 - file move is best-effort
+            import traceback
+            traceback.print_exc()
+    return {"ok": True, "new_status": "REJECTED BY ACCOUNTS", "moved_to": moved}
 
 
 @app.get("/api/batches/download")
-def download_batch(batch: str, doc_no: Optional[str] = None, entry_no: Optional[str] = None):
+def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, entry_no: Optional[str] = None):
     """Rebuild the Excel for a batch from the 3 DB tables, on demand.
     Optional doc_no / entry_no override the Document No. / Entry No.
     sequence used in the export (Dashboard > Batches inputs) — see
@@ -780,39 +1500,157 @@ def download_batch(batch: str, doc_no: Optional[str] = None, entry_no: Optional[
     start_doc_no = _to_int(doc_no, "doc_no")
     start_entry_no = _to_int(entry_no, "entry_no")
 
+    locked = database.is_batch_locked(name)
+    all_batches = database.list_batches()
+    this_batch = next((b for b in all_batches if b.get("batch") == name), None)
+    pending = (this_batch or {}).get("counts", {}).get("READY TO LOAD", 0)
+
+    # A locked batch (something in it already Loaded/Posted/Completed/
+    # Rejected) still refuses a download once there's nothing LEFT to
+    # download - but if some invoices are still sitting at Ready to Load
+    # (a partial Load: some of the batch was taken on to NAV, some wasn't),
+    # the remaining ones must still be reachable. usp_FetchBatch already
+    # only ever fetches invoices NOT YET past Ready to Load, so this can
+    # never re-touch or re-mint a Document No./Entry No. for one that's
+    # already Loaded+ - only the still-pending ones are ever exported or
+    # renumbered here, regardless of the batch's own lock state.
+    if locked and not pending:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch '{name}' has an invoice already Loaded, Excluded, "
+                "Posted, Completed, or Rejected, and nothing left at Ready "
+                "to Load - there's nothing left to download."
+            ),
+        )
+
+    # An invoice still parked at Buyer Order No Doesn't Exist has nothing
+    # usable for Navision yet - block the whole batch's download rather
+    # than silently exporting it without a PO, or worse, minting it a
+    # Document No. now that it'll need redone once the PO is fixed later.
+    this_batch = next((b for b in all_batches if b.get("batch") == name), None)
+    missing_po = (this_batch or {}).get("counts", {}).get("BUYER ORDER NO DOESN'T EXIST", 0)
+    if missing_po:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch '{name}' has {missing_po} invoice(s) with no Buyer "
+                "Order No. — kindly fill in the Buyer Order No before "
+                "downloading this batch."
+            ),
+        )
+
+    # A Data Mismatch invoice is missing a required field - block the whole
+    # batch's download the same way a missing Buyer Order No does, rather
+    # than silently exporting around it (and minting Document Nos. for the
+    # rest) while it sits unresolved. The batch stays CREATED until every
+    # Data Mismatch in it is cleared - resolving one moves it to whatever
+    # status it now deserves (possibly still Data Mismatch, for a different
+    # field) via the same re-upload/reprocess path as New Template/Excluded.
+    missing_data = (this_batch or {}).get("counts", {}).get("DATA MISMATCH", 0)
+    if missing_data:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch '{name}' has {missing_data} invoice(s) at Data "
+                "Mismatch — kindly resolve the missing field(s) before "
+                "downloading this batch."
+            ),
+        )
+
+    # Batches must clear in creation order: an earlier batch not yet fully
+    # Loaded/Posted/Completed (ignoring its excluded invoices) blocks any
+    # newer batch's download, so Document Nos. never get ahead of a batch
+    # still pending - see database.list_batches's 'blocked_by'.
+    blocked_by = next(
+        (b.get("blocked_by", []) for b in all_batches if b.get("batch") == name),
+        [],
+    )
+    if blocked_by:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch '{name}' can't be downloaded yet — the earlier "
+                f"batch(es) {', '.join(blocked_by)} must be fully Loaded, "
+                "Posted, or Completed first."
+            ),
+        )
+
+    # Only one batch may be mid-flight (Downloaded or In Progress) at a
+    # time - if some OTHER batch is already sitting there, it must be
+    # taken to Loaded/Posted/Completed before a different batch may be
+    # downloaded, even if this one wouldn't otherwise be blocked by
+    # creation order.
+    active_others = [
+        b["batch"] for b in all_batches
+        if b["batch"] != name and b.get("batch_status") in ("DOWNLOADED", "IN PROGRESS")
+    ]
+    if active_others:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch(es) {', '.join(active_others)} still Downloaded/In "
+                "Progress — take it to Loaded, Posted, or Completed before "
+                f"downloading '{name}'."
+            ),
+        )
+
     try:
         sheet_data = database.fetch_batch(name, excel_export.sheet_columns())
+    except ValueError as exc:
+        # A Document No. collision against another batch (see
+        # database._find_no_collision) - nothing was written, refuse the
+        # download with a clear reason rather than a generic 500.
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
     if not sheet_data["Purchase Header"]["rows"]:
         raise HTTPException(status_code=404, detail=f"Batch '{name}' not found")
 
+    # database.fetch_batch() already wrote a real [No.]/[Entry No.] directly
+    # (see _assign_document_numbers/_assign_entry_numbers) - the batch being
+    # locked was already rejected above, so a custom doc_no/entry_no here is
+    # a deliberate user override on top of that, persisted the same way
+    # (overwriting what fetch_batch just auto-assigned).
     if start_doc_no is not None or start_entry_no is not None:
         excel_export.renumber_batch(sheet_data, start_doc_no, start_entry_no)
-
-    # Keep Last_Updated_No in sync with whatever was just exported (default
-    # numbering or a custom renumber) — the number that becomes real/
-    # permanent (see database.advance_status) once the invoice is Loaded.
-    try:
-        database.update_last_updated_no([
-            (row.get("Id"), row.get("No.", ""))
+        doc_pairs = {
+            row.get("Id"): row.get("No.", "")
             for row in sheet_data["Purchase Header"]["rows"]
             if row.get("Id") is not None
-        ])
-    except Exception:  # noqa: BLE001 - best-effort, download still succeeds
-        import traceback
-        traceback.print_exc()
-
-    # Same idea for Reservation Entry's Entry No. (see
-    # database.update_last_updated_entry_no) — row-local, not shared
-    # across a header's rows like No./Source ID.
-    try:
-        database.update_last_updated_entry_no([
-            (row.get("Id"), row.get("Entry No.", ""))
+        } if start_doc_no is not None else {}
+        entry_pairs = {
+            row.get("Id"): row.get("Entry No.", "")
             for row in sheet_data["Reservation Entry"]["rows"]
             if row.get("Id") is not None
-        ])
+        } if start_entry_no is not None else {}
+        try:
+            # Check BOTH mappings before writing EITHER - write_document_numbers
+            # and write_entry_numbers each commit independently, so without
+            # this upfront check a Document No. write could succeed and
+            # commit only for the paired Entry No. write to then collide,
+            # leaving the Document No. change persisted despite the overall
+            # request failing with "nothing was changed".
+            database.precheck_number_collisions(doc_pairs, entry_pairs, name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if start_doc_no is not None:
+            try:
+                database.write_document_numbers(doc_pairs, name)
+            except ValueError as exc:
+                # A custom-chosen number collides with another batch's -
+                # nothing was written, refuse rather than export an Excel
+                # with a Document No. that never actually got saved.
+                raise HTTPException(status_code=400, detail=str(exc))
+        if start_entry_no is not None:
+            try:
+                database.write_entry_numbers(entry_pairs, name)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        database.mark_batch_downloaded(name, user_id=request.scope.get("state", {}).get("user_id"))
     except Exception:  # noqa: BLE001 - best-effort, download still succeeds
         import traceback
         traceback.print_exc()
@@ -910,14 +1748,14 @@ def download_manual(user_id: int, kind: str = "user"):
 
 
 @app.get("/api/process/status/{job_id}")
-def process_status(job_id: str):
+def process_status(job_id: str, brief: bool = False):
 
     job = job_manager.get(job_id)
 
     if not job:
         raise HTTPException(status_code=404, detail="Unknown job_id")
 
-    return job.status_dict()
+    return job.status_dict(brief=brief)
 
 
 @app.get("/api/process/result/{job_id}")
@@ -972,6 +1810,7 @@ def upload_input(subpath: str = "", user_id: Optional[int] = None,
 
     import database
 
+    _require_not_viewer(user_id)
     folder = _input_subdir(subpath)
     os.makedirs(folder, exist_ok=True)
 
@@ -1038,9 +1877,11 @@ def upload_input(subpath: str = "", user_id: Optional[int] = None,
 # ==========================================================================
 
 @app.post("/api/train")
-def train_start():
-    """Learn (merge) invoice formats from PDFs in the server New_Format folder."""
-
+def train_start(user_id: Optional[int] = None):
+    """Learn (merge) invoice formats from PDFs in the server New_Format folder.
+    Super Admin only - the Training screen this action lives on is already
+    restricted to Super Admin/Developer in ROLE_MENUS."""
+    _require_developer(user_id)
     folders = _require_folders()
 
     # Back up the current model before training so a failed/partial run
@@ -1116,9 +1957,11 @@ def list_formats():
 
 
 @app.delete("/api/formats")
-def clear_formats():
-    """Forget all trained formats (start clean)."""
-
+def clear_formats(user_id: Optional[int] = None):
+    """Forget all trained formats (start clean). Super Admin only - wipes
+    every vendor's learned format at once, and the Training screen this
+    lives on is already Super Admin/Developer-only in ROLE_MENUS."""
+    _require_developer(user_id)
     model = FormatModel()
     model.clear()
     return {"formats": [], "message": "All trained formats cleared"}
@@ -1126,6 +1969,7 @@ def clear_formats():
 
 class RestoreModel(BaseModel):
     name: str
+    user_id: Optional[int] = None
 
 
 @app.get("/api/backups")
@@ -1147,8 +1991,9 @@ def list_backups():
 
 @app.post("/api/backups/restore")
 def restore_backup(payload: RestoreModel):
-    """Restore a chosen model backup."""
-
+    """Restore a chosen model backup. Super Admin only - can silently
+    discard every format learned since the chosen backup."""
+    _require_developer(payload.user_id)
     model = FormatModel()
     try:
         model.restore(payload.name)
@@ -1185,6 +2030,7 @@ def get_mapping():
 @app.post("/api/mapping")
 def save_mapping(payload: MappingModel):
     import excel_export
+    _require_not_viewer(payload.user_id)
     return {"mapping": excel_export.save_mapping(payload.mapping, payload.user_id)}
 
 
@@ -1236,6 +2082,7 @@ def get_fields():
 def save_fields(payload: FieldsModel):
     """Save customized column lists {sheet: [columns]} (order matters)."""
     import excel_export
+    _require_not_viewer(payload.user_id)
     return {"columns": excel_export.save_columns(payload.columns, payload.user_id)}
 
 
@@ -1250,6 +2097,9 @@ class TemplateModel(BaseModel):
     po_format: Optional[str] = ""
     static: dict = {}
     user_id: Optional[int] = None
+    # Set only when renaming an existing template (Template Edit screen's
+    # Template name field) - the key it's being renamed FROM.
+    original_key: Optional[str] = None
 
 
 class TemplateKeyModel(BaseModel):
@@ -1282,10 +2132,11 @@ def get_templates():
 @app.post("/api/templates")
 def save_template(payload: TemplateModel):
     import template_store
+    _require_not_viewer(payload.user_id)
     try:
         key, folder = template_store.save_template(
             payload.entity, payload.invoice_type, payload.name, payload.po_format,
-            payload.static, payload.user_id,
+            payload.static, payload.user_id, original_key=payload.original_key,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1295,6 +2146,7 @@ def save_template(payload: TemplateModel):
 @app.post("/api/templates/delete")
 def delete_template(payload: TemplateKeyModel):
     import template_store
+    _require_not_viewer(payload.user_id)
     return {"deleted": template_store.delete_template(payload.key, payload.user_id)}
 
 
@@ -1308,7 +2160,12 @@ class LoginModel(BaseModel):
 
 
 class ForgotPasswordModel(BaseModel):
-    username_or_email: str
+    # Several accounts can share one email address, so the form asks for the
+    # username AND the email and matches the pair. `username_or_email` is the
+    # older single-field form, still accepted.
+    username: Optional[str] = ""
+    email: Optional[str] = ""
+    username_or_email: Optional[str] = ""
 
 
 class ChangePasswordModel(BaseModel):
@@ -1339,11 +2196,37 @@ def _base_url(request: Request):
     return str(request.base_url).rstrip("/")
 
 
+def _client_ip(request: Request):
+    """The caller's address for throttling. Behind the IIS reverse proxy every
+    request arrives from the proxy's own (loopback/private) address, which
+    would make ALL users share one throttle bucket - so when the direct peer
+    is a proxy on this machine/LAN, take the first X-Forwarded-For hop."""
+    peer = (request.client.host if request.client else "") or "unknown"
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if forwarded:
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(peer)
+            if addr.is_loopback or addr.is_private:
+                return forwarded
+        except ValueError:
+            pass
+    return peer
+
+
 @app.post("/api/login")
-def api_login(payload: LoginModel):
+def api_login(payload: LoginModel, request: Request):
     import database
+    username = (payload.username or "").strip()
+    # Slow password guessing: 10 attempts / 15 min per client + username.
+    throttle_key = f"login:{_client_ip(request)}:{username.lower()}"
+    if security.throttled(throttle_key, 10, 15 * 60):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many sign-in attempts. Please wait a few minutes and try again.",
+        )
     try:
-        user = database.authenticate((payload.username or "").strip(), payload.password or "")
+        user = database.authenticate(username, payload.password or "")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
     if not user:
@@ -1351,7 +2234,21 @@ def api_login(payload: LoginModel):
             status_code=401,
             detail="Invalid username or password, or the account is inactive.",
         )
-    return user
+    security.clear_attempts(throttle_key)
+    database.record_login(user["user_id"])
+    return {**user, "token": security.issue_token(user["user_id"])}
+
+@app.post("/api/logout")
+def api_logout(request: Request):
+    """Sign the caller out: stamp the logout time, mark them offline and make
+    their token unusable."""
+    import database
+    state = request.scope.get("state", {})
+    database.record_logout(state.get("user_id"))
+    if state.get("token"):
+        security.revoke_token(state["token"])
+    return {"ok": True}
+
 
 
 @app.post("/api/forgot-password")
@@ -1363,18 +2260,60 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
     import database
     import mailer
 
-    name_or_email = (payload.username_or_email or "").strip()
+    username = (payload.username or "").strip()
+    email = (payload.email or "").strip()
+    legacy = (payload.username_or_email or "").strip()
+    if legacy and not username and not email:
+        if "@" in legacy:
+            email = legacy
+        else:
+            username = legacy
+    name_or_email = username or email
     generic = {"ok": True, "message": "If that account exists, a new password has been emailed to it."}
     if not name_or_email:
         return generic
+    # Nobody may keep resetting (and mailing) other people's passwords:
+    # 5 requests / hour per client, and 3 / hour per target account.
+    if (security.throttled(f"forgot:{_client_ip(request)}", 5, 3600)
+            or security.throttled(f"forgot-target:{name_or_email.lower()}", 3, 3600)):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many password-reset requests. Please try again later.",
+        )
 
     try:
-        user = database.get_user_by_email(name_or_email) if "@" in name_or_email \
-            else database.get_user(name_or_email)
+        if username:
+            # The account is named: an email given alongside it must be that
+            # account's own, so one shared address can't reset a neighbour.
+            user = database.get_user(username)
+            if user and email and (user.get("Email") or "").strip().lower() != email.lower():
+                user = None
+        else:
+            matches = database.get_users_by_email(email)
+            if len(matches) > 1:
+                # Same address on several accounts and no username given: don't
+                # guess which one - mail the address its usernames so the owner
+                # can ask again with the username.
+                names = ", ".join(m["UserName"] for m in matches if m["IsActive"])
+                if names:
+                    try:
+                        mailer.send_mail(
+                            email, "Your PIIPS usernames",
+                            "<p>Several PIIPS accounts use this email address: <b>"
+                            + names + "</b>.</p><p>On the Forgot password screen, enter the "
+                            "username you need together with this email address.</p>")
+                    except mailer.MailError:
+                        pass
+                return generic
+            user = matches[0] if matches else None
     except Exception:  # noqa: BLE001
         return generic
 
     if not user or not user["IsActive"] or not user.get("Email"):
+        # The caller always gets the same reply (no account enumeration); the
+        # reason is logged for whoever runs the server.
+        print(f"[forgot-password] no reset sent: no active account with an email "
+              f"for username={username!r} email={email!r}")
         return generic
 
     temp_password = database.generate_temp_password()
@@ -1388,8 +2327,11 @@ def api_forgot_password(payload: ForgotPasswordModel, request: Request):
             user["Email"], "Your PIIPS password was reset",
             mailer.password_reset_email_html(user["UserName"], temp_password, _base_url(request)),
         )
-    except mailer.MailError:
-        pass  # generic response either way - the password was still reset
+    except mailer.MailError as exc:
+        # Same reply either way - the password WAS reset - but say why the mail
+        # never arrived (SMTP not configured / login refused / unreachable).
+        print(f"[forgot-password] password reset for {user['UserName']!r} but the email "
+              f"could not be sent: {exc}")
 
     return generic
 
@@ -1404,6 +2346,8 @@ def api_change_password(payload: ChangePasswordModel):
         raise HTTPException(status_code=404, detail="User not found.")
     if not database.verify_password(payload.current_password or "", user["Password"] or ""):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
+    if (payload.new_password or "").strip().lower() == (user["UserName"] or "").strip().lower():
+        raise HTTPException(status_code=400, detail="Your new password can't be the same as your username.")
     try:
         database.reset_password(user["UserName"], payload.new_password, force_change=False)
     except ValueError as exc:
@@ -1419,9 +2363,12 @@ def api_change_password(payload: ChangePasswordModel):
 
 class UserCreateModel(BaseModel):
     username: str
-    email: str
+    email: Optional[str] = None
     user_type_id: int
     created_by: Optional[int] = None
+    # Viewer accounts only: a Super Admin assigns the password directly
+    # instead of one being auto-generated and emailed - see api_create_user.
+    password: Optional[str] = None
 
 
 class UserActiveModel(BaseModel):
@@ -1434,6 +2381,12 @@ class UserResetPasswordModel(BaseModel):
     user_id: int          # the acting admin/super admin
     target_user_id: int   # whose password is being reset
     new_password: Optional[str] = None   # None = auto-generate
+
+
+class UserChangeTypeModel(BaseModel):
+    user_id: int          # the acting admin/super admin
+    target_user_id: int   # whose role is being changed
+    new_user_type_id: int
 
 
 def _email_result(email_sent, email_error):
@@ -1454,24 +2407,57 @@ def api_list_users():
 
 @app.post("/api/users")
 def api_create_user(payload: UserCreateModel, request: Request):
-    """Create a user. The admin never chooses a password - one is always
-    auto-generated and emailed to the address given here."""
+    """Create a user. Normally the admin never chooses a password - one is
+    always auto-generated and emailed to the address given here. A Viewer
+    account is the one exception: it's set up directly by a Super Admin
+    with a password of their choosing, no email required, and no welcome
+    email sent (see the Viewer-specific rules noted inline below)."""
     import database
     import mailer
 
+    _require_not_viewer(payload.created_by)
     name = (payload.username or "").strip()
     email = (payload.email or "").strip()
-    if not name or not email:
-        raise HTTPException(status_code=400, detail="Username and email are required.")
-    if "@" not in email or "." not in email.split("@")[-1]:
-        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    type_name = next(
+        (t["name"] for t in database.list_user_types() if t["id"] == payload.user_type_id), ""
+    )
+    is_viewer = type_name.strip().lower() == "viewer"
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Username is required.")
+    if is_viewer:
+        # A Viewer's password is assigned directly by the Super Admin
+        # creating it, not auto-generated and emailed - there's no welcome
+        # email to send, so no email address is required either. The usual
+        # complexity policy is skipped too: a Viewer account is commonly
+        # set up with a simple, memorable convention (e.g. the employee
+        # code as-is), and it's read-only with no email recovery path
+        # anyway, unlike a self-service account's own password.
+        if not payload.password:
+            raise HTTPException(status_code=400, detail="A password is required for a Viewer account.")
+    else:
+        if not email:
+            raise HTTPException(status_code=400, detail="Username and email are required.")
+        if "@" not in email or "." not in email.split("@")[-1]:
+            raise HTTPException(status_code=400, detail="Enter a valid email address.")
 
     try:
-        temp_password = database.create_user(name, payload.user_type_id, email, payload.created_by)
+        # Viewer: the Super Admin's own chosen password (kept). Everyone else:
+        # the initial password is simply the username - the user MUST replace
+        # it at their first login (must_change_password), so it only ever
+        # works once, until they set their own under the full policy.
+        temp_password = database.create_user(
+            name, payload.user_type_id, email or None, payload.created_by,
+            password=payload.password if is_viewer else name,
+            force_change=None if is_viewer else True,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    if is_viewer:
+        return {"ok": True, "email_sent": False, "email_error": None}
 
     created = database.get_user(name)
     user_type_name = (created or {}).get("UserTypeName", "")
@@ -1493,6 +2479,7 @@ def api_set_user_active(payload: UserActiveModel, request: Request):
     import database
     import mailer
 
+    _require_not_viewer(payload.modified_by)
     try:
         user = database.get_user_by_id(payload.user_id)
     except Exception as exc:  # noqa: BLE001
@@ -1515,9 +2502,15 @@ def api_set_user_active(payload: UserActiveModel, request: Request):
         database.set_user_active(payload.user_id, payload.is_active, payload.modified_by)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    security.forget_user(payload.user_id)
+
+    # A Viewer account is set up by a Super Admin directly (no email on
+    # file is even required for one - see api_create_user), so there's no
+    # activation/deactivation notice to send either.
+    is_viewer = (user or {}).get("UserTypeName", "").strip().lower() == "viewer"
 
     email_sent, email_error = False, None
-    if user and user.get("Email"):
+    if user and user.get("Email") and not is_viewer:
         html = (
             mailer.activation_email_html(user["UserName"], _base_url(request))
             if payload.is_active
@@ -1565,17 +2558,36 @@ def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
                        "- not their own, another Admin's, or a Super Admin's.",
             )
 
+    target_is_viewer = (target.get("UserTypeName") or "").strip().lower() == "viewer"
     if payload.new_password:
-        try:
-            database.validate_password_policy(payload.new_password)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        if is_super_admin:
+            # A Super Admin may give ANY user any password of their choosing
+            # (no complexity rules - just not empty); the user replaces it under
+            # the normal policy at their next login.
+            if not payload.new_password.strip() or len(payload.new_password) > 128:
+                raise HTTPException(status_code=400, detail="Enter a password (1-128 characters).")
+        else:
+            try:
+                database.validate_password_policy(payload.new_password)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
         new_password = payload.new_password
+        initial = is_super_admin
     else:
-        new_password = database.generate_temp_password()
+        # Back to the initial credential: password = username, change forced
+        # at the next login.
+        new_password = target["UserName"]
+        initial = True
 
     try:
-        database.reset_password(target["UserName"], new_password, force_change=True, modified_by=payload.user_id)
+        # A Viewer account is a fixed credential the Super Admin hands out (no
+        # forced change, same as when it is created); everyone else must
+        # change the password at next login.
+        database.reset_password(target["UserName"], new_password,
+                                force_change=not (is_super_admin and payload.new_password and target_is_viewer),
+                                modified_by=payload.user_id, check_policy=not initial)
+    except ValueError as exc:      # e.g. Sadmin's password is fixed
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
@@ -1591,6 +2603,55 @@ def api_admin_reset_password(payload: UserResetPasswordModel, request: Request):
             email_error = str(exc)
 
     return {"ok": True, **_email_result(email_sent, email_error)}
+
+
+@app.post("/api/users/change-type")
+def api_admin_change_user_type(payload: UserChangeTypeModel):
+    """Admin-triggered role change for an existing user, mirroring
+    /api/users/reset-password's exact permission rule: a Super Admin may
+    retarget anyone (including themselves) to any role. An Admin may only
+    retarget a plain User/Accounts account - never themselves, another
+    Admin, or a Super Admin - AND may only assign them another plain
+    User/Accounts role (never promote anyone to Admin/Super Admin)."""
+    import database
+
+    caller_role = database.get_user_role(payload.user_id)
+    if not caller_role or not caller_role["active"] or caller_role["role"].lower() not in ("admin", "super admin"):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    is_super_admin = caller_role["role"].lower() == "super admin"
+
+    target = database.get_user_by_id(payload.target_user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    types = {t["id"]: t["name"] for t in database.list_user_types()}
+    new_type_name = (types.get(payload.new_user_type_id) or "").lower()
+    if not new_type_name:
+        raise HTTPException(status_code=400, detail="Unknown user type.")
+
+    if not is_super_admin:
+        target_role_name = (target.get("UserTypeName") or "").lower()
+        if (payload.target_user_id == payload.user_id
+                or target_role_name in ("admin", "super admin")):
+            raise HTTPException(
+                status_code=403,
+                detail="Admins can only change the role of a regular User/Accounts account "
+                       "- not their own, another Admin's, or a Super Admin's.",
+            )
+        if new_type_name in ("admin", "super admin"):
+            raise HTTPException(
+                status_code=403,
+                detail="Admins can only assign the User or Accounts role - promoting to "
+                       "Admin or Super Admin requires a Super Admin.",
+            )
+
+    try:
+        database.set_user_type(payload.target_user_id, payload.new_user_type_id, payload.user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    security.forget_user(payload.target_user_id)
+
+    return {"ok": True, "user_type_name": types[payload.new_user_type_id]}
 
 
 class MailSettingsModel(BaseModel):
@@ -1679,6 +2740,7 @@ def api_list_announcements(user_id: Optional[int] = None):
 
 @app.post("/api/announcements")
 def api_create_announcement(
+    request: Request,
     title: str = Form(...),
     body_text: str = Form(""),
     video_url: str = Form(""),
@@ -1693,6 +2755,9 @@ def api_create_announcement(
     or a Super Admin stops it early."""
     import database
 
+    # Multipart forms aren't inspected by the auth middleware - take the
+    # acting user from the verified token instead of the client-sent field.
+    user_id = request.scope["state"]["user_id"]
     _require_developer(user_id)
 
     title = title.strip()

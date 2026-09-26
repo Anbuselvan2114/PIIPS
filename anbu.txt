@@ -1,6 +1,10 @@
 --UAT
     --Move files
+        --max 
         robocopy "D:\WorkSpace\Projects\Python\PIIPS" "\\10.0.1.210\E$\PIIPS_Application" /E /Z /R:3 /W:5 /PURGE /XD "venv" "__pycache__" ".git" "logs" ".claude" /XF "config.json"
+        --minimum
+        robocopy "D:\WorkSpace\Projects\Python\PIIPS" "\\10.0.1.210\E$\PIIPS_Application" /E /Z /R:3 /W:5 /PURGE /XD "venv" ".venv" "__pycache__" ".git" ".claude" "node_modules" "logs" "output" "New_Format" "model_backups" "old" "announcement_media" /XF "config.json" "PIIPS.sql" "*.log" "*.pyc"
+
     --- installing dependency
         Set-Location "E:\PIIPS_Application"; (Get-Content ".\requirements.txt") | ForEach-Object { if ($_ -match '^opencv-python==') { 'opencv-python==4.6.0.66' } elseif ($_ -match '^opencv-python-headless==') { $null } else { $_ } } | Set-Content ".\requirements.txt"; & ".\venv\Scripts\python.exe" -m pip install -r ".\requirements.txt"
         Get-OdbcDriver | Where-Object Name -like "*ODBC Driver 17*" 
@@ -121,3 +125,33 @@
         Write-Host "Uvicorn          : 127.0.0.1:8000"
         Write-Host "IIS Domain       : https://piips.precisionit.co.in:8010"
                 
+
+#run without nssm  
+    PS C:\Windows\system32> cd E:\Source\piips; & "E:\Source\piips\venv\Scripts\python.exe" -m uvicorn main:app --host 127.0.0.1 --port 8000
+#when sit crash 
+# 1. Stop PIIPS Backend
+Stop-Service PIIPS_Backend
+
+# 2. Set Python executable
+E:\Source\piips\required_softwares\nssm-2.24\win64\nssm.exe set PIIPS_Backend Application "E:\Source\piips\venv\Scripts\python.exe"
+
+# 3. Set working directory
+E:\Source\piips\required_softwares\nssm-2.24\win64\nssm.exe set PIIPS_Backend AppDirectory "E:\Source\piips"
+
+# 4. Set FastAPI/Uvicorn command
+E:\Source\piips\required_softwares\nssm-2.24\win64\nssm.exe set PIIPS_Backend AppParameters "-m uvicorn main:app --host 127.0.0.1 --port 8000"
+
+# 5. Start PIIPS Backend
+Start-Service PIIPS_Backend
+
+# 6. Wait for startup
+Start-Sleep -Seconds 5
+
+# 7. Check service
+Get-Service PIIPS_Backend
+
+# 8. Check port 8000
+netstat -ano | findstr :8000
+
+# 9. Test FastAPI
+Invoke-RestMethod http://127.0.0.1:8000/

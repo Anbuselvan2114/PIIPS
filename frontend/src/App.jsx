@@ -1,16 +1,20 @@
 import { useState, useEffect } from "react";
-import { Logo, AnnouncementBell } from "./components";
+import { Logo, AnnouncementBell, JobBanner } from "./components";
 import Dashboard from "./Dashboard";
 import Configuration from "./Configuration";
 import DatabaseConfig from "./DatabaseConfig";
 import ApiConfiguration from "./ApiConfiguration";
 import Training from "./Training";
 import InputFiles from "./InputFiles";
+import InvoiceSearch from "./InvoiceSearch";
 import CreateField from "./CreateField";
 import Mapping from "./Mapping";
 import Template from "./Template";
 import UserManagement from "./UserManagement";
 import BuyerOrderEntry from "./BuyerOrderEntry";
+import VendorCodeEntry from "./VendorCodeEntry";
+import PartDescriptionUpdate from "./PartDescriptionUpdate";
+import RoleMenuAccess from "./RoleMenuAccess";
 import Lifecycle from "./Lifecycle";
 import Login from "./Login";
 import ForgotPassword from "./ForgotPassword";
@@ -19,38 +23,28 @@ import MailSettings from "./MailSettings";
 import Announcement from "./Announcement";
 import Manuals from "./Manuals";
 import Publish from "./Publish";
+import { getConfig, getVersion, getRoleMenus, setToken, getToken, logoutSession } from "./api";
+import { MENU } from "./menuConfig";
 
-// key, label, icon, nav group
-const MENU = [
-  ["dashboard", "Dashboard", "▤", "Main"],
-  ["input", "File Explorer", "🗂", "Main"],
-  ["manual", "Manual", "📖", "Main"],
-  ["buyerorder", "Buyer Order Entry", "✎", "Review"],
-  ["load", "Load", "📥", "Accounts"],
-  ["post", "Post", "📮", "Accounts"],
-  ["complete", "Complete", "✅", "Accounts"],
-  ["configuration", "Folder Configuration", "⚙", "Setup"],
-  ["dbconfig", "Database Configuration", "🗄", "Setup"],
-  ["apiconfig", "API Configuration", "🔌", "Setup"],
-  ["template", "Template", "🧩", "Setup"],
-  ["createfield", "Create Field", "✚", "Mapping"],
-  ["mapping", "Field Mapping", "🔗", "Mapping"],
-  ["training", "Model Training", "🧠", "Admin"],
-  ["users", "User Management", "👤", "Admin"],
-  ["mailsettings", "Mail Server Setting", "✉", "Admin"],
-  ["announcement", "Announcement", "📣", "Admin"],
-  ["publish", "Publish", "🚀", "Admin"],
-];
-
-const ROLE_MENUS = {
-  "super admin": MENU.map(([k]) => k),
-  developer: MENU.map(([k]) => k),   // legacy alias (pre-rename sessions)
-  admin: ["dashboard", "input", "manual", "buyerorder", "load", "post", "complete",
+// Fallback used until /api/role-menus answers (and if it ever fails) - also
+// exactly what a brand new deployment's tbl_RoleMenu is seeded with (see
+// database._ROLE_MENU_DEFAULTS, which MUST be kept in sync with this).
+// Super Admin/Developer are never fetched or configurable - they always see
+// every menu (MENU.map below), enforced here regardless of what the Screen
+// Access menu's own table might ever contain.
+const DEFAULT_ROLE_MENUS = {
+  admin: ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate",
+          "load", "post", "complete",
           "configuration", "apiconfig", "template", "createfield", "users"],
-  // Users process invoices, fix Buyer Order Nos, and Load them.
-  user: ["dashboard", "input", "manual", "buyerorder", "load"],
+  // Users process invoices, fix Buyer Order Nos / NAV Vendor Codes, and Load them.
+  user: ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load"],
   // Accounts run the downstream Post / Complete steps.
-  accounts: ["dashboard", "input", "manual", "post", "complete"],
+  accounts: ["dashboard", "input", "manual", "invoicesearch", "post", "complete"],
+  // Viewer sees invoice-processing data read-only (every mutating action is
+  // blocked server-side too, app.py's _require_not_viewer) but not the
+  // Setup/Mapping/Admin screens - those configure the app itself rather
+  // than show data, and aren't meant for this role.
+  viewer: ["dashboard", "input", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
 };
 
 // Load / Post / Complete are one component parameterised by stage.
@@ -60,11 +54,15 @@ const Complete = (p) => <Lifecycle {...p} stage="complete" />;
 
 const PAGES = {
   dashboard: Dashboard, configuration: Configuration, input: InputFiles,
+  invoicesearch: InvoiceSearch,
   training: Training, createfield: CreateField, mapping: Mapping,
   template: Template, users: UserManagement, dbconfig: DatabaseConfig,
   apiconfig: ApiConfiguration, buyerorder: BuyerOrderEntry,
+  vendorcode: VendorCodeEntry,
+  partdescupdate: PartDescriptionUpdate,
   load: Load, post: Post, complete: Complete, manual: Manuals,
   publish: Publish, mailsettings: MailSettings, announcement: Announcement,
+  rolemenus: RoleMenuAccess,
 };
 
 const loadUser = () => {
@@ -75,11 +73,15 @@ const loadUser = () => {
   const params = new URLSearchParams(window.location.search);
   if (params.get("signout") === "1") {
     localStorage.removeItem("piips_user");
+    setToken("");
     params.delete("signout");
     const rest = params.toString();
     window.history.replaceState({}, "", window.location.pathname + (rest ? `?${rest}` : ""));
     return null;
   }
+  // A stored user with no session token (signed in before tokens existed,
+  // or the token was cleared) can't call the API - make them sign in again.
+  if (!getToken()) { localStorage.removeItem("piips_user"); return null; }
   try { return JSON.parse(localStorage.getItem("piips_user")); } catch { return null; }
 };
 
@@ -89,6 +91,74 @@ export default function App() {
   const [page, setPage] = useState("dashboard");
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("piips_collapsed") === "1");
   const [theme, setTheme] = useState(() => localStorage.getItem("piips_theme") || "standard");
+  // null = still checking. Logging in needs a working DB, so a fresh
+  // deploy with an empty/missing config.json would otherwise strand
+  // everyone on a Login screen that can never succeed, with no way to
+  // reach Database Configuration (that page is normally only reachable
+  // AFTER logging in). Checked before rendering Login at all - see
+  // /api/config's public db_configured flag and /api/db-config's matching
+  // bootstrap exception (both skip the Super-Admin gate only while this
+  // is false).
+  const [dbConfigured, setDbConfigured] = useState(null);
+
+  useEffect(() => {
+    getConfig()
+      .then((c) => setDbConfigured(!!c.db_configured))
+      // If /api/config itself can't be reached, the backend is down for
+      // everyone regardless - fail open to the normal Login screen rather
+      // than get stuck showing nothing.
+      .catch(() => setDbConfigured(true));
+  }, []);
+
+  // Shown in the sidebar footer - fetched rather than hardcoded so it
+  // never drifts out of sync with app.py's own `version=`.
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    getVersion().then((v) => setAppVersion(v.version)).catch(() => {});
+  }, []);
+
+  // Which menu keys each role can see - starts at DEFAULT_ROLE_MENUS (so
+  // the sidebar never flashes empty/wrong while this loads) and is
+  // replaced once /api/role-menus answers. refreshRoleMenus is passed down
+  // to every page as onRoleMenusSaved so the Screen Access menu's own Save
+  // button can re-run it, applying a Super Admin's edit to their own
+  // sidebar immediately without a full reload. Super Admin/Developer are
+  // always the full MENU list, never fetched - see DEFAULT_ROLE_MENUS.
+  const [roleMenus, setRoleMenus] = useState(DEFAULT_ROLE_MENUS);
+  const refreshRoleMenus = () =>
+    getRoleMenus()
+      .then((r) => setRoleMenus((prev) => ({ ...prev, ...(r.mapping || {}) })))
+      .catch(() => {});
+  useEffect(() => { refreshRoleMenus(); }, []);
+
+  // Single-tab guard: a casual convenience, not real security - a private
+  // window, a different browser, or simply not supporting BroadcastChannel
+  // all sail straight past this, same caveat as the DevTools deterrent
+  // below. One tab's channel answers "ping" with "pong"; a tab that gets a
+  // pong back knows it's a duplicate and shows a blocking screen instead
+  // of the app. `retryTick` re-runs the handshake (e.g. after closing the
+  // other tab) without a full page reload.
+  // null = still running the handshake (nothing else renders meanwhile,
+  // so a genuine duplicate tab never gets a flash of real content first).
+  const [otherTabOpen, setOtherTabOpen] = useState(null);
+  const [retryTick, setRetryTick] = useState(0);
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") {
+      setOtherTabOpen(false);   // unsupported browser - fail open, never stay stuck on null
+      return undefined;
+    }
+    const channel = new BroadcastChannel("piips-single-tab");
+    let settled = false;
+    channel.onmessage = (e) => {
+      if (e.data === "ping") channel.postMessage("pong");
+      else if (e.data === "pong") { settled = true; setOtherTabOpen(true); }
+    };
+    channel.postMessage("ping");
+    const timer = setTimeout(() => {
+      if (!settled) setOtherTabOpen(false);
+    }, 300);
+    return () => { clearTimeout(timer); channel.close(); };
+  }, [retryTick]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -120,16 +190,52 @@ export default function App() {
     setCollapsed((c) => { localStorage.setItem("piips_collapsed", c ? "0" : "1"); return !c; });
   };
 
+  if (otherTabOpen === null) {
+    // Still running the ping/pong handshake - render nothing real yet, so
+    // a genuine duplicate tab is never briefly shown the app underneath.
+    return <div className="page"><div className="card">Loading…</div></div>;
+  }
+
+  if (otherTabOpen) {
+    return (
+      <div className="page">
+        <div className="card" style={{ maxWidth: 480, margin: "80px auto", textAlign: "center" }}>
+          <h3>PIIPS is already open</h3>
+          <p className="hint">
+            This app is already open in another tab or window. Close it there,
+            or switch to it, then try again here.
+          </p>
+          <button className="btn btn-primary" onClick={() => setRetryTick((t) => t + 1)}>
+            Try Again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (dbConfigured === null) {
+    return <div className="page"><div className="card">Loading…</div></div>;
+  }
+
+  if (!dbConfigured) {
+    return <DatabaseConfig onSaved={() => setDbConfigured(true)} />;
+  }
+
   if (!user) {
     return authView === "forgot"
       ? <ForgotPassword onDone={() => setAuthView("login")} />
       : <Login
           onSuccess={(u) => { localStorage.setItem("piips_user", JSON.stringify(u)); setUser(u); setPage("dashboard"); }}
           onForgot={() => setAuthView("forgot")}
+          onDbError={() => setDbConfigured(false)}
         />;
   }
 
-  const logout = () => { localStorage.removeItem("piips_user"); setUser(null); setAuthView("login"); };
+  const logout = async () => {
+    // Tell the server first (it stamps the logout time and cancels the token).
+    try { await logoutSession(); } catch { /* signing out anyway */ }
+    localStorage.removeItem("piips_user"); setToken(""); setUser(null); setAuthView("login");
+  };
 
   // A freshly-created account, or one that just went through Forgot
   // password, must set its own password before doing anything else.
@@ -147,7 +253,10 @@ export default function App() {
     );
   }
 
-  const allowed = ROLE_MENUS[(user.user_type || "").toLowerCase()] || ROLE_MENUS.user;
+  const roleKey = (user.user_type || "").toLowerCase();
+  const allowed = ["super admin", "developer"].includes(roleKey)
+    ? MENU.map(([k]) => k)
+    : roleMenus[roleKey] || DEFAULT_ROLE_MENUS.user;
   const menu = MENU.filter(([k]) => allowed.includes(k));
   const activePage = allowed.includes(page) ? page : menu[0][0];
   const Active = PAGES[activePage];
@@ -168,7 +277,12 @@ export default function App() {
           <span className="brand-mark"><Logo size={34} /></span>
           <div className="brand-text">
             <div className="brand-name">PIIPS</div>
-            <div className="brand-sub">Invoice Processing Suite</div>
+            <div className="brand-sub">
+              Invoice Processing Suite
+              {appVersion && (
+                <span style={{ color: "#fbbf24", fontWeight: 700 }}> · v{appVersion}</span>
+              )}
+            </div>
           </div>
         </div>
 
@@ -215,7 +329,15 @@ export default function App() {
             </select>
           </label>
         </header>
-        <div className="content">{Active ? <Active user={user} /> : null}</div>
+        <div className="content" style={{ flex: 1 }}>
+          <JobBanner hidden={activePage === "dashboard"} />
+          {Active ? <Active user={user} onRoleMenusSaved={refreshRoleMenus} /> : null}
+        </div>
+        <div className="hint" style={{ textAlign: "center", padding: "14px 28px",
+                                        borderTop: "1px solid var(--border)", whiteSpace: "nowrap" }}>
+          © 2026 Precision Techserve Madras Pvt. Ltd. All Rights Reserved. —
+          Precision Intelligent Invoice Processing Suite (PIIPS){appVersion ? ` v${appVersion}` : ""}
+        </div>
       </div>
     </div>
   );

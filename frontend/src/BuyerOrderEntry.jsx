@@ -44,7 +44,7 @@ export default function BuyerOrderEntry({ user }) {
 
   const invoiceCell = (row) => (
     row.file_name ? (
-      <button className="btn-link" onClick={() => setPdfFile(row.file_name)}
+      <button className="btn-link" onClick={() => setPdfFile({ file: row.file_name, page: row.page_start ?? row.page, pageEnd: row.page_end })}
               style={{ background: "none", border: "none", padding: 0, color: "var(--primary)",
                        cursor: "pointer", textDecoration: "underline", font: "inherit" }}>
         {row.invoice_no || row.file_name}
@@ -95,7 +95,7 @@ export default function BuyerOrderEntry({ user }) {
                      empty="No invoices are waiting for a Buyer Order No." />
         )}
       </div>
-      {pdfFile && <PdfModal file={pdfFile} onClose={() => setPdfFile(null)} />}
+      {pdfFile && <PdfModal file={pdfFile.file} page={pdfFile.page} pageEnd={pdfFile.pageEnd} onClose={() => setPdfFile(null)} />}
     </div>
   );
 }

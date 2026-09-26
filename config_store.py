@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import time
 import traceback
 import xml.etree.ElementTree as ET
 
@@ -42,10 +43,28 @@ DEFAULT_CONFIG = {
     # {"uat"|"live": {"at": iso-str, "by": username, "status": "Success"|"Failed"}}
     # - last Publish outcome per environment, shown on the Publish page.
     "publish_status": {},
+    # Off by default (the original, conservative behaviour): an invoice
+    # with no embedded text layer (a scan/photocopy) is rejected outright
+    # rather than OCR-extracted, since a first-time vendor's unknown layout
+    # read purely off a scanned image is unreliable. Toggled on, a scanned
+    # invoice of that type is OCR'd instead - safe specifically for a
+    # vendor whose born-digital layout PIIPS already knows, since it'll
+    # simply match (or fail to match) the same trained format as always.
+    # Kept separate per invoice type (PART/SERVICE) rather than one shared
+    # toggle, so enabling it for one doesn't also silently start OCR'ing
+    # scanned invoices of the other. Super Admin only (see app.py's
+    # /api/config/scanned-pdfs). A genuine handheld-photo page is still
+    # rejected either way (see ocr_engine._looks_like_photo_page).
+    "allow_scanned_pdfs_part": False,
+    "allow_scanned_pdfs_service": False,
 }
 
 # Legacy keys that used to hold folder paths; migrated into folder_path.
 _LEGACY_FOLDER_KEYS = ("output_folder", "pdf_folder")
+
+# Legacy single toggle that used to apply to both invoice types at once;
+# migrated into the two allow_scanned_pdfs_* keys above.
+_LEGACY_SCANNED_PDFS_KEY = "allow_scanned_pdfs"
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +83,19 @@ def webconfig_get(key):
         if add.get("key") == key:
             return add.get("value") or ""
     return ""
+
+
+def current_environment():
+    """'Local (test)' / 'UAT' / 'Live' - which deployment this running
+    instance is, read from web.config's own <appSettings> "environment"
+    key. Every outbound email (mailer.py) shows this so a recipient can
+    tell at a glance which environment sent it - important since the same
+    codebase runs on all three. Defaults to "Local (test)" when the key is
+    absent, which is the normal case for a developer's own machine (no
+    web.config-driven IIS hosting there) - a UAT/Live web.config sets this
+    explicitly (<add key="environment" value="UAT" /> / "Live") as part of
+    that server's one-time setup."""
+    return webconfig_get("environment") or "Local (test)"
 
 
 def webconfig_set(key, value):
@@ -101,6 +133,7 @@ def load_config():
     Path comes from web.config when present (authoritative)."""
 
     config = dict(DEFAULT_CONFIG)
+    saved = {}
 
     if os.path.exists(CONFIG_FILE):
 
@@ -110,10 +143,25 @@ def load_config():
 
             if isinstance(saved, dict):
                 config.update(saved)
+            else:
+                saved = {}
 
         except (json.JSONDecodeError, OSError):
             # Corrupt / unreadable file -> fall back to defaults
-            pass
+            saved = {}
+
+    # Migrate the old single scanned-PDFs toggle into the two per-type
+    # keys - only when this environment's saved file actually had the old
+    # key AND has never been through this migration before (neither new
+    # key saved yet), so a later explicit Off for just one type isn't
+    # overwritten back to the old shared value on every load.
+    if _LEGACY_SCANNED_PDFS_KEY in saved and not (
+        "allow_scanned_pdfs_part" in saved or "allow_scanned_pdfs_service" in saved
+    ):
+        legacy_val = bool(saved[_LEGACY_SCANNED_PDFS_KEY])
+        config["allow_scanned_pdfs_part"] = legacy_val
+        config["allow_scanned_pdfs_service"] = legacy_val
+    config.pop(_LEGACY_SCANNED_PDFS_KEY, None)
 
     # Migrate the old two-folder config (output_folder / pdf_folder) into the
     # single folder_path, then drop the legacy keys.
@@ -152,10 +200,13 @@ def save_config(updates):
         if value is not None:
             config[key] = value
 
-    # Persist with the connection string encrypted at rest; keep the
-    # in-memory copy plaintext for the caller.
+    # Written as plain, human-readable text - DPAPI encryption ties the
+    # value to the exact machine it was saved on, which repeatedly broke
+    # moving/redeploying config.json between servers (a copy taken on one
+    # machine can't be decrypted on another - see secret_store.py). A
+    # config.json copied around, or edited by hand, must just work.
     on_disk = dict(config)
-    on_disk["db_connection"] = secret_store.protect(config.get("db_connection") or "")
+    on_disk["db_connection"] = config.get("db_connection") or ""
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as file:
         json.dump(on_disk, file, indent=4, ensure_ascii=False)
@@ -166,11 +217,17 @@ def save_config(updates):
     return config
 
 
-def ensure_secret_encrypted():
-    """One-time migration: if config.json holds a plaintext db_connection,
-    rewrite that single field encrypted (DPAPI). Idempotent — a value that is
-    already protected is left untouched. Only that field is rewritten so the
-    rest of the file is preserved verbatim."""
+def ensure_secret_plaintext():
+    """One-time migration (reversed from the old DPAPI-encrypting version):
+    if config.json holds a DPAPI-protected db_connection from before this
+    was switched to plain text, decrypt it back to plain text ON THIS SAME
+    MACHINE (the only place that ever could) and rewrite just that field -
+    the rest of the file is preserved verbatim. Idempotent - a value that's
+    already plain text is left untouched. Run this once more per machine
+    before removing DPAPI encryption entirely: a value that's still
+    protected AND can no longer be decrypted here (e.g. copied from another
+    machine - see secret_store.py) is left as-is rather than raising, since
+    Database Configuration can still overwrite it with a fresh plain value."""
     if not os.path.exists(CONFIG_FILE):
         return
     try:
@@ -180,8 +237,12 @@ def ensure_secret_encrypted():
         return
 
     dbc = raw.get("db_connection") or ""
-    if dbc and not secret_store.is_protected(dbc):
-        raw["db_connection"] = secret_store.protect(dbc)
+    if dbc and secret_store.is_protected(dbc):
+        try:
+            raw["db_connection"] = secret_store.unprotect(dbc)
+        except Exception:  # noqa: BLE001 - protected under a different machine's key
+            traceback.print_exc()
+            return
         with open(CONFIG_FILE, "w", encoding="utf-8") as file:
             json.dump(raw, file, indent=4, ensure_ascii=False)
 
@@ -328,6 +389,36 @@ def move_pdf_to_status(filename, status_name, src_path=None):
     except OSError:
         return ""
     return dest
+
+
+def expire_stale_files(status_name, days, target_status):
+    """Move any PDF sitting in `status_name`'s folder for more than `days`
+    (by filesystem modified time) into `target_status`'s folder. Used for
+    a status that never gets a database row at all - UNSUPPORTED, a pure
+    exception + file move (see processor.py) - so filesystem age is the
+    only "how long has this sat unresolved" signal available; a status
+    with real tracker rows (Data Mismatch/Excluded/New Template) is aged
+    off LastModifiedDatetime instead - see database.expire_stale_unresolved.
+    Returns the list of filenames moved.
+
+    Sample: expire_stale_files('UNSUPPORTED', 10, 'MANUALLY UPDATED')"""
+    src_folder = status_folder(status_name, create=False)
+    if not src_folder or not os.path.isdir(src_folder):
+        return []
+    cutoff = time.time() - days * 86400
+    moved = []
+    for fname in os.listdir(src_folder):
+        src = os.path.join(src_folder, fname)
+        if not os.path.isfile(src):
+            continue
+        try:
+            if os.path.getmtime(src) > cutoff:
+                continue
+        except OSError:
+            continue
+        if move_pdf_to_status(fname, target_status, src_path=src):
+            moved.append(fname)
+    return moved
 
 
 def copy_pdf_to_all_invoices(src_path, dest_filename):

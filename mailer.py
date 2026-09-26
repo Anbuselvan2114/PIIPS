@@ -13,6 +13,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import config_store
 import database
 
 
@@ -121,6 +122,7 @@ def _shell(accent, heading, body_html, footer_note=""):
                 <div style="color:#94a3b8;font-size:12px;line-height:1.6;{_FONT}">
                   Precision Intelligent Invoice Processing Suite
                   {f"<br>{footer_note}" if footer_note else ""}
+                  <br>Source: {config_store.current_environment()}
                   <br>This is an automated message - please do not reply to this email.
                 </div>
               </td>

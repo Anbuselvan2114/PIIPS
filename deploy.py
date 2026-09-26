@@ -43,7 +43,14 @@ _ROBOCOPY_XD = [
     "logs", "output", "New_Format", "model_backups", "old",
     "sample_input", "manuals", "announcement_media",
 ]
-_ROBOCOPY_XF = ["config.json", "config_nonencrypted.json", "PIIPS.sql", "*.log", "*.pyc"]
+# format_model.json holds each environment's own trained-format knowledge
+# (learned from THAT environment's own real invoices) - same category of
+# per-environment data as config.json just above, and excluded for the
+# same reason: staging it here means Deploy_To_Network.txt's day-to-day
+# /MIR sync (see PART 1b there) would overwrite the target server's real
+# trained formats with whatever this dev machine happens to have learned
+# locally.
+_ROBOCOPY_XF = ["config.json", "format_model.json", "PIIPS.sql", "*.log", "*.pyc"]
 
 
 class PublishError(Exception):
@@ -153,5 +160,41 @@ def publish(environment, published_root=None):
     # 8+ = real failure. Not a normal 0-only process exit code.
     _run(robocopy_cmd, BASE_DIR, log, allow_returncodes=range(0, 8))
 
+    # Tag the copied web.config with which environment it's headed for
+    # (config_store.current_environment() reads this back at runtime so
+    # every outbound email shows its source) - this repo's OWN web.config
+    # stays untagged (defaults to "Local (test)"), only the staged copy
+    # gets it, since that's the one that actually ends up on the UAT/Live
+    # server.
+    _tag_webconfig_environment(dest, "UAT" if environment == "uat" else "Live", log)
+
     log.append(f"Publish complete - staged at {dest}. Move it to the real server by hand.")
     return "\n".join(log)
+
+
+def _tag_webconfig_environment(dest, env_label, log):
+    """Set/replace the "environment" <appSettings> key in <dest>/web.config
+    (best-effort - a missing or unparseable web.config just skips this
+    silently, same tolerance config_store.webconfig_set already has for
+    the source copy)."""
+    import xml.etree.ElementTree as ET
+
+    path = os.path.join(dest, "web.config")
+    if not os.path.isfile(path):
+        return
+    try:
+        tree = ET.parse(path)
+        root = tree.getroot()
+    except ET.ParseError:
+        log.append("[WARNING] Could not parse staged web.config - environment tag not set.")
+        return
+    appsettings = root.find("appSettings")
+    if appsettings is None:
+        appsettings = ET.SubElement(root, "appSettings")
+    existing = next((a for a in appsettings.findall("add") if a.get("key") == "environment"), None)
+    if existing is not None:
+        existing.set("value", env_label)
+    else:
+        ET.SubElement(appsettings, "add", {"key": "environment", "value": env_label})
+    tree.write(path, encoding="utf-8", xml_declaration=True)
+    log.append(f"Tagged staged web.config with environment='{env_label}'.")

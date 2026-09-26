@@ -7,12 +7,62 @@
 
 const API_BASE = import.meta?.env?.VITE_API_BASE ?? "";
 
+// Session token issued by /api/login. Every API call sends it as a Bearer
+// header; direct-navigation URLs (PDF iframe, downloads) carry it as
+// ?access_token= since a browser can't attach headers to those.
+const TOKEN_KEY = "piips_token";
+export const getToken = () => {
+  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+};
+export const setToken = (t) => {
+  try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
+};
+export const clearSession = () => {
+  setToken("");
+  try { localStorage.removeItem("piips_user"); } catch { /* ignore */ }
+};
+const authHeaders = () => {
+  const t = getToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+};
+const withToken = (url) => {
+  const t = getToken();
+  return t ? `${url}${url.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(t)}` : url;
+};
+
+// An expired/invalid session (401 while a token was being sent) sends the
+// user back to the sign-in screen instead of leaving a dead page.
+let sessionEnding = false;
+const endSessionIfExpired = (res, sentToken) => {
+  if (res.status === 401 && sentToken && !sessionEnding) {
+    sessionEnding = true;
+    clearSession();
+    window.location.reload();
+  }
+};
+
+// Shared by request() and downloadBatchFile(): pull a clean message out of
+// a non-ok response's {"detail": ...} body (FastAPI's error shape).
+async function errorMessageFor(res) {
+  let detail;
+  try {
+    detail = (await res.json()).detail;
+  } catch {
+    detail = res.statusText;
+  }
+  const message =
+    typeof detail === "string"
+      ? detail
+      : (detail && detail.message) || JSON.stringify(detail);
+  return message || `Request failed (${res.status})`;
+}
+
 async function request(path, options = {}) {
   let res;
   try {
     res = await fetch(API_BASE + path, {
-      headers: { "Content-Type": "application/json" },
       ...options,
+      headers: { "Content-Type": "application/json", ...authHeaders(), ...(options.headers || {}) },
     });
   } catch {
     // fetch() itself throwing (not the server returning an error status)
@@ -22,21 +72,20 @@ async function request(path, options = {}) {
   }
 
   if (!res.ok) {
-    let detail;
-    try {
-      detail = (await res.json()).detail;
-    } catch {
-      detail = res.statusText;
-    }
-    const message =
-      typeof detail === "string"
-        ? detail
-        : (detail && detail.message) || JSON.stringify(detail);
-    throw new Error(message || `Request failed (${res.status})`);
+    if (path !== "/api/login") endSessionIfExpired(res, !!getToken());
+    const err = new Error(await errorMessageFor(res));
+    // Status is attached (not just the message) so a caller can tell a
+    // real database/server failure (5xx) apart from a normal rejection
+    // (e.g. 401 wrong password) without pattern-matching text - see
+    // Login.jsx, which bounces back to Database Configuration on a 5xx.
+    err.status = res.status;
+    throw err;
   }
 
   return res.json();
 }
+
+export const getVersion = () => request("/api/version");
 
 export const getConfig = () => request("/api/config");
 
@@ -44,6 +93,12 @@ export const saveConfig = (folderPath) =>
   request("/api/config", {
     method: "POST",
     body: JSON.stringify({ folder_path: folderPath }),
+  });
+
+export const setScannedPdfsEnabled = (enabled, invoiceType, user_id) =>
+  request("/api/config/scanned-pdfs", {
+    method: "POST",
+    body: JSON.stringify({ enabled, invoice_type: invoiceType, user_id }),
   });
 
 export const getApiConfig = () => request("/api/api-config");
@@ -65,8 +120,17 @@ export const getInvoicesByBatch = (batch) =>
 export const getInvoiceFieldCheck = (headerId) =>
   request(`/api/invoices/${encodeURIComponent(headerId)}/fields`);
 
-export const invoicePdfUrl = (file) =>
-  `${API_BASE}/api/invoices/pdf?file=${encodeURIComponent(file)}`;
+export const searchInvoices = (q) =>
+  request(`/api/invoices/search?q=${encodeURIComponent(q)}`);
+
+export const getInvoiceHistory = (headerId) =>
+  request(`/api/invoices/${encodeURIComponent(headerId)}/history`);
+
+export const invoicePdfUrl = (file, page, pageEnd) =>
+  withToken(
+    `${API_BASE}/api/invoices/pdf?file=${encodeURIComponent(file)}` +
+    (page ? `&page=${encodeURIComponent(page)}` : "") +
+    (pageEnd && pageEnd !== page ? `&page_end=${encodeURIComponent(pageEnd)}` : ""));
 
 export const setInvoiceExcluded = (header_id, exclude, user_id) =>
   request("/api/invoices/exclude", {
@@ -83,13 +147,51 @@ export const setBuyerOrder = (header_id, buyer_order_no, user_id) =>
     body: JSON.stringify({ header_id, buyer_order_no, user_id }),
   });
 
+export const getVendorCodeMissing = () =>
+  request("/api/invoices/vendor-code-missing");
+
+export const setVendorCode = (header_id, vendor_code, user_id) =>
+  request("/api/invoices/vendor-code", {
+    method: "POST",
+    body: JSON.stringify({ header_id, vendor_code, user_id }),
+  });
+
+export const getRoleMenus = () => request("/api/role-menus");
+
+export const saveRoleMenus = (mapping, user_id) =>
+  request("/api/role-menus", {
+    method: "POST",
+    body: JSON.stringify({ mapping, user_id }),
+  });
+
 export const getLifecycleInvoices = (stage) =>
   request(`/api/lifecycle/invoices?stage=${encodeURIComponent(stage)}`);
+
+export const getPartDescriptionUpdateItems = () =>
+  request("/api/part-description-update/items");
+
+export const savePartDescription = (part_no_map_id, description, purchase_order_no, user_id) =>
+  request("/api/part-description-update/save", {
+    method: "POST",
+    body: JSON.stringify({ part_no_map_id, description, purchase_order_no, user_id }),
+  });
+
+export const revalidateAllDataMismatch = (user_id) =>
+  request("/api/part-description-update/revalidate-all", {
+    method: "POST",
+    body: JSON.stringify({ user_id }),
+  });
 
 export const advanceLifecycle = (stage, header_ids, user_id) =>
   request("/api/lifecycle/advance", {
     method: "POST",
     body: JSON.stringify({ stage, header_ids, user_id }),
+  });
+
+export const rejectInvoice = (header_id, remark, user_id) =>
+  request("/api/lifecycle/reject", {
+    method: "POST",
+    body: JSON.stringify({ header_id, remark, user_id }),
   });
 
 export const getDbConfig = (user_id) =>
@@ -107,19 +209,21 @@ export const startProcessing = (user_id) =>
     body: JSON.stringify({ user_id }),
   });
 
-export const startTraining = () =>
-  request("/api/train", { method: "POST" });
+export const startTraining = (user_id) =>
+  request(`/api/train${user_id != null ? `?user_id=${user_id}` : ""}`, { method: "POST" });
 
 export const getTrainFiles = () => request("/api/train/files");
 
 export const trainFileUrl = (name) =>
-  `${API_BASE}/api/train/file?name=${encodeURIComponent(name)}`;
+  withToken(`${API_BASE}/api/train/file?name=${encodeURIComponent(name)}`);
 
-export const getActiveJob = (mode) =>
-  request(`/api/job/active${mode ? `?mode=${mode}` : ""}`);
+// `brief` leaves out the per-file result list - use it for progress polling
+// (every signed-in user's screen polls while a run is going).
+export const getActiveJob = (mode, brief = false) =>
+  request(`/api/job/active?${mode ? `mode=${mode}&` : ""}${brief ? "brief=1" : ""}`);
 
-export const getStatus = (jobId) =>
-  request(`/api/process/status/${jobId}`);
+export const getStatus = (jobId, brief = false) =>
+  request(`/api/process/status/${jobId}${brief ? "?brief=1" : ""}`);
 
 export const getResult = (jobId) =>
   request(`/api/process/result/${jobId}`);
@@ -127,13 +231,35 @@ export const getResult = (jobId) =>
 export const getBatches = () => request("/api/batches");
 
 export const manualDownloadUrl = (userId, kind = "user") =>
-  `${API_BASE}/api/manual/download?user_id=${encodeURIComponent(userId)}&kind=${kind}`;
+  withToken(`${API_BASE}/api/manual/download?user_id=${encodeURIComponent(userId)}&kind=${kind}`);
 
 export const batchDownloadUrl = (batch, docNo, entryNo) => {
   let url = `${API_BASE}/api/batches/download?batch=${encodeURIComponent(batch)}`;
   if (docNo) url += `&doc_no=${encodeURIComponent(docNo)}`;
   if (entryNo) url += `&entry_no=${encodeURIComponent(entryNo)}`;
-  return url;
+  return withToken(url);
+};
+
+// A plain <a href> to this URL can't show a clean error - a failed
+// download (e.g. a Document No. collision) just navigates the browser to
+// the raw JSON. Fetch it instead so a rejection surfaces the same clean
+// message a normal API error would, and only save the file on success.
+export const downloadBatchFile = async (batch, docNo, entryNo) => {
+  let res;
+  try {
+    res = await fetch(batchDownloadUrl(batch, docNo, entryNo), { headers: authHeaders() });
+  } catch {
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
+  if (!res.ok) {
+    endSessionIfExpired(res, !!getToken());
+    throw new Error(await errorMessageFor(res));
+  }
+
+  const blob = await res.blob();
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  return { blob, filename: match ? match[1] : `${batch}.xlsx` };
 };
 
 export const getFormats = () => request("/api/formats");
@@ -168,16 +294,21 @@ export const deleteTemplate = (key, user_id) =>
     body: JSON.stringify({ key, user_id }),
   });
 
-export const login = (username, password) =>
-  request("/api/login", {
+export const login = async (username, password) => {
+  const user = await request("/api/login", {
     method: "POST",
     body: JSON.stringify({ username, password }),
   });
+  // The token is kept apart from the user record App.jsx persists.
+  const { token, ...rest } = user;
+  setToken(token);
+  return rest;
+};
 
-export const forgotPassword = (username_or_email) =>
+export const forgotPassword = (username, email) =>
   request("/api/forgot-password", {
     method: "POST",
-    body: JSON.stringify({ username_or_email }),
+    body: JSON.stringify({ username, email }),
   });
 
 export const changePassword = (user_id, current_password, new_password) =>
@@ -188,10 +319,13 @@ export const changePassword = (user_id, current_password, new_password) =>
 
 export const getUsers = () => request("/api/users");
 
-export const createUser = (username, email, user_type_id, created_by) =>
+// Sign out on the server too (stamps the logout time, cancels the token).
+export const logoutSession = () => request("/api/logout", { method: "POST", body: "{}" });
+
+export const createUser = (username, email, user_type_id, created_by, password) =>
   request("/api/users", {
     method: "POST",
-    body: JSON.stringify({ username, email, user_type_id, created_by }),
+    body: JSON.stringify({ username, email, user_type_id, created_by, password }),
   });
 
 export const setUserActive = (user_id, is_active, modified_by) =>
@@ -204,6 +338,12 @@ export const adminResetPassword = (user_id, target_user_id, new_password) =>
   request("/api/users/reset-password", {
     method: "POST",
     body: JSON.stringify({ user_id, target_user_id, new_password: new_password || null }),
+  });
+
+export const adminChangeUserType = (user_id, target_user_id, new_user_type_id) =>
+  request("/api/users/change-type", {
+    method: "POST",
+    body: JSON.stringify({ user_id, target_user_id, new_user_type_id }),
   });
 
 export const getMailSettings = (user_id) =>
@@ -231,11 +371,12 @@ export const createAnnouncement = async ({ title, body_text, video_url, end_date
 
   let res;
   try {
-    res = await fetch(API_BASE + "/api/announcements", { method: "POST", body: form });
+    res = await fetch(API_BASE + "/api/announcements", { method: "POST", body: form, headers: authHeaders() });
   } catch {
     throw new Error("Could not reach the server. Check your connection and try again.");
   }
   if (!res.ok) {
+    endSessionIfExpired(res, !!getToken());
     let detail;
     try { detail = (await res.json()).detail; } catch { detail = res.statusText; }
     throw new Error((typeof detail === "string" ? detail : detail?.message) || `Request failed (${res.status})`);
@@ -251,8 +392,8 @@ export const stopAnnouncement = (announcement_id, user_id) =>
 
 export const announcementImageUrl = (path) => `${API_BASE}/announcement_media/${encodeURIComponent(path)}`;
 
-export const clearFormats = () =>
-  request("/api/formats", { method: "DELETE" });
+export const clearFormats = (user_id) =>
+  request(`/api/formats${user_id != null ? `?user_id=${user_id}` : ""}`, { method: "DELETE" });
 
 const sub = (subpath) =>
   subpath ? `?subpath=${encodeURIComponent(subpath)}` : "";
@@ -274,12 +415,14 @@ export const uploadInputFiles = async (fileList, subpath = "", user_id) => {
     res = await fetch(API_BASE + url, {
       method: "POST",
       body: form, // let the browser set the multipart Content-Type/boundary
+      headers: authHeaders(),
     });
   } catch {
     throw new Error("Could not reach the server. Check your connection and try again.");
   }
 
   if (!res.ok) {
+    endSessionIfExpired(res, !!getToken());
     let detail;
     try {
       detail = (await res.json()).detail;
@@ -311,8 +454,8 @@ export const publishDeploy = (environment, user_id) =>
 
 export const getBackups = () => request("/api/backups");
 
-export const restoreBackup = (name) =>
+export const restoreBackup = (name, user_id) =>
   request("/api/backups/restore", {
     method: "POST",
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, user_id }),
   });
