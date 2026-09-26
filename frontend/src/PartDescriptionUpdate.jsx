@@ -239,7 +239,14 @@ export default function PartDescriptionUpdate({ user }) {
           el.style.height = `${el.scrollHeight}px`;
         };
         const value = drafts[row._key] ?? initialValue(row);
-        const query = value.trim().toLowerCase();
+        // Filtered by what the user has actually TYPED this session
+        // (drafts), never by the row's own pre-filled current value - a
+        // Resolved row's textarea already starts full of its confirmed SF
+        // description, so filtering by `value` (which falls back to that
+        // pre-fill) hid every OTHER suggestion the instant the field was
+        // focused, before the user changed anything at all. No draft yet
+        // means nothing's been typed - show every suggestion.
+        const query = (drafts[row._key] ?? "").trim().toLowerCase();
         const suggestions = (row.PdfDescriptions || []).filter((d) =>
           !query || d.toLowerCase().includes(query)
         );

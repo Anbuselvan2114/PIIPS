@@ -2123,33 +2123,157 @@ def revalidate_data_mismatch_header(header_id, user_id=None):
             "is_active": verdict.get("is_active", False), "reason": verdict.get("reason", "")}
 
 
+def reextract_and_fix_description(candidate, ocr=None, output_folder=None):
+    """Re-OCR one DATA MISMATCH/PENDING IN SF candidate (a dict shaped like
+    one of data_mismatch_headers()'s own rows) with today's extraction, and
+    - only when the item count is unchanged (a different count means
+    today's fix also changed WHICH rows exist, not just their text - too
+    different to positionally match, skipped rather than guessed at) and
+    at least one Description actually differs from what's stored - correct
+    just those Description(s) (fix_purchase_line_descriptions - PDF-sourced
+    data only) and re-validate the invoice (Service First for PART, the
+    mandatory-field gate for SERVICE), rebuilding only its Reservation
+    Entry rows and status/IsActive (revalidate_header_after_description_fix
+    - Service First-sourced data only). Never touches BatchName, [No.], or
+    [Entry No.].
+
+    Shared by the one-time startup migration (app.py's
+    _run_line_description_continuation_fix_migration_impl) and the
+    on-demand "Recheck All" sweep (revalidate_all_data_mismatch) - the
+    one-time migration only ever examines each invoice ONCE, ever (its own
+    config.json flag), so an invoice processed by a stale, not-yet-
+    restarted worker AFTER that flag was already set (or before some LATER
+    extraction fix existed) never gets a second look from it; "Recheck
+    All" gives a user a way to ask for that second look themselves, any
+    time, without waiting on a fresh one-time flag that will never fire
+    again on an environment that already completed it.
+
+    Returns None if nothing changed (still current, or a PDF/JSON is
+    missing, or the item count changed), else {"header_id", "file_name",
+    "lines_changed", "new_status"}.
+    Sample: reextract_and_fix_description(data_mismatch_headers()[0])"""
+    import config_store
+    import excel_export
+    import service_api
+    import template_store
+    from ocr_engine import OCREngine
+    from invoice_schema import build_invoice_json
+
+    header_id, fname, json_path = candidate["header_id"], candidate["file_name"], candidate["source_json"]
+    invoice_type = candidate["invoice_type"]
+    if not json_path or not os.path.isfile(json_path):
+        return None
+    path = config_store.find_pdf(fname)
+    if not path:
+        return None
+
+    cfg = config_store.load_config()
+    allow_scanned = bool(cfg.get(
+        f"allow_scanned_pdfs_{invoice_type.lower()}"
+        if invoice_type in ("PART", "SERVICE") else "allow_scanned_pdfs_part"
+    ))
+    ocr = ocr or OCREngine()
+    ocr_result = ocr.read_pdf(path, allow_scanned=allow_scanned)
+    invoice_groups = ocr_result.get("Invoices") or [ocr_result]
+    fresh = build_invoice_json(invoice_groups[0], path)
+    new_items = fresh.get("items") or []
+
+    with open(json_path, "r", encoding="utf-8") as fp:
+        data = json.load(fp)
+    old_items = data.get("items") or []
+    if len(old_items) != len(new_items):
+        return None  # today's fix also changed the item count - skip, don't guess
+    if all(
+        (o.get("Description") or "").strip() == (n.get("Description") or "").strip()
+        for o, n in zip(old_items, new_items)
+    ):
+        return None  # nothing this re-extraction is meant to touch changed
+
+    data["items"] = new_items
+    if output_folder is None:
+        output_folder = (config_store.folders(create=False) or {}).get("output", "")
+    static, _ = template_store.static_for_path(output_folder, json_path)
+    data["_static"] = static
+    with open(json_path, "w", encoding="utf-8") as fp:
+        json.dump(data, fp, indent=4, ensure_ascii=False)
+
+    if invoice_type == "SERVICE":
+        field_mapping = excel_export.load_mapping()
+        grouped = excel_export.build_rows_grouped([data])
+        group = grouped["groups"][0] if grouped["groups"] else {"header": {}, "lines": [], "reservations": []}
+        header_for_check = dict(group.get("header", {}))
+        header_for_check["InvoiceNo"] = data.get("invoice_no", "")
+        missing = excel_export.missing_required_fields(
+            header_for_check, group.get("lines", []), group.get("reservations", []),
+            field_mapping, invoice_type="SERVICE",
+        )
+        missing_names = sorted({m["field"] for m in missing})
+        verdict = (
+            {"status": "DATA MISMATCH", "is_active": False, "is_synced": False,
+             "reason": "Missing required field(s): " + ", ".join(missing_names)}
+            if missing_names else
+            {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
+        )
+    else:
+        verdict = service_api.enrich_invoice(data)
+
+    n = fix_purchase_line_descriptions(header_id, new_items)
+    if not n:
+        return None
+    revalidate_header_after_description_fix(header_id, data, verdict)
+    log_event(
+        "STATUS_CHANGED", header_id=header_id, to_status=verdict["status"],
+        detail="Purchase Line Description corrected (continuation-line extraction fix) and re-validated")
+    return {"header_id": header_id, "file_name": fname, "lines_changed": n, "new_status": verdict["status"]}
+
+
 def revalidate_all_data_mismatch(user_id=None):
-    """Re-run Service First for EVERY invoice currently at DATA MISMATCH or
-    PENDING IN SF (revalidate_data_mismatch_header, one at a time) -
-    a repeatable, on-demand version of what the Part Description Mapping
-    screen's Update button now does automatically for a single invoice
-    right when its description is confirmed (see
-    part_description_update_save). Exists because confirming a description
-    directly on Service First's own side (not through that Update button -
-    e.g. by someone else, or before that auto-recheck existed) leaves the
-    invoice sitting there forever with nothing to ever notice the fix and
-    re-check it - this is the catch-up sweep for exactly that backlog, safe
-    to run any time (each invoice re-validates independently; one failure
-    is logged and skipped, never aborts the rest).
+    """Re-check EVERY invoice currently at DATA MISMATCH or PENDING IN SF,
+    both ways at once - a repeatable, on-demand version of what the Part
+    Description Mapping screen's Update button now does automatically for
+    a single invoice right when its description is confirmed (see
+    part_description_update_save):
+      1. Re-OCR it (reextract_and_fix_description) - catches an invoice
+         whose Description was never actually fixed, e.g. because a stale
+         worker processed it after the one-time migration's flag was
+         already set, or before some later extraction fix existed.
+      2. If that made no change, re-run Service First anyway
+         (revalidate_data_mismatch_header) - catches a description
+         confirmed directly on Service First's own side (not through this
+         screen's Update button - e.g. by someone else, or before that
+         auto-recheck existed), which step 1 has nothing to fix but Service
+         First itself may now resolve.
+    Safe to run any time; each invoice re-validates independently, one
+    failure is logged and skipped, never aborts the rest.
     Returns {"checked": n, "moved": [{"header_id", "file_name",
-    "new_status"}, ...]} - "moved" only lists ones whose status actually
-    changed.
+    "from_status", "new_status"}, ...]} - "moved" only lists ones whose
+    status actually changed.
     Sample: revalidate_all_data_mismatch(7)"""
     import traceback
+    from ocr_engine import OCREngine
+    import config_store
+
     candidates = data_mismatch_headers(("DATA MISMATCH", "PENDING IN SF"))
     moved = []
+    ocr = OCREngine() if candidates else None
+    output_folder = (config_store.folders(create=False) or {}).get("output", "")
     for c in candidates:
+        before = c["status"]
         try:
-            before = c["status"]
-            res = revalidate_data_mismatch_header(c["header_id"], user_id)
-            if res and res["new_status"] != before:
-                moved.append({"header_id": c["header_id"], "file_name": res["file_name"],
-                              "from_status": before, "new_status": res["new_status"]})
+            reextracted = reextract_and_fix_description(c, ocr=ocr, output_folder=output_folder)
+        except Exception:  # noqa: BLE001 - one bad invoice must not stop the rest
+            traceback.print_exc()
+            reextracted = None
+        try:
+            if reextracted:
+                if reextracted["new_status"] != before:
+                    moved.append({"header_id": c["header_id"], "file_name": reextracted["file_name"],
+                                  "from_status": before, "new_status": reextracted["new_status"]})
+            else:
+                res = revalidate_data_mismatch_header(c["header_id"], user_id)
+                if res and res["new_status"] != before:
+                    moved.append({"header_id": c["header_id"], "file_name": res["file_name"],
+                                  "from_status": before, "new_status": res["new_status"]})
         except Exception:  # noqa: BLE001 - one bad invoice must not stop the rest
             traceback.print_exc()
             continue

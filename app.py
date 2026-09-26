@@ -248,7 +248,6 @@ def _run_line_description_continuation_fix_migration_impl():
     [Entry No.] - those stay exactly as already assigned. Best-effort per
     PDF: one failure is logged and skipped, never aborts the rest of the
     run or blocks startup."""
-    import json
     import traceback
     try:
         cfg = config_store.load_config()
@@ -258,9 +257,6 @@ def _run_line_description_continuation_fix_migration_impl():
             return  # DB not configured yet - nothing to migrate
 
         import database
-        import excel_export
-        import service_api
-        import template_store
 
         candidates = database.data_mismatch_headers(("DATA MISMATCH", "PENDING IN SF"))
         if not candidates:
@@ -270,76 +266,17 @@ def _run_line_description_continuation_fix_migration_impl():
             return
 
         from ocr_engine import OCREngine
-        from invoice_schema import build_invoice_json
 
         ocr = OCREngine()
         output_folder = (config_store.folders(create=False) or {}).get("output", "")
         fixed_lines = 0
         fixed_invoices = 0
         for c in candidates:
-            header_id, fname, json_path = c["header_id"], c["file_name"], c["source_json"]
             try:
-                if not json_path or not os.path.isfile(json_path):
-                    continue
-                path = config_store.find_pdf(fname)
-                if not path:
-                    continue
-                allow_scanned = bool(cfg.get(
-                    f"allow_scanned_pdfs_{c['invoice_type'].lower()}"
-                    if c["invoice_type"] in ("PART", "SERVICE") else "allow_scanned_pdfs_part"
-                ))
-                ocr_result = ocr.read_pdf(path, allow_scanned=allow_scanned)
-                invoice_groups = ocr_result.get("Invoices") or [ocr_result]
-                fresh = build_invoice_json(invoice_groups[0], path)
-                new_items = fresh.get("items") or []
-
-                with open(json_path, "r", encoding="utf-8") as fp:
-                    data = json.load(fp)
-                old_items = data.get("items") or []
-                if len(old_items) != len(new_items):
-                    continue  # today's fix also changed the item count - skip, don't guess
-                if all(
-                    (o.get("Description") or "").strip() == (n.get("Description") or "").strip()
-                    for o, n in zip(old_items, new_items)
-                ):
-                    continue  # nothing this migration is meant to touch changed
-
-                data["items"] = new_items
-                static, _ = template_store.static_for_path(output_folder, json_path)
-                data["_static"] = static
-                with open(json_path, "w", encoding="utf-8") as fp:
-                    json.dump(data, fp, indent=4, ensure_ascii=False)
-
-                if c["invoice_type"] == "SERVICE":
-                    field_mapping = excel_export.load_mapping()
-                    grouped = excel_export.build_rows_grouped([data])
-                    group = grouped["groups"][0] if grouped["groups"] else {"header": {}, "lines": [], "reservations": []}
-                    header_for_check = dict(group.get("header", {}))
-                    header_for_check["InvoiceNo"] = data.get("invoice_no", "")
-                    missing = excel_export.missing_required_fields(
-                        header_for_check, group.get("lines", []), group.get("reservations", []),
-                        field_mapping, invoice_type="SERVICE",
-                    )
-                    missing_names = sorted({m["field"] for m in missing})
-                    verdict = (
-                        {"status": "DATA MISMATCH", "is_active": False, "is_synced": False,
-                         "reason": "Missing required field(s): " + ", ".join(missing_names)}
-                        if missing_names else
-                        {"status": "READY TO LOAD", "is_active": True, "is_synced": False}
-                    )
-                else:
-                    verdict = service_api.enrich_invoice(data)
-
-                n = database.fix_purchase_line_descriptions(header_id, new_items)
-                if not n:
-                    continue
-                fixed_lines += n
-                fixed_invoices += 1
-                database.revalidate_header_after_description_fix(header_id, data, verdict)
-                database.log_event(
-                    "STATUS_CHANGED", header_id=header_id, to_status=verdict["status"],
-                    detail="Purchase Line Description corrected (continuation-line extraction "
-                           "fix) and re-validated during startup migration")
+                res = database.reextract_and_fix_description(c, ocr=ocr, output_folder=output_folder)
+                if res:
+                    fixed_lines += res["lines_changed"]
+                    fixed_invoices += 1
             except Exception:  # noqa: BLE001 - one bad PDF must not stop the rest
                 traceback.print_exc()
                 continue

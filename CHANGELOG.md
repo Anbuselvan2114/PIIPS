@@ -11,6 +11,21 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### "Recheck All" now also re-OCRs, not just re-checks Service First
+
+- The one-time startup migration only ever examines each invoice ONCE - an
+  invoice processed by a stale, not-yet-restarted worker right after that
+  flag was already set (or before some later extraction fix existed) never
+  gets a second look from it, and keeps a wrong Description forever (seen
+  on Spares Bazar - 148.pdf / SPRPUR/2026/09/10-86617: the description's
+  own continuation line - "3520 Palmrest with Kbd" - never made it into
+  what was saved).
+- "Recheck All" now does the SAME re-extraction the one-time migration
+  does, for every current DATA MISMATCH/PENDING IN SF invoice, before
+  falling back to a plain Service First re-check when nothing needed
+  re-extracting - so it's no longer dependent on a one-shot flag's exact
+  timing to catch this case; it can be run again any time.
+
 ### Part Description Mapping: the suggestion dropdown was missing options
 
 - A PO's suggestion dropdown was trimmed to hide any of the invoice's own
@@ -23,6 +38,14 @@ sub-versions.
   client-side (descriptionUsedElsewhereInPo, grayed out in the dropdown,
   re-checked server-side before ever saving). Removed the trim: every row
   now shows every one of its invoice's descriptions.
+- A second, separate cause of the same symptom: the dropdown was also
+  filtered, client-side, by the field's OWN pre-filled value - a Resolved
+  row's textarea starts full of its confirmed Service First description,
+  so the instant it was focused (before typing anything) every OTHER
+  suggestion that didn't happen to contain that exact text was hidden.
+  Now filtered only by what's actually been typed this session - focusing
+  an untouched field shows every suggestion, narrowing down only as the
+  user types something new.
 
 ### Part Description Mapping: "Recheck All" button for the pre-fix backlog
 
