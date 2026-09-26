@@ -11,6 +11,19 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### Invoice Search: View/Download, type-ahead suggestions, and a few polish fixes
+
+- File Name now has its own View (opens the shared PDF viewer) and
+  Download link, scoped to just that invoice's own pages the same way
+  every other PDF link in the app already is.
+- Typing in the search box now shows a live picklist of matching
+  invoices (debounced) - picking one fills the box and runs the full
+  search immediately; Enter/Search still work on their own regardless.
+- Removed the results table's own separate "Search…" box - redundant
+  with the page's own dedicated search above it.
+- A timeline entry with a blank who/when/what field now shows "Unknown"
+  there instead of a blank space.
+
 ### New menu: Invoice Search
 
 - Look up an invoice by Invoice No. (or part of it) to see its file name,
