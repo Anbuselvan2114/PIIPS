@@ -11,6 +11,26 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### "Recheck All" / the Description migration also refreshes a stale Buyer's Order No.
+
+- A misspelt PO ("SPRUR/..." instead of "SPRPUR/...") read as confident
+  instead of doubtful by an older extraction sent the invoice to PENDING
+  IN SF instead of BUYER ORDER NO DOESN'T EXIST (seen on Avantik -
+  254.pdf) - and, since only Descriptions were ever refreshed, nothing
+  ever re-checked or corrected it afterward either.
+- reextract_and_fix_description (shared by the one-time migration and
+  "Recheck All") now also refreshes the Buyer's Order No./doubtful flag
+  from a fresh re-OCR when it differs from what's stored, moving the
+  invoice to whatever status is now correct - UNLESS a human has since
+  keyed in a correction on Buyer Order Entry (BuyerOrderSource =
+  'MANUAL'), which is never touched or reverted. Verified both paths:
+  a stale doubtful flag gets corrected and the invoice moves to BUYER
+  ORDER NO DOESN'T EXIST; a manually-corrected PO is left untouched.
+- Also fixed: a PO-only correction (no Description change) used to be
+  silently dropped - the function bailed out before ever saving the
+  corrected value or re-validating, whenever fix_purchase_line_
+  descriptions found 0 lines actually needing a Description update.
+
 ### A partially-Loaded batch can be downloaded again for its remaining invoices
 
 - Previously, the moment ANY invoice in a batch reached Loaded (or Posted/

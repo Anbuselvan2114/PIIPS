@@ -2131,19 +2131,45 @@ def revalidate_data_mismatch_header(header_id, user_id=None):
             "is_active": verdict.get("is_active", False), "reason": verdict.get("reason", "")}
 
 
+def _buyer_order_is_manual(header_id):
+    """True if this header's CURRENT Buyer's Order No. was keyed in by a
+    human on Buyer Order Entry (BuyerOrderSource = 'MANUAL' - see
+    _stamp_tracker), never a PDF/OCR value - reextract_and_fix_description
+    must never silently revert that with a fresh re-OCR's own reading.
+    Sample: _buyer_order_is_manual(7353)"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT BuyerOrderSource FROM dbo.tbl_Purchase_Tracker WHERE Purchase_Header_ID = ?",
+            header_id)
+        row = cur.fetchone()
+        return bool(row and (row[0] or "").strip().upper() == "MANUAL")
+    finally:
+        conn.close()
+
+
 def reextract_and_fix_description(candidate, ocr=None, output_folder=None):
     """Re-OCR one DATA MISMATCH/PENDING IN SF candidate (a dict shaped like
     one of data_mismatch_headers()'s own rows) with today's extraction, and
-    - only when the item count is unchanged (a different count means
-    today's fix also changed WHICH rows exist, not just their text - too
-    different to positionally match, skipped rather than guessed at) and
-    at least one Description actually differs from what's stored - correct
-    just those Description(s) (fix_purchase_line_descriptions - PDF-sourced
-    data only) and re-validate the invoice (Service First for PART, the
-    mandatory-field gate for SERVICE), rebuilding only its Reservation
-    Entry rows and status/IsActive (revalidate_header_after_description_fix
-    - Service First-sourced data only). Never touches BatchName, [No.], or
-    [Entry No.].
+    correct whichever of these actually changed, then re-validate the
+    invoice (Service First for PART, the mandatory-field gate for SERVICE),
+    rebuilding only its Reservation Entry rows and status/IsActive
+    (revalidate_header_after_description_fix) - never BatchName, [No.], or
+    [Entry No.]:
+      - Purchase Line Description(s) (fix_purchase_line_descriptions) -
+        only when the item count is unchanged (a different count means
+        today's fix also changed WHICH rows exist, not just their text -
+        too different to positionally match, skipped rather than guessed
+        at) and at least one Description actually differs from what's
+        stored.
+      - The Buyer's Order No. / doubtful flag - just as easily wrong in an
+        old extraction as a Description (e.g. a misspelt "SPRUR/..." read
+        as a confident PO instead of doubtful, so the invoice went to
+        PENDING IN SF instead of BUYER ORDER NO DOESN'T EXIST) - refreshed
+        the same way, UNLESS a human has since confirmed/corrected it on
+        Buyer Order Entry (_buyer_order_is_manual), which must never be
+        silently reverted by a later re-OCR.
 
     Shared by the one-time startup migration (app.py's
     _run_line_description_continuation_fix_migration_impl) and the
@@ -2157,8 +2183,8 @@ def reextract_and_fix_description(candidate, ocr=None, output_folder=None):
     again on an environment that already completed it.
 
     Returns None if nothing changed (still current, or a PDF/JSON is
-    missing, or the item count changed), else {"header_id", "file_name",
-    "lines_changed", "new_status"}.
+    missing, or the item count changed with nothing else to fix either),
+    else {"header_id", "file_name", "lines_changed", "new_status"}.
     Sample: reextract_and_fix_description(data_mismatch_headers()[0])"""
     import config_store
     import excel_export
@@ -2189,15 +2215,33 @@ def reextract_and_fix_description(candidate, ocr=None, output_folder=None):
     with open(json_path, "r", encoding="utf-8") as fp:
         data = json.load(fp)
     old_items = data.get("items") or []
-    if len(old_items) != len(new_items):
-        return None  # today's fix also changed the item count - skip, don't guess
-    if all(
+
+    # A different item count means today's fix also changed WHICH rows
+    # exist, not just their text - too different to positionally match
+    # Descriptions, skipped rather than guessed at (the PO check below is
+    # independent and still runs either way).
+    items_changed = len(old_items) == len(new_items) and not all(
         (o.get("Description") or "").strip() == (n.get("Description") or "").strip()
         for o, n in zip(old_items, new_items)
-    ):
+    )
+
+    old_po = (data.get("buyer_order_no") or "").strip()
+    new_po = (fresh.get("buyer_order_no") or "").strip()
+    new_doubtful = bool(fresh.get("buyer_order_doubtful"))
+    po_changed = (
+        not _buyer_order_is_manual(header_id)
+        and (new_po != old_po or new_doubtful != bool(data.get("buyer_order_doubtful")))
+    )
+
+    if not items_changed and not po_changed:
         return None  # nothing this re-extraction is meant to touch changed
 
-    data["items"] = new_items
+    if items_changed:
+        data["items"] = new_items
+    if po_changed:
+        data["buyer_order_no"] = new_po
+        data["buyer_order_doubtful"] = new_doubtful
+
     if output_folder is None:
         output_folder = (config_store.folders(create=False) or {}).get("output", "")
     static, _ = template_store.static_for_path(output_folder, json_path)
@@ -2225,14 +2269,17 @@ def reextract_and_fix_description(candidate, ocr=None, output_folder=None):
     else:
         verdict = service_api.enrich_invoice(data)
 
-    n = fix_purchase_line_descriptions(header_id, new_items)
-    if not n:
-        return None
+    lines_changed = fix_purchase_line_descriptions(header_id, new_items) if items_changed else 0
     revalidate_header_after_description_fix(header_id, data, verdict)
+    detail_parts = []
+    if items_changed:
+        detail_parts.append("Purchase Line Description corrected (continuation-line extraction fix)")
+    if po_changed:
+        detail_parts.append(f"Buyer's Order No. corrected ('{old_po or '(blank)'}' -> '{new_po or '(blank)'}')")
     log_event(
         "STATUS_CHANGED", header_id=header_id, to_status=verdict["status"],
-        detail="Purchase Line Description corrected (continuation-line extraction fix) and re-validated")
-    return {"header_id": header_id, "file_name": fname, "lines_changed": n, "new_status": verdict["status"]}
+        detail=" and ".join(detail_parts) + ", re-validated")
+    return {"header_id": header_id, "file_name": fname, "lines_changed": lines_changed, "new_status": verdict["status"]}
 
 
 def revalidate_all_data_mismatch(user_id=None):
