@@ -765,26 +765,34 @@ def get_processed_invoices():
 
 # Statuses an existing header may be re-processed FROM (in place, same
 # header/batch/No.) instead of the re-upload being parked as a DUPLICATE -
-# see reprocess_reworkable_header. All five represent an invoice that never
+# see reprocess_reworkable_header. Each represents an invoice that never
 # reached a real, final outcome the first time - Excluded is a deliberate
 # drop (a real re-inclusion - see _mark_batch_reincluded); Pending In SF
-# just means the part hadn't reached Service First yet; Data Mismatch and
-# New Template mean the data/format wasn't usable last time; Unsupported
-# means the format matched but something essential (e.g. the Vendor
-# Invoice No.) couldn't be read - in every case, a fresh upload deserves a
-# fresh look rather than being told it's a duplicate of itself. This
-# re-processing only ever happens when a USER deliberately re-uploads that
-# exact file and starts a run - nothing here pulls a file back in on its
-# own (see processor.py's main loop, which is the only caller, driven by
-# whatever the user just uploaded).
-# MANUALLY UPDATED is deliberately NOT in this list - it's what Data
-# Mismatch/Excluded/New Template becomes once usp_ExpireStaleUnresolved
-# parks it as permanently unresolved (Pending In SF is NOT swept by that
-# expiry - a re-upload can still merge into it as before); unlike the
-# five statuses below, a re-upload of a Manually Updated invoice must
-# fall through to DUPLICATE, never merge back in.
+# just means the part hadn't reached Service First yet; New Template means
+# the format wasn't usable last time; Unsupported means the format matched
+# but something essential (e.g. the Vendor Invoice No.) couldn't be read -
+# in every case, a fresh upload deserves a fresh look rather than being
+# told it's a duplicate of itself. This re-processing only ever happens
+# when a USER deliberately re-uploads that exact file and starts a run -
+# nothing here pulls a file back in on its own (see processor.py's main
+# loop, which is the only caller, driven by whatever the user just
+# uploaded).
+# DATA MISMATCH is deliberately NOT in this list - its intended fix path
+# is the Part Description Mapping menu (correct the description/part on
+# Service First's own side, then Update or Recheck All re-validates it in
+# place), not a re-upload; re-uploading the same PDF would just re-run the
+# same extraction against the same still-wrong Service First data and land
+# right back at DATA MISMATCH, so a re-upload now falls through to
+# DUPLICATE like any other already-processed invoice, steering the user
+# back to Part Description Mapping instead of a pointless reprocess.
+# MANUALLY UPDATED is likewise NOT in this list - it's what Excluded/New
+# Template (or, before today, Data Mismatch) becomes once
+# usp_ExpireStaleUnresolved parks it as permanently unresolved (Pending In
+# SF is NOT swept by that expiry - a re-upload can still merge into it as
+# before); a re-upload of a Manually Updated invoice must fall through to
+# DUPLICATE, never merge back in.
 # KEEP IN SYNC with usp_GetProcessedInvoices' own copy of this list.
-_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "DATA MISMATCH", "NEW TEMPLATE", "UNSUPPORTED")
+_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "NEW TEMPLATE", "UNSUPPORTED")
 
 
 def reprocess_reworkable_header(existing_header_id, new_header_id):
@@ -4400,18 +4408,21 @@ _MENU_PROC_DDL = [
         -- StatusID = 0 means the file was reset (moved to New_Format) and may
         -- be uploaded again by anyone, so it is NOT treated as a duplicate.
         -- Same for a file whose linked invoice is currently in any of
-        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/New
-        -- Template/Unsupported) - KEEP THIS LIST IN SYNC with database.
+        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/New Template/
+        -- Unsupported) - KEEP THIS LIST IN SYNC with database.
         -- _REPROCESSABLE_STATUSES. Re-uploading one of these is a deliberate
         -- correction (see processor.py/reprocess_reworkable_header), not a
         -- duplicate, so it must reach processing rather than being silently
-        -- skipped here before it ever gets that far.
+        -- skipped here before it ever gets that far. DATA MISMATCH is
+        -- deliberately excluded from this list - its fix path is Part
+        -- Description Mapping, not a re-upload (see _REPROCESSABLE_STATUSES'
+        -- own comment) - so a re-upload of one now IS treated as a duplicate.
         SELECT r.RelPath, r.FileName, r.InitiatedByID, u.UserName AS InitiatedByName,
                r.InitiatedDatetime
         FROM ranked r
         LEFT JOIN dbo.tbl_user u ON u.UserId = r.InitiatedByID
         WHERE r.rn = 1 AND ISNULL(r.StatusID, -1) <> 0
-          AND ISNULL(r.StatusName, '') NOT IN ('EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE', 'UNSUPPORTED');
+          AND ISNULL(r.StatusName, '') NOT IN ('EXCLUDED', 'PENDING IN SF', 'NEW TEMPLATE', 'UNSUPPORTED');
     END
     """,
     # ---- Reset input-file log entries (moved to New_Format) --------------
@@ -4619,8 +4630,9 @@ _MENU_PROC_DDL = [
         -- BatchName now lives on the tracker (informational for dedup).
         -- HeaderId/IsReprocessable let the caller re-process an invoice
         -- whose only existing record is in one of database.
-        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/
-        -- New Template/Unsupported), instead of flagging it as a duplicate
+        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/New Template/
+        -- Unsupported - DATA MISMATCH deliberately excluded, see that
+        -- constant's own comment), instead of flagging it as a duplicate
         -- (see database.get_processed_invoices/reprocess_reworkable_header)
         -- - KEEP THIS LIST IN SYNC with _REPROCESSABLE_STATUSES. Picks one
         -- representative header per invoice no. (MIN Id) since an invoice
@@ -4632,7 +4644,7 @@ _MENU_PROC_DDL = [
         SELECT h.InvoiceNo, MIN(pt.BatchName) AS BatchName,
                MIN(h.Id) AS HeaderId,
                MAX(CASE WHEN s.StatusName IN (
-                       'EXCLUDED', 'PENDING IN SF', 'DATA MISMATCH', 'NEW TEMPLATE', 'UNSUPPORTED'
+                       'EXCLUDED', 'PENDING IN SF', 'NEW TEMPLATE', 'UNSUPPORTED'
                    ) THEN 1 ELSE 0 END) AS IsReprocessable,
                MIN(pt.BuyerOrderNo) AS BuyerOrderNo
         FROM dbo.tbl_Purchase_Header h

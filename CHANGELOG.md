@@ -11,6 +11,35 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### A partially-Loaded batch can be downloaded again for its remaining invoices
+
+- Previously, the moment ANY invoice in a batch reached Loaded (or Posted/
+  Completed/Rejected), the whole batch could never be downloaded again -
+  even invoices still sitting at Ready to Load (a partial Load: only some
+  of the batch was taken on to NAV so far). Those invoices had no way
+  back into an active batch short of excluding and re-uploading them.
+- Now, a locked batch can still be downloaded as long as it has invoices
+  left at Ready to Load - the export (and any custom Document No./Entry
+  No.) only ever touches those still-pending invoices; one already past
+  Ready to Load is never re-fetched, re-exported, or renumbered (verified:
+  a mixed Ready to Load + Loaded batch now downloads, and only the
+  Ready to Load invoice is ever included). A batch only refuses download
+  outright once there's genuinely nothing left to download.
+
+### Data Mismatch is no longer reprocessable by re-upload
+
+- Re-uploading a DATA MISMATCH invoice used to merge fresh extraction back
+  onto the same invoice (like Excluded/Pending In SF/New Template/
+  Unsupported still do) - but its intended fix path is now the Part
+  Description Mapping menu (correct the description/part on Service
+  First's own side, then Update or Recheck All re-validates it in place),
+  not a re-upload, which would just re-run the same extraction against the
+  same still-wrong Service First data and land right back at DATA
+  MISMATCH. A re-upload of one now falls through to DUPLICATE instead,
+  same as any other already-processed invoice. Verified: reprocessing and
+  the duplicate-detection procedure both now correctly refuse a DATA
+  MISMATCH header.
+
 ### "Recheck All" now also re-OCRs, not just re-checks Service First
 
 - The one-time startup migration only ever examines each invoice ONCE - an

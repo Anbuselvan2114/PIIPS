@@ -703,9 +703,9 @@ class JobManager:
                             # does for every other status.
                             #
                             # Exception: if that existing record is currently
-                            # Excluded, Pending In SF, Data Mismatch, or New
-                            # Template (database._REPROCESSABLE_STATUSES) - it
-                            # never reached a real final outcome - a
+                            # Excluded, Pending In SF, New Template, or
+                            # Unsupported (database._REPROCESSABLE_STATUSES) -
+                            # it never reached a real final outcome - a
                             # deliberate re-upload is treated as a retry, not
                             # a duplicate - its Header/Tracker rows are
                             # updated in place (same Id, not a new-looking

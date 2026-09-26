@@ -1478,17 +1478,28 @@ def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, e
     start_entry_no = _to_int(entry_no, "entry_no")
 
     locked = database.is_batch_locked(name)
-    if locked:
+    all_batches = database.list_batches()
+    this_batch = next((b for b in all_batches if b.get("batch") == name), None)
+    pending = (this_batch or {}).get("counts", {}).get("READY TO LOAD", 0)
+
+    # A locked batch (something in it already Loaded/Posted/Completed/
+    # Rejected) still refuses a download once there's nothing LEFT to
+    # download - but if some invoices are still sitting at Ready to Load
+    # (a partial Load: some of the batch was taken on to NAV, some wasn't),
+    # the remaining ones must still be reachable. usp_FetchBatch already
+    # only ever fetches invoices NOT YET past Ready to Load, so this can
+    # never re-touch or re-mint a Document No./Entry No. for one that's
+    # already Loaded+ - only the still-pending ones are ever exported or
+    # renumbered here, regardless of the batch's own lock state.
+    if locked and not pending:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Batch '{name}' has an invoice already Loaded, Excluded, "
-                "Posted, Completed, or Rejected — it can no longer be "
-                "downloaded or have its Document No./Entry No. renumbered."
+                "Posted, Completed, or Rejected, and nothing left at Ready "
+                "to Load - there's nothing left to download."
             ),
         )
-
-    all_batches = database.list_batches()
 
     # An invoice still parked at Buyer Order No Doesn't Exist has nothing
     # usable for Navision yet - block the whole batch's download rather
