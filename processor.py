@@ -1469,8 +1469,25 @@ class JobManager:
             filenames = database.expire_stale_unresolved()
             if filenames:
                 print(f"Expired {len(filenames)} stale record(s) to Manually Updated")
+                # The DB status change above already committed per row - a
+                # file-move failure here (locked/open file, one already
+                # moved/renamed by hand, a permission issue, ...) must never
+                # abort the loop and strand every file AFTER it in its old
+                # folder despite its status already correctly saying
+                # Manually Updated. One failure is logged and skipped.
+                moved = 0
                 for fname in filenames:
-                    config_store.move_pdf_to_status(fname, "MANUALLY UPDATED")
+                    try:
+                        dest = config_store.move_pdf_to_status(fname, "MANUALLY UPDATED")
+                        if dest:
+                            moved += 1
+                        else:
+                            print(f"Could not locate '{fname}' on disk to move to Manually Updated")
+                    except Exception:  # noqa: BLE001 - one bad file must not stop the rest
+                        traceback.print_exc()
+                if moved != len(filenames):
+                    print(f"Moved {moved}/{len(filenames)} expired file(s) to Manually Updated "
+                          f"({len(filenames) - moved} left in their current folder - see above)")
 
             unsupported = config_store.expire_stale_files(
                 "UNSUPPORTED", database.STALE_STATUS_EXPIRY_DAYS, "MANUALLY UPDATED"

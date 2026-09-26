@@ -868,6 +868,29 @@ def invoices_by_status(status_id: int):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+@app.get("/api/invoices/search")
+def invoices_search(q: str = ""):
+    """Invoice Search menu: invoices whose Invoice No. contains `q`, each
+    with its file name/vendor/batch/batch status/file status."""
+    import database
+    try:
+        return {"invoices": database.search_invoices_by_number(q)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/invoices/{header_id}/history")
+def invoice_history(header_id: int):
+    """Who did what and when for one invoice (Invoice Search menu's
+    tracking-history timeline) - every audit event recorded for it, newest
+    first."""
+    import database
+    try:
+        return {"events": database.get_audit(header_id=header_id, limit=500)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 @app.get("/api/invoices/{header_id}/fields")
 def invoice_field_check(header_id: int):
     """Field-by-field mandatory-data breakdown for one invoice (Dashboard

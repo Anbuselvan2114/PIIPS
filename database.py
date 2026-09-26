@@ -1837,6 +1837,27 @@ def _table_exists(cur, table):
     return cur.fetchone() is not None
 
 
+def search_invoices_by_number(query, limit=200):
+    """Invoices whose Invoice No. contains `query` (Invoice Search menu) -
+    same display shape as _invoice_list (file name, vendor, batch, file
+    status, ...), plus each row's own batch_status (see list_batches -
+    CREATED/DOWNLOADED/IN PROGRESS/LOADED/POSTED/COMPLETED/EXCLUDED), so a
+    user can see which batch an invoice is in and how that batch itself is
+    progressing without a separate lookup. Blank query returns nothing (no
+    "browse everything" mode - this is a targeted lookup by number).
+    Sample: search_invoices_by_number('AVS/26-27/00668')"""
+    q = (query or "").strip()
+    if not q:
+        return []
+    rows = _invoice_list("h.InvoiceNo LIKE ?", [f"%{q}%"])[:limit]
+    if not rows:
+        return rows
+    batch_status_by_name = {b["batch"]: b["batch_status"] for b in list_batches()}
+    for r in rows:
+        r["batch_status"] = batch_status_by_name.get(r["batch"], "")
+    return rows
+
+
 def invoices_by_status(status_id):
     """Invoices whose tracker status is `status_id` (pie-slice pop-up).
     Sample: invoices_by_status(5)"""
@@ -1881,12 +1902,12 @@ def invoices_by_statuses(status_names, active_only=False):
 # a one-time seed, not read on every request, so a stale key here only
 # matters for a brand new deployment's first run.
 _ROLE_MENU_DEFAULTS = {
-    "admin": ["dashboard", "input", "manual", "buyerorder", "vendorcode", "partdescupdate",
+    "admin": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate",
               "load", "post", "complete",
               "configuration", "apiconfig", "template", "createfield", "users"],
-    "user": ["dashboard", "input", "manual", "buyerorder", "vendorcode", "partdescupdate", "load"],
-    "accounts": ["dashboard", "input", "manual", "post", "complete"],
-    "viewer": ["dashboard", "input", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
+    "user": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load"],
+    "accounts": ["dashboard", "input", "manual", "invoicesearch", "post", "complete"],
+    "viewer": ["dashboard", "input", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
 }
 
 
@@ -4878,6 +4899,23 @@ def ensure_menu_schema(force=False):
         for ddl in _MENU_TABLE_DDL:
             cur.execute(ddl)
         conn.commit()
+
+        # A brand new deployment's tbl_RoleMenu is empty and gets the full
+        # _ROLE_MENU_DEFAULTS the first time get_role_menus() is called - but
+        # an EXISTING deployment's table already has rows, so adding a new
+        # menu key to that dict (invoicesearch) would otherwise never reach
+        # it without a Super Admin manually visiting Screen Access and
+        # re-saving. Backfill it for every configurable role whenever it's
+        # missing, so it's available everywhere immediately - safe/idempotent
+        # to run on every startup (a no-op once each role already has it).
+        cur.execute("SELECT 1 FROM sys.tables WHERE name = 'tbl_RoleMenu'")
+        if cur.fetchone():
+            for role in ("admin", "user", "accounts", "viewer"):
+                cur.execute(
+                    "IF NOT EXISTS (SELECT 1 FROM dbo.tbl_RoleMenu WHERE RoleName = ? AND MenuKey = ?) "
+                    "INSERT INTO dbo.tbl_RoleMenu (RoleName, MenuKey) VALUES (?, ?)",
+                    role, "invoicesearch", role, "invoicesearch")
+            conn.commit()
 
         # Normalise legacy table/column names BEFORE (re)creating the
         # procedures, whose static references use the final names.

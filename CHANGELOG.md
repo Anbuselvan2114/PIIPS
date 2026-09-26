@@ -11,6 +11,29 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### New menu: Invoice Search
+
+- Look up an invoice by Invoice No. (or part of it) to see its file name,
+  vendor, batch, that batch's own status, the invoice's own current
+  status, and a full timeline of who did what and when (processing,
+  Buyer Order Entry, Part Description Mapping updates, Load/Post/
+  Complete, ...) - a read-only lookup, available to every role.
+- Available immediately for existing deployments too, not just new ones -
+  backfilled into every role's Screen Access on next startup, no manual
+  Super Admin step needed.
+
+### A 31-day-expired invoice's PDF could get stranded in its old folder
+
+- Parking a stale invoice as Manually Updated updates its database status
+  for every expired invoice in one commit, then moves each one's PDF into
+  the Manually Updated folder in a plain loop with no per-file error
+  handling - one file failing to move (locked/open, already moved by
+  hand, a permission issue, ...) aborted the whole loop, leaving every
+  file AFTER it stranded in its old folder even though its status already
+  said Manually Updated. Fixed: one failure is now logged and skipped,
+  never blocks the rest. Verified: a simulated failure on one of three
+  files still correctly moves the other two.
+
 ### "Recheck All" / the Description migration also refreshes a stale Buyer's Order No.
 
 - A misspelt PO ("SPRUR/..." instead of "SPRPUR/...") read as confident

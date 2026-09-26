@@ -7,6 +7,7 @@ export const MENU = [
   ["dashboard", "Dashboard", "▤", "Main"],
   ["input", "File Explorer", "🗂", "Main"],
   ["manual", "Manual", "📖", "Main"],
+  ["invoicesearch", "Invoice Search", "🔎", "Main"],
   ["buyerorder", "Buyer Order Entry", "✎", "Review & Update"],
   ["vendorcode", "Vendor Code Entry", "🏷", "Review & Update"],
   ["partdescupdate", "Part Description Mapping", "📝", "Review & Update"],

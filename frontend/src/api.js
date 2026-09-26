@@ -120,6 +120,12 @@ export const getInvoicesByBatch = (batch) =>
 export const getInvoiceFieldCheck = (headerId) =>
   request(`/api/invoices/${encodeURIComponent(headerId)}/fields`);
 
+export const searchInvoices = (q) =>
+  request(`/api/invoices/search?q=${encodeURIComponent(q)}`);
+
+export const getInvoiceHistory = (headerId) =>
+  request(`/api/invoices/${encodeURIComponent(headerId)}/history`);
+
 export const invoicePdfUrl = (file, page, pageEnd) =>
   withToken(
     `${API_BASE}/api/invoices/pdf?file=${encodeURIComponent(file)}` +
