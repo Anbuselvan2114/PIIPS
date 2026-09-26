@@ -405,6 +405,7 @@ export default function Dashboard({ user }) {
   const canDownload = (row) => (row.exportable ?? 1) > 0 && (row["st:READY TO LOAD"] ?? 0) > 0
     && !row.locked && !(row.blocked_by || []).length
     && !(row["st:BUYER ORDER NO DOESN'T EXIST"] ?? 0)
+    && !(row["st:DATA MISMATCH"] ?? 0)
     && !batches.some((b) => b.batch !== row.batch
       && (b.batch_status === "DOWNLOADED" || b.batch_status === "IN PROGRESS"));
 
@@ -478,6 +479,8 @@ export default function Dashboard({ user }) {
                 ? `Waiting on earlier batch(es) to be Loaded, Posted, or Completed first: ${row.blocked_by.join(", ")}`
                 : (row["st:BUYER ORDER NO DOESN'T EXIST"] ?? 0)
                 ? "Kindly fill in the Buyer Order No for every invoice in this batch before downloading."
+                : (row["st:DATA MISMATCH"] ?? 0)
+                ? "Kindly resolve the Data Mismatch invoice(s) in this batch before downloading."
                 : "No active / included invoices to export, or every invoice in this batch has already moved past Ready to Load"}>—</span>
       )) },
   ];

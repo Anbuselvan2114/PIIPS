@@ -11,6 +11,104 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### Stale unresolved invoices now get 31 days before auto-parking, not 10
+
+- `STALE_STATUS_EXPIRY_DAYS` (database.py) is now 31, not 10. A Data
+  Mismatch/Excluded/New Template/Buyer Order No Doesn't Exist/NAV Vendor
+  Code Doesn't Exist invoice now has a full month to get resolved before
+  it's permanently parked as Manually Updated.
+
+### A same-part, multi-serial line never resolved even after the description was confirmed
+
+- A vendor can print the SAME physical part twice on one PO as separate
+  serialized units (e.g. two individual monitors, "...RAA06UW05165" /
+  "...RAA06UW05168"). Service First tracks purchasing demand by PART, not
+  serial, so it only ever has ONE record - and one confirmed description -
+  covering both. Whichever unit's own PDF text didn't happen to equal that
+  one confirmed string could never get its own match, no matter how many
+  times a description got "confirmed" - it stayed DATA MISMATCH forever
+  (seen on Computer Point - 1233.pdf / SPRPUR/2026/09/07-86531).
+- Fixed: a line sharing the same HSN/SAC code and Rate as an already-
+  resolved sibling on the same PO now inherits its resolved Nav Item No/HSN
+  data too, instead of staying permanently unmatched.
+- Fixed alongside it: when two lines DO share one Nav Item No, every
+  matching Service First reservation unit was being attributed to only the
+  LAST such line (a plain dict collapsing the duplicate key) - the other
+  line kept zero reservations even though it was just as genuinely
+  received. Reservation units now correctly split one-per-line.
+- Purchase Line's own Service-First-sourced columns (No., HSN/SAC Code, GST
+  Group Code/Type, GST %) are now re-synced when an invoice is re-validated
+  after a description fix - previously only the invoice's status/Reservation
+  Entry rows were, leaving a resolved line's own [No.] column stuck blank
+  even though the invoice had already moved to READY TO LOAD.
+- Checked against the two lines this exact PO already has (correctly
+  merged) and a different invoice's two same-HSN, different-Rate lines
+  (correctly left alone, as genuinely different parts) - no regression on
+  the other DATA MISMATCH/PENDING IN SF invoices re-checked alongside it.
+
+### Part Description Mapping: irregular whitespace could push a description that never actually matches
+
+- Only `.strip()` was applied before pushing a description to Service First -
+  an embedded newline or double space (e.g. from a PdfDescriptions
+  suggestion whose own OCR text still had one) survived into what got saved
+  to Service First. PIIPS's own "already resolved" check collapses
+  whitespace, so the row looked "✓ Updated" here, but Service First's own
+  item-catalog match against the PDF's real, single-spaced text kept
+  failing forever after - the invoice silently never left DATA MISMATCH
+  (seen on ATH Printer - 2117.pdf). Fixed: the description is now collapsed
+  to single spaces before both the duplicate-description check and the
+  actual push to Service First.
+
+### The Description continuation-line migration now also covers Pending in SF
+
+- The one-time startup migration that re-checks a DATA MISMATCH invoice's
+  Description for the continuation-line bug now also examines PENDING IN SF
+  invoices - one parked there for an unrelated reason (Service First just
+  hasn't received the part yet) can still be carrying the same bad
+  Description from before the fix existed. Same scope as before: only
+  Description (PDF-sourced) and Reservation Entry/status (Service First-
+  sourced) are ever touched; BatchName, [No.], and [Entry No.] are never
+  part of what it writes.
+
+### Part Description Mapping: real invoice grouping, and the row now refreshes after Update
+
+- Rows for the same invoice now show under one banner ("Invoice: ... · PO:
+  ... · N of M description(s) updated"), sorted so an invoice's parts are
+  always adjacent - not just a same-order sort with no visible grouping.
+- Clicking Update previously left the row's Status/color stuck on "Pending"
+  until a manual Refresh, even though the save had actually gone through
+  (and, per the entry above, may have already moved the invoice off DATA
+  MISMATCH entirely). It now re-fetches right after a successful save, so
+  the row flips to "✓ Updated" (or drops off the list, if its invoice
+  fully cleared) immediately.
+- `DataTable` (the shared table component) gained two small opt-in props
+  behind this - `rowStyle` (per-row background) and `groupBy` /
+  `renderGroupHeader` (a banner row wherever the group key changes) - every
+  other screen using it is unaffected, since neither is passed there.
+
+### Part Description Mapping: updating a description now re-checks the invoice
+
+- Previously, correcting a part's description on this screen only pushed the
+  fix to Service First - the invoice stayed at DATA MISMATCH until some
+  later, unrelated run happened to re-check it. It now re-validates the
+  invoice against Service First right away and moves it to whatever status
+  is now correct.
+- The screen now shows an invoice's parts TOGETHER, including ones already
+  resolved (previously dropped from view entirely) - a green "✓ Updated" row
+  for a part that already matches the invoice, amber "⏳ Pending" for one
+  that still needs a description fix - and sorts rows so the same invoice's
+  parts land next to each other by default.
+
+### A Data Mismatch invoice now blocks its whole batch's download
+
+- Previously, downloading a batch simply skipped any Data Mismatch invoice
+  (it's inactive, so it was never included in the Excel) and exported
+  whatever was Ready to Load around it. Now, same as a missing Buyer Order
+  No, a Data Mismatch invoice blocks the ENTIRE batch's download until it's
+  resolved - the batch stays CREATED, Download is disabled on the
+  Dashboard, and the server refuses the download too if it's called
+  directly.
+
 ### One-time migration: re-check DATA MISMATCH invoices for the Description fix
 
 - On first start after this update, every invoice currently at DATA MISMATCH

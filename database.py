@@ -28,7 +28,7 @@ ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 # never reprocessable again. Unsupported gets the same treatment by
 # filesystem age instead, since it never gets a database row at all (see
 # config_store.expire_stale_files).
-STALE_STATUS_EXPIRY_DAYS = 10
+STALE_STATUS_EXPIRY_DAYS = 31
 
 
 # Ordered status values for tbl_status.
@@ -2045,48 +2045,131 @@ def purchase_header_id_for_invoice(buyer_order_no, file_name, status_name):
         conn.close()
 
 
-def data_mismatch_headers():
-    """[{"header_id", "file_name", "source_json", "invoice_type", "buyer_order_no"}]
-    for every non-excluded invoice currently at DATA MISMATCH - feeds the
-    one-time continuation-line Description re-extraction migration (app.py's
-    _run_line_description_continuation_fix_migration).
-    Sample: data_mismatch_headers()"""
+def data_mismatch_headers(status_names=("DATA MISMATCH",)):
+    """[{"header_id", "file_name", "source_json", "invoice_type",
+    "buyer_order_no", "status"}] for every non-excluded invoice currently at
+    one of `status_names` - feeds the one-time continuation-line Description
+    re-extraction migration (app.py's
+    _run_line_description_continuation_fix_migration), which also passes
+    PENDING IN SF so an invoice waiting on Service First for an unrelated
+    reason still gets its Description corrected if it happens to carry the
+    same bug - the migration only ever touches Description (PDF-sourced) and
+    Reservation Entry / status (Service First-sourced); BatchName, [No.] and
+    [Entry No.] are never part of what it writes.
+    Sample: data_mismatch_headers(('DATA MISMATCH', 'PENDING IN SF'))"""
     ensure_menu_schema()
     conn = get_connection()
     try:
         cur = conn.cursor()
+        placeholders = ", ".join("?" for _ in status_names)
         cur.execute(
             "SELECT pt.Purchase_Header_ID, pt.FileName, pt.SourceJson, "
-            "  it.InvoiceTypeName, pt.BuyerOrderNo "
+            "  it.InvoiceTypeName, pt.BuyerOrderNo, s.StatusName "
             "FROM dbo.tbl_Purchase_Tracker pt WITH (NOLOCK) "
             "JOIN dbo.tbl_Status s WITH (NOLOCK) ON s.StatusId = pt.StatusID "
             "LEFT JOIN dbo.tbl_InvoiceType it WITH (NOLOCK) ON it.InvoiceTypeID = pt.InvoiceTypeID "
-            "WHERE s.StatusName = 'DATA MISMATCH' AND ISNULL(pt.IsExcluded, 0) = 0"
+            f"WHERE s.StatusName IN ({placeholders}) AND ISNULL(pt.IsExcluded, 0) = 0",
+            *status_names,
         )
         return [
             {"header_id": hid, "file_name": fname, "source_json": jpath,
-             "invoice_type": (itype or "").strip().upper(), "buyer_order_no": po}
-            for hid, fname, jpath, itype, po in cur.fetchall()
+             "invoice_type": (itype or "").strip().upper(), "buyer_order_no": po,
+             "status": sname}
+            for hid, fname, jpath, itype, po, sname in cur.fetchall()
         ]
     finally:
         conn.close()
 
 
+def revalidate_data_mismatch_header(header_id, user_id=None):
+    """Re-run Service First for one PART invoice still at DATA MISMATCH,
+    using its extracted JSON exactly as last saved (no re-OCR - the fix,
+    if any, already happened on Service First's own side, e.g. a
+    corrected part description on Part Description Mapping), and persist
+    whatever verdict that now produces. A no-op (returns None) if the
+    header isn't found, its JSON is missing, or it's not a PART invoice
+    (SERVICE never calls Service First, so there's nothing here to re-run).
+    Sample: revalidate_data_mismatch_header(7353, 7)"""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT pt.SourceJson, pt.FileName, it.InvoiceTypeName "
+            "FROM dbo.tbl_Purchase_Tracker pt "
+            "LEFT JOIN dbo.tbl_InvoiceType it ON it.InvoiceTypeID = pt.InvoiceTypeID "
+            "WHERE pt.Purchase_Header_ID = ?", header_id)
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    json_path, file_name, invoice_type = row
+    if (invoice_type or "").strip().upper() != "PART":
+        return None
+    if not json_path or not os.path.isfile(json_path):
+        return None
+
+    import service_api
+    with open(json_path, "r", encoding="utf-8") as fp:
+        data = json.load(fp)
+    verdict = service_api.enrich_invoice(data)
+    with open(json_path, "w", encoding="utf-8") as fp:
+        json.dump(data, fp, indent=4, ensure_ascii=False)
+
+    revalidate_header_after_description_fix(header_id, data, verdict, user_id)
+    log_event("STATUS_CHANGED", header_id=header_id, user_id=user_id, to_status=verdict["status"],
+              detail="Re-checked against Service First after a Part Description Mapping update")
+    return {"file_name": file_name, "new_status": verdict["status"],
+            "is_active": verdict.get("is_active", False), "reason": verdict.get("reason", "")}
+
+
+# Purchase Line columns whose value comes straight from Service First (see
+# service_api._apply_hsn_map) - the only ones revalidate_header_after_
+# description_fix ever touches on tbl_Purchase_Line itself, matched
+# positionally by [Line No.] (see fix_purchase_line_descriptions - Line No.
+# is minted sequentially in extraction order, so the Nth existing line is
+# always the Nth item in `data["items"]`).
+_SF_SOURCED_LINE_COLUMNS = ("No.", "HSN/SAC Code", "GST Group Code", "GST Group Type", "GST %")
+
+
 def revalidate_header_after_description_fix(header_id, data, verdict, user_id=None):
     """Persist a freshly-recomputed verdict for one header after its
     Purchase Line Description(s) were corrected by re-extraction (see the
-    one-time migration in app.py): rebuilds Reservation Entry rows from
-    `data` (empty for a SERVICE invoice, which never has any) and updates
-    the tracker's StatusID / IsActive via usp_ReplaceReservation, exactly
-    like a Buyer Order No / NAV vendor code correction does.
+    one-time migration in app.py), or after a sibling on the same PO let
+    Service First resolve THIS line too (a vendor prints the same physical
+    part as separate serialized units - SF only tracks it as one part, so
+    confirming one unit's description can now resolve another's Nav Item No
+    too - see service_api._apply_hsn_map's sibling fallback): rebuilds
+    Reservation Entry rows from `data` (empty for a SERVICE invoice, which
+    never has any), re-syncs the Service-First-sourced Purchase Line
+    columns (_SF_SOURCED_LINE_COLUMNS - description/PDF-sourced columns are
+    never touched here), and updates the tracker's StatusID / IsActive via
+    usp_ReplaceReservation, exactly like a Buyer Order No / NAV vendor code
+    correction does.
     Sample: revalidate_header_after_description_fix(7378, data, {"status": "READY TO LOAD", "is_active": True}, 7)"""
     import excel_export
     grouped = excel_export.build_rows_grouped([data])
-    group = grouped["groups"][0] if grouped["groups"] else {"reservations": []}
+    group = grouped["groups"][0] if grouped["groups"] else {"reservations": [], "lines": []}
     re_cols = grouped["columns"]["Reservation Entry"]
     conn = get_connection()
     try:
         cur = conn.cursor()
+
+        new_lines = group.get("lines") or []
+        if new_lines:
+            cur.execute(
+                "SELECT Id FROM dbo.tbl_Purchase_Line WHERE Purchase_Header_ID = ? "
+                "ORDER BY [Line No.]", header_id)
+            existing_ids = [r[0] for r in cur.fetchall()]
+            cols = [c for c in _SF_SOURCED_LINE_COLUMNS if c in (new_lines[0] or {})]
+            if cols:
+                set_clause = ", ".join(f"[{c}] = ?" for c in cols)
+                for line_id, line in zip(existing_ids, new_lines):
+                    cur.execute(
+                        f"UPDATE dbo.tbl_Purchase_Line SET {set_clause} WHERE Id = ?",
+                        *[line.get(c, "") for c in cols], line_id,
+                    )
+
         cur.execute(
             "EXEC dbo.usp_ReplaceReservation ?, ?, ?, ?, ?, ?",
             header_id, json.dumps(re_cols), json.dumps(group["reservations"]),
@@ -5955,13 +6038,17 @@ def log_processed_batch(batch_name, started_by, started_at):
 def record_part_description_update(purchase_order_no, description, user_id=None, part_no_map_id=None):
     """A part description was corrected on Part Description Mapping: stamp who
     and when on the matching tbl_Purchase_Line rows (this PO's lines whose
-    invoice description equals the description that was saved) and add an audit
-    event per invoice. Returns how many lines were stamped.
+    invoice description equals the description that was saved) and add an
+    audit event per invoice. Returns {"count": how many lines were stamped,
+    "header_ids": the DATA MISMATCH ones among them - the caller
+    (app.py's part_description_update_save) re-validates just those against
+    Service First, since fixing the description is exactly what a DATA
+    MISMATCH invoice was waiting on; any other status is left untouched}.
     Sample: record_part_description_update('SPRPUR/2026/08/12-85974', 'DELL ADAPTER 65W', 7, 1234)"""
     po = (purchase_order_no or "").strip()
     norm = re.sub(r"\s+", " ", (description or "").strip()).lower()
     if not po or not norm:
-        return 0
+        return {"count": 0, "header_ids": []}
     try:
         ensure_audit_table()
         conn = get_connection()
@@ -5969,28 +6056,31 @@ def record_part_description_update(purchase_order_no, description, user_id=None,
             cur = conn.cursor()
             _ensure_header_line_audit_columns(cur)
             cur.execute(
-                "SELECT l.Id, l.Purchase_Header_ID, l.[Description] FROM dbo.tbl_Purchase_Line l "
+                "SELECT l.Id, l.Purchase_Header_ID, l.[Description], s.StatusName "
+                "FROM dbo.tbl_Purchase_Line l "
                 "JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID "
+                "JOIN dbo.tbl_Status s ON s.StatusId = pt.StatusID "
                 "WHERE LOWER(LTRIM(RTRIM(pt.BuyerOrderNo))) = LOWER(?)", po)
-            hits = [(lid, hid) for lid, hid, d in cur.fetchall()
+            hits = [(lid, hid, sname) for lid, hid, d, sname in cur.fetchall()
                     if re.sub(r"\s+", " ", (d or "").strip()).lower() == norm]
-            for lid, _hid in hits:
+            for lid, _hid, _sname in hits:
                 cur.execute(
                     "UPDATE dbo.tbl_Purchase_Line SET PartDescriptionUpdatedByID = ?, "
                     "PartDescriptionUpdatedDatetime = GETDATE() WHERE Id = ?",
                     user_id, lid)
-            for hid in sorted({h for _l, h in hits}):
+            for hid in sorted({h for _l, h, _s in hits}):
                 log_event("PART_DESCRIPTION_UPDATED", header_id=hid, user_id=user_id, _cur=cur,
                           detail=f"Part description set to '{(description or '').strip()[:200]}' on Part "
                                  f"Description Mapping (Service First part {part_no_map_id})")
             conn.commit()
-            return len(hits)
+            mismatch_header_ids = sorted({h for _l, h, sname in hits if (sname or "").upper() == "DATA MISMATCH"})
+            return {"count": len(hits), "header_ids": mismatch_header_ids}
         finally:
             conn.close()
     except Exception:  # noqa: BLE001 - never breaks the save
         import traceback
         traceback.print_exc()
-        return 0
+        return {"count": 0, "header_ids": []}
 
 
 def get_audit(header_id=None, batch=None, user=None, action=None, entity=None,
