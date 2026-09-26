@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoicePdfUrl, getActiveAnnouncements, announcementImageUrl, getActiveJob } from "./api";
 
@@ -167,7 +167,8 @@ export function SearchableSelect({ value, onChange, options, placeholder = "Sear
 // isn't a reliable enough guarantee on its own for the caller's intent.
 export function DataTable({ columns, rows, searchKeys, pageSize = 10,
                             pageSizeOptions, empty, actions,
-                            defaultSortKey = null, defaultSortDir = "asc" }) {
+                            defaultSortKey = null, defaultSortDir = "asc",
+                            rowStyle, groupBy, renderGroupHeader }) {
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState(defaultSortKey);
   const [sortDir, setSortDir] = useState(defaultSortDir);
@@ -254,13 +255,31 @@ export function DataTable({ columns, rows, searchKeys, pageSize = 10,
             </tr>
           </thead>
           <tbody>
-            {view.map((row, i) => (
-              <tr key={row._key ?? i}>
-                {columns.map((c) => (
-                  <td key={c.key}>{c.render ? c.render(row) : (row[c.key] ?? "—")}</td>
-                ))}
-              </tr>
-            ))}
+            {view.map((row, i) => {
+              // A visible banner row whenever the group key changes from the
+              // row before it - only meaningful when same-group rows are
+              // actually adjacent (the caller sorts by that same key, e.g.
+              // defaultSortKey matching groupBy - see PartDescriptionUpdate),
+              // otherwise this still degrades gracefully into one banner per
+              // occurrence rather than crashing or hiding rows.
+              const groupKey = groupBy ? groupBy(row) : null;
+              const prevGroupKey = groupBy && i > 0 ? groupBy(view[i - 1]) : undefined;
+              const showGroupHeader = groupBy && groupKey !== prevGroupKey;
+              return (
+                <Fragment key={row._key ?? i}>
+                  {showGroupHeader && renderGroupHeader && (
+                    <tr className="tbl-group-header">
+                      <td colSpan={columns.length}>{renderGroupHeader(groupKey, row)}</td>
+                    </tr>
+                  )}
+                  <tr style={rowStyle ? rowStyle(row) : undefined}>
+                    {columns.map((c) => (
+                      <td key={c.key}>{c.render ? c.render(row) : (row[c.key] ?? "—")}</td>
+                    ))}
+                  </tr>
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       </div>

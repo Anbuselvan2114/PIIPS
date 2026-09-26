@@ -289,10 +289,8 @@ def _apply_hsn_map(data, order_no, hsn_map):
     # placeholder standing in for an unconfirmed match.
     sf_active = bool(_base_url())
     items = data.get("items", []) or []
-    for item in items:
-        if item.get("_charge"):
-            continue
-        info = hsn_map.get((_clean(order_no), _clean(item.get("Description"))))
+
+    def _apply_info(item, info):
         # GetHSNDetails is the authoritative item-master lookup: no match at
         # all, or a match whose own Nav_Item_No is blank, means SF doesn't
         # recognize this line's description -> flag it as a new template
@@ -306,7 +304,7 @@ def _apply_hsn_map(data, order_no, hsn_map):
             # blank it so a saved No. always means SF actually confirmed it.
             item["ProductNo"] = ""
         if not info:
-            continue
+            return
         # Only overwrite a field when SF actually has a value for it — an SF
         # match whose own record is missing a piece (no code, no tax rate,
         # ...) must not blank out what build_invoice_json/the PDF already
@@ -328,6 +326,47 @@ def _apply_hsn_map(data, order_no, hsn_map):
         if info.get("TaxPercentage"):
             item["TaxPercentage"] = info["TaxPercentage"]
             item["GST_%"] = info["TaxPercentage"]
+
+    for item in items:
+        if item.get("_charge"):
+            continue
+        info = hsn_map.get((_clean(order_no), _clean(item.get("Description"))))
+        _apply_info(item, info)
+
+    # A vendor can print the SAME physical part twice on one PO as separate
+    # serialized units (e.g. "18.5 LED MONITOR ... RAA06UW05165" / "...
+    # RAA06UW05168", two individual monitors) - PIIPS keeps these as two
+    # Purchase Lines (each its own serial), but Service First tracks
+    # purchasing demand by PART, not by serial, so it only ever has ONE
+    # record - and one Nav_Part_Description - covering both. Whichever
+    # unit's own PDF text doesn't happen to equal that one confirmed string
+    # can never get its own GetHSNDetails match by exact text, no matter how
+    # many times a description gets "confirmed" on Part Description Mapping
+    # - only one sibling's text can ever be the confirmed one at a time. A
+    # sibling on the same PO sharing the same HSN/SAC code (the PDF's own
+    # stated code - reliable even before any match exists) and the same
+    # Rate is, in practice, the same generic part: inherit its resolved
+    # Nav Item No/HSN data too, instead of staying permanently unmatched.
+    for item in items:
+        if item.get("_charge") or not item.get("_hsn_nav_item_no_missing"):
+            continue
+        hsn = str(item.get("hsn") or "").strip()
+        if not hsn:
+            continue
+        sibling = next(
+            (
+                other for other in items
+                if other is not item and not other.get("_charge")
+                and not other.get("_hsn_nav_item_no_missing")
+                and str(other.get("hsn") or "").strip() == hsn
+                and other.get("rate") == item.get("rate")
+            ),
+            None,
+        )
+        if sibling is None:
+            continue
+        info = hsn_map.get((_clean(order_no), _clean(sibling.get("Description"))))
+        _apply_info(item, info)
 
 
 # ---------------------------------------------------------------------------
@@ -427,16 +466,34 @@ def _apply_sf_to_invoice(data, order_no, rows, hsn_map):
         # Reservation Entry.Source Ref. No. = Purchase Line.Line No. for
         # the matching Item No./No. (join key: Nav_Item_No). Preferred
         # match: by Nav_Item_No, when the HSN lookup above resolved it.
+        # Queued (not a plain {key: item} dict) because two DIFFERENT
+        # Purchase Lines can share the same Nav_Item_No - the same physical
+        # part printed as separate serialized units on one PO (see
+        # _apply_hsn_map's sibling fallback just above) - a plain dict would
+        # let the SECOND item silently overwrite the first, so every
+        # matching SF row ends up attributed to just the LAST such line,
+        # leaving the other(s) with no reservation at all even though they
+        # were just as genuinely received. Each item queues once per its own
+        # Quantity (a single line with Quantity > 1 needs that many
+        # reservation rows too), and every incoming SF row for that key
+        # claims the next queued slot in line order.
         items = [it for it in data.get("items", []) if not it.get("_charge")]
-        by_nav = {
-            _clean(it.get("Nav_Item_No")): it
-            for it in items if _clean(it.get("Nav_Item_No"))
-        }
+        by_nav = {}
+        for it in items:
+            key = _clean(it.get("Nav_Item_No"))
+            if not key:
+                continue
+            try:
+                qty = max(1, int(float(it.get("Quantity") or 1)))
+            except (TypeError, ValueError):
+                qty = 1
+            by_nav.setdefault(key, []).extend([it] * qty)
         matched = set()
         for sf in rows:
             key = _clean(sf.get("Nav_Item_No"))
-            it = by_nav.get(key)
-            if it is not None:
+            queue = by_nav.get(key)
+            if queue:
+                it = queue.pop(0)
                 sf["Line_No"] = it.get("Line_No", "")
                 matched.add(id(it))
 

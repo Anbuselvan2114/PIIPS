@@ -68,6 +68,13 @@ export default function PartDescriptionUpdate({ user }) {
 
   useEffect(() => { load(); }, []);
 
+  // Re-fetch after a successful Update WITHOUT the full "Loading…" swap
+  // load() does - the row just saved should flip to green (or, if its
+  // invoice fully cleared, disappear) right away, not only after a manual
+  // Refresh click.
+  const silentRefresh = () =>
+    getPartDescriptionUpdateItems().then((r) => setRows(r.items || [])).catch(() => {});
+
   const rowKey = (r, i) => `${r.SpareRequestID ?? ""}-${r.PartID ?? i}`;
   // Invoice No. lives nested inside PdfInvoices (one row can have several
   // invoices for the same PO), not as a plain top-level field - DataTable's
@@ -76,7 +83,22 @@ export default function PartDescriptionUpdate({ user }) {
   const keyedRows = rows.map((r, i) => ({
     ...r, _key: rowKey(r, i),
     _invoiceNos: (r.PdfInvoices || []).map((inv) => inv.InvoiceNo).filter(Boolean).join(" "),
+    // A single value (first invoice, falling back to the PO itself when no
+    // invoice was resolved at all) to sort by - so every part belonging to
+    // the same invoice sorts next to each other by default, instead of
+    // scattered in whatever order Service First happened to return them.
+    _invoiceNo: (r.PdfInvoices || []).map((inv) => inv.InvoiceNo).filter(Boolean)[0] || r.PurchaseOrderNo || "",
   }));
+
+  // Per-invoice "N of M updated" summary for the group header banner - built
+  // from the FULL row set (not just the current page/search view), so the
+  // count is always accurate regardless of pagination.
+  const summaryByInvoice = {};
+  for (const r of keyedRows) {
+    const s = summaryByInvoice[r._invoiceNo] || (summaryByInvoice[r._invoiceNo] = { total: 0, done: 0 });
+    s.total += 1;
+    if (r.Resolved) s.done += 1;
+  }
 
   // Shown as-is (whatever Service First's API actually returned, including
   // a meaningless placeholder like "1") - the textarea selects all of it on
@@ -113,9 +135,18 @@ export default function PartDescriptionUpdate({ user }) {
     }
     setSaving(key); setError(null); setMsg(null);
     try {
-      await savePartDescription(row.PartNoMapID, description, row.PurchaseOrderNo, user?.user_id);
+      const res = await savePartDescription(row.PartNoMapID, description, row.PurchaseOrderNo, user?.user_id);
       lastValidRef.current[key] = description;
-      setMsg(`Updated Service First's description for the part no ${row.PartNo || "this part"}.`);
+      const moved = (res?.revalidated || []).find((m) => m.new_status && m.new_status !== "DATA MISMATCH");
+      setMsg(
+        `Updated Service First's description for the part no ${row.PartNo || "this part"}.` +
+        (moved ? ` Invoice ${moved.file_name} moved to ${moved.new_status}.` : "")
+      );
+      // Re-fetch so this row flips to green (or, if its invoice fully
+      // cleared Data Mismatch, drops off the list) right away - without
+      // this, the row's Status/color stayed stuck at "Pending" until the
+      // next manual Refresh, even though the update itself had succeeded.
+      await silentRefresh();
     } catch (e) {
       setError(e.message);
     } finally {
@@ -124,6 +155,12 @@ export default function PartDescriptionUpdate({ user }) {
   };
 
   const columns = [
+    { key: "Resolved", label: "Status", sortable: false,
+      render: (row) => (
+        <span className={`badge ${row.Resolved ? "badge-success" : "badge-warning"}`}>
+          {row.Resolved ? "✓ Updated" : "⏳ Pending"}
+        </span>
+      ) },
     { key: "purchaseDetails", label: "Purchase Details", sortable: false,
       render: (row) => (
         <div style={{ lineHeight: 1.6, whiteSpace: "normal", overflowWrap: "break-word", maxWidth: 220 }}>
@@ -278,7 +315,9 @@ export default function PartDescriptionUpdate({ user }) {
         <p className="hint" style={{ marginTop: 0 }}>
           Service First's own purchase-line records for every Buyer's Order No
           currently at DATA MISMATCH - compare against the invoice's own
-          description to spot why a part didn't match.
+          description to spot why a part didn't match. Rows for the same
+          invoice sort together; green rows are already updated, amber rows
+          are still pending.
         </p>
         {error && <div className="alert alert-danger" style={{ marginBottom: 12 }}>{error}</div>}
         {msg && <div className="alert alert-success" style={{ marginBottom: 12 }}>{msg}</div>}
@@ -287,6 +326,22 @@ export default function PartDescriptionUpdate({ user }) {
                      rows={keyedRows}
                      searchKeys={["_invoiceNos", "PurchaseOrderNo", "PartNo", "PartSpecification", "Nav_Part_Description"]}
                      pageSizeOptions={[10, 20, 30, "all"]}
+                     defaultSortKey="_invoiceNo"
+                     rowStyle={(row) => ({
+                       background: row.Resolved ? "var(--success-050)" : "var(--warning-050)",
+                     })}
+                     groupBy={(row) => row._invoiceNo}
+                     renderGroupHeader={(invoiceNo, row) => {
+                       const s = summaryByInvoice[invoiceNo] || { total: 0, done: 0 };
+                       return (
+                         <span>
+                           Invoice: {invoiceNo || "—"} · PO: {row.PurchaseOrderNo || "—"} ·{" "}
+                           <span style={{ color: s.done === s.total ? "var(--success)" : "var(--muted)" }}>
+                             {s.done} of {s.total} description(s) updated
+                           </span>
+                         </span>
+                       );
+                     }}
                      empty="No Service First records found for the current DATA MISMATCH invoices." />
         )}
       </div>

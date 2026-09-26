@@ -95,6 +95,18 @@ def _warm_extraction_pool():
 
 @app.on_event("startup")
 def _run_part_description_migration():
+    """Kicks off _run_part_description_migration_impl() in the background
+    (see its own docstring) - a startup event handler blocks the app from
+    ever becoming ready to serve requests until every handler returns, and
+    on a real live database this can mean re-OCRing a real number of PDFs
+    (each easily 10-40s for a scanned one) - left synchronous, a slow host-
+    level startup timeout could kill the process before it ever finishes,
+    over and over, without ever reaching the point where it marks itself
+    done (see _warm_extraction_pool just above for the same reasoning)."""
+    threading.Thread(target=_run_part_description_migration_impl, daemon=True).start()
+
+
+def _run_part_description_migration_impl():
     """One-time data-quality migration, NOT a general cleanup: older
     ocr_engine.py extraction bugs (now fixed - see EXCLUDE_KW's hsn/sac,
     way bill, net amount, bank name, beneficiary, account no, ifsc code,
@@ -196,6 +208,17 @@ def _run_part_description_migration():
 
 @app.on_event("startup")
 def _run_line_description_continuation_fix_migration():
+    """Kicks off _run_line_description_continuation_fix_migration_impl() in
+    the background - same reasoning as _run_part_description_migration's own
+    wrapper just above (a startup event handler blocks the app from ever
+    becoming ready until every handler returns; this one re-OCRs a real
+    number of PDFs and calls Service First per invoice on a real live
+    database, easily long enough for a host-level startup timeout to kill
+    the process before it ever finishes and marks itself done)."""
+    threading.Thread(target=_run_line_description_continuation_fix_migration_impl, daemon=True).start()
+
+
+def _run_line_description_continuation_fix_migration_impl():
     """One-time data-quality migration, NOT a general cleanup: a table
     layout where each item prints its serial + full values on one row with
     a plain spec line right below it (e.g. "1 MOTHERBOARD ... 9,800.00" /
@@ -205,19 +228,26 @@ def _run_line_description_continuation_fix_migration():
     processed before that fix already has the wrong text saved in
     tbl_Purchase_Line. Runs ONCE ever, guarded by config.json's
     line_description_continuation_fix_done: re-OCRs, with today's fixed
-    extraction, every PDF currently at DATA MISMATCH (database.
-    data_mismatch_headers - never a blanket table scan), and for any whose
-    freshly re-extracted Description(s) differ from what's stored AND whose
-    item count is unchanged (a different item count means today's fix also
-    changed WHICH rows exist, not just their text - too different to
-    positionally match, skipped rather than guessed at), overwrites just
-    those Description(s) (database.fix_purchase_line_descriptions) and
-    re-validates the invoice (Service First for PART, the same mandatory-
-    field gate a NAV vendor code correction uses for SERVICE) so it moves
-    to whatever status is now actually correct - which may still be DATA
-    MISMATCH, just for a different, genuine reason. Best-effort per PDF:
-    one failure is logged and skipped, never aborts the rest of the run or
-    blocks startup."""
+    extraction, every PDF currently at DATA MISMATCH or PENDING IN SF
+    (database.data_mismatch_headers - never a blanket table scan; PENDING IN
+    SF is included too since an invoice parked there for an unrelated reason
+    - Service First just hasn't received the part yet - can still be
+    carrying the same bad Description from before the fix existed), and for
+    any whose freshly re-extracted Description(s) differ from what's stored
+    AND whose item count is unchanged (a different item count means today's
+    fix also changed WHICH rows exist, not just their text - too different
+    to positionally match, skipped rather than guessed at), overwrites just
+    those Description(s) (database.fix_purchase_line_descriptions - PDF-
+    sourced data only) and re-validates the invoice (Service First for PART,
+    the same mandatory-field gate a NAV vendor code correction uses for
+    SERVICE), rebuilding only its Reservation Entry rows and status/IsActive
+    (database.revalidate_header_after_description_fix - Service First-
+    sourced data only) so it moves to whatever status is now actually
+    correct - which may still be DATA MISMATCH or PENDING IN SF, just for a
+    different, genuine reason. Never touches BatchName, [No.], or
+    [Entry No.] - those stay exactly as already assigned. Best-effort per
+    PDF: one failure is logged and skipped, never aborts the rest of the
+    run or blocks startup."""
     import json
     import traceback
     try:
@@ -232,9 +262,9 @@ def _run_line_description_continuation_fix_migration():
         import service_api
         import template_store
 
-        candidates = database.data_mismatch_headers()
+        candidates = database.data_mismatch_headers(("DATA MISMATCH", "PENDING IN SF"))
         if not candidates:
-            # Nothing at DATA MISMATCH at all - determined entirely from
+            # Nothing at either status at all - determined entirely from
             # our own DB, a safe, unambiguous "done".
             config_store.save_config({"line_description_continuation_fix_done": True})
             return
@@ -318,7 +348,7 @@ def _run_line_description_continuation_fix_migration():
         print(
             f"[line-description-continuation-fix-migration] Corrected {fixed_lines} Purchase "
             f"Line description(s) across {fixed_invoices} invoice(s) "
-            f"({len(candidates)} DATA MISMATCH invoice(s) examined). Will not run again."
+            f"({len(candidates)} DATA MISMATCH/PENDING IN SF invoice(s) examined). Will not run again."
         )
     except Exception:  # noqa: BLE001 - never block startup
         traceback.print_exc()
@@ -1074,23 +1104,23 @@ def part_description_update_items():
     own saved Purchase Line Description text(s) for that PO - the screen's
     autocomplete when typing a corrected SF description).
 
-    A row is dropped when its own Nav_Part_Description already matches one
-    of the PDF's own descriptions (whitespace/case-insensitive) - this
-    screen exists to resolve a PDF/SF description MISMATCH specifically,
-    so a part whose description already lines up isn't shown just because
-    its PO's overall status happens to be DATA MISMATCH for some unrelated
-    reason (a missing field elsewhere, another part on the same PO, etc.) -
+    A row is flagged Resolved (kept, not dropped) when its own
+    Nav_Part_Description already matches one of the PDF's own descriptions
+    (whitespace/case-insensitive) - every part on a PO is shown together so
+    a user can see how many of an invoice's lines are already done vs still
+    pending, rather than a resolved one silently vanishing just because its
+    PO's overall status happens to be DATA MISMATCH for some unrelated
+    reason (a missing field elsewhere, another part on the same PO, etc.).
     UNLESS that same description is also claimed by another, different
     part on the same PO (see DuplicateDescription below), in which case
-    both are always kept regardless: two distinct parts sharing one
+    neither is ever marked Resolved: two distinct parts sharing one
     description means the "match" is ambiguous, not resolved - e.g. an
     invoice's own line reads "DELL3560-BEZEL" and Service First has BOTH
     that part AND an unrelated part "0RHGDM" saved under the identical
     description (someone updated two different parts to the same text) -
     without this override, whichever part actually corresponds to the PDF
-    line would look "already matched" and silently drop out of view,
-    hiding the fact that a second, wrongly-duplicated part is sitting
-    right behind it, unresolved."""
+    line would look "already matched" and hide the fact that a second,
+    wrongly-duplicated part is sitting right behind it, unresolved."""
     import database
     import service_api
     try:
@@ -1112,10 +1142,12 @@ def part_description_update_items():
             ids_by_key.setdefault(key, set()).add(item.get("PartNoMapID"))
         dup_keys = {k for k, ids in ids_by_key.items() if len(ids) > 1}
 
-        # First pass: which items are already resolved (dropped below) vs.
-        # kept for review - tracking each PO's resolved descriptions so the
-        # second pass can keep them out of OTHER lines' suggestion list on
-        # the same PO (see kept_items loop below for why).
+        # First pass: which items already match a PDF description (flagged
+        # Resolved, not dropped - the screen shows a PO's parts together so
+        # a user can see how many of an invoice's lines are done vs still
+        # pending) vs. still need review - tracking each PO's resolved
+        # descriptions so the second pass can keep them out of OTHER lines'
+        # suggestion list on the same PO (see kept_items loop below for why).
         kept_items = []
         resolved_descs_by_po = {}
         for item in items:
@@ -1131,6 +1163,8 @@ def part_description_update_items():
                 continue
             if nav_desc and any(_norm_desc(d) == nav_desc for d in pdf_descriptions):
                 resolved_descs_by_po.setdefault(item.get("PurchaseOrderNo"), set()).add(nav_desc)
+                item["Resolved"] = True
+                kept_items.append(item)
                 continue
             kept_items.append(item)
 
@@ -1184,7 +1218,16 @@ def part_description_update_save(payload: PartDescriptionSaveModel, request: Req
     backward compatible with any older caller that doesn't send it yet."""
     import service_api
     _require_not_viewer(payload.user_id)
-    desc = (payload.description or "").strip()
+    # Collapsed to single spaces (never just .strip()) before it's ever
+    # compared OR pushed to Service First - an embedded newline/double space
+    # (e.g. a suggestion picked from PdfDescriptions whose own OCR text still
+    # had one) makes PIIPS's own "already resolved" check pass (_norm_desc
+    # collapses whitespace too) while the value actually saved to Service
+    # First keeps it, so SF's OWN GetHSNDetails match against the PDF's real,
+    # single-spaced text keeps failing forever after - the invoice looks
+    # "✓ Updated" here but never actually leaves DATA MISMATCH (see
+    # ATH Printer - 2117.pdf's "CAN DR 240 PICKUP ROLLER KIT \nIMPORT").
+    desc = re.sub(r"\s+", " ", (payload.description or "")).strip()
     if payload.purchase_order_no and desc:
         norm = _norm_desc(desc)
         try:
@@ -1201,13 +1244,29 @@ def part_description_update_save(payload: PartDescriptionSaveModel, request: Req
                            f"on PO {payload.purchase_order_no} - each description can only map to one part.",
                 )
     try:
-        result = service_api.update_invoice_description(payload.part_no_map_id, payload.description)
+        result = service_api.update_invoice_description(payload.part_no_map_id, desc)
         # Who / when for the matching Purchase Line rows (best effort).
         import database
-        database.record_part_description_update(
-            payload.purchase_order_no, desc, request.scope.get("state", {}).get("user_id"),
-            payload.part_no_map_id)
-        return {"result": result}
+        user_id = request.scope.get("state", {}).get("user_id")
+        stamped = database.record_part_description_update(
+            payload.purchase_order_no, desc, user_id, payload.part_no_map_id)
+        # This description was exactly what a DATA MISMATCH invoice on this
+        # PO was waiting on (Service First couldn't resolve its Nav Item No.
+        # against the OLD description) - now that it's corrected, re-check
+        # against Service First right away instead of leaving the invoice
+        # parked until some later, unrelated run happens to revisit it.
+        # Best-effort: a re-check failure must not fail the save itself,
+        # which already succeeded against Service First.
+        moved = []
+        for header_id in stamped.get("header_ids", []):
+            try:
+                res = database.revalidate_data_mismatch_header(header_id, user_id)
+                if res:
+                    moved.append({"header_id": header_id, **res})
+            except Exception:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+        return {"result": result, "revalidated": moved}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Service First update failed: {exc}")
 
@@ -1503,6 +1562,24 @@ def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, e
             detail=(
                 f"Batch '{name}' has {missing_po} invoice(s) with no Buyer "
                 "Order No. — kindly fill in the Buyer Order No before "
+                "downloading this batch."
+            ),
+        )
+
+    # A Data Mismatch invoice is missing a required field - block the whole
+    # batch's download the same way a missing Buyer Order No does, rather
+    # than silently exporting around it (and minting Document Nos. for the
+    # rest) while it sits unresolved. The batch stays CREATED until every
+    # Data Mismatch in it is cleared - resolving one moves it to whatever
+    # status it now deserves (possibly still Data Mismatch, for a different
+    # field) via the same re-upload/reprocess path as New Template/Excluded.
+    missing_data = (this_batch or {}).get("counts", {}).get("DATA MISMATCH", 0)
+    if missing_data:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Batch '{name}' has {missing_data} invoice(s) at Data "
+                "Mismatch — kindly resolve the missing field(s) before "
                 "downloading this batch."
             ),
         )

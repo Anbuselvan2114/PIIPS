@@ -286,6 +286,11 @@ table.tbl th {
 table.tbl td { padding: 11px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
 table.tbl tbody tr:last-child td { border-bottom: none; }
 table.tbl tbody tr:hover { background: var(--surface-2); }
+table.tbl tbody tr.tbl-group-header td {
+  background: var(--surface-2); font-weight: 600; padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+table.tbl tbody tr.tbl-group-header:first-child td { border-top: none; }
 .empty { color: var(--muted); padding: 16px 2px; }
 
 /* ---- badges ---- */
