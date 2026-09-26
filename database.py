@@ -28,7 +28,7 @@ ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 # never reprocessable again. Unsupported gets the same treatment by
 # filesystem age instead, since it never gets a database row at all (see
 # config_store.expire_stale_files).
-STALE_STATUS_EXPIRY_DAYS = 10
+STALE_STATUS_EXPIRY_DAYS = 31
 
 
 # Ordered status values for tbl_status.

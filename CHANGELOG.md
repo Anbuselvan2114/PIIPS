@@ -11,6 +11,13 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### Stale unresolved invoices now get 31 days before auto-parking, not 10
+
+- `STALE_STATUS_EXPIRY_DAYS` (database.py) is now 31, not 10. A Data
+  Mismatch/Excluded/New Template/Buyer Order No Doesn't Exist/NAV Vendor
+  Code Doesn't Exist invoice now has a full month to get resolved before
+  it's permanently parked as Manually Updated.
+
 ### A same-part, multi-serial line never resolved even after the description was confirmed
 
 - A vendor can print the SAME physical part twice on one PO as separate
