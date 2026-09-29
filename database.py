@@ -5249,7 +5249,33 @@ def activate_template(template_key, user_id=None):
         cur.execute("EXEC dbo.usp_ActivateTemplate ?, ?", template_key, user_id)
         row = cur.fetchone()
         conn.commit()
-        return bool(row and row[0])
+        ok = bool(row and row[0])
+        if ok:
+            log_event("TEMPLATE_ACTIVATED", entity="TEMPLATE", invoice_no=template_key,
+                      user_id=user_id, detail=f"Template activated: {template_key}")
+        return ok
+    finally:
+        conn.close()
+
+
+def get_template_history(template_key, limit=200):
+    """Who/when activated or deactivated this template, newest first -
+    the Template screen's own History (mirrors get_audit's invoice-level
+    version, but for Entity='TEMPLATE' events, matched on the template
+    key stored in the audit row's InvoiceNo column - repurposed here to
+    hold the template key rather than an actual invoice number).
+    Sample: get_template_history('PT\\PART\\Chennai')"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT a.Id, a.EventDatetime, a.Action, a.Detail, u.UserName "
+            "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+            "WHERE a.Entity = 'TEMPLATE' AND a.InvoiceNo = ? "
+            "ORDER BY a.EventDatetime DESC", template_key)
+        cols = ["Id", "EventDatetime", "Action", "Detail", "UserName"]
+        return [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
     finally:
         conn.close()
 
@@ -5376,7 +5402,11 @@ def delete_template(template_key, user_id=None):
         cur.execute("EXEC dbo.usp_DeleteTemplate ?, ?", template_key, user_id)
         row = cur.fetchone()
         conn.commit()
-        return bool(row and row[0])
+        ok = bool(row and row[0])
+        if ok:
+            log_event("TEMPLATE_DEACTIVATED", entity="TEMPLATE", invoice_no=template_key,
+                      user_id=user_id, detail=f"Template deactivated: {template_key}")
+        return ok
     finally:
         conn.close()
 

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { getTemplates, saveTemplate, deleteTemplate, activateTemplate } from "./api";
-import { DataTable, confirmDialog } from "./components";
+import { getTemplates, saveTemplate, deleteTemplate, activateTemplate, getTemplateHistory } from "./api";
+import { DataTable, confirmDialog, Modal } from "./components";
 
 export default function Template({ user }) {
   const [data, setData] = useState(null);
@@ -8,6 +8,8 @@ export default function Template({ user }) {
   const [editKey, setEditKey] = useState(null);
   const [error, setError] = useState(null);
   const [actionError, setActionError] = useState(null);
+  const [history, setHistory] = useState(null);   // {key, events} | null
+  const [historyLoading, setHistoryLoading] = useState(null);   // template key currently loading
 
   const refresh = () => getTemplates().then(setData).catch((e) => setError(e.message));
   useEffect(() => { refresh(); }, []);
@@ -35,6 +37,19 @@ export default function Template({ user }) {
       refresh();
     } catch (e2) {
       setActionError(e2.message);
+    }
+  };
+
+  const openHistory = async (key) => {
+    setHistoryLoading(key);
+    setActionError(null);
+    try {
+      const r = await getTemplateHistory(key);
+      setHistory({ key, events: r.events || [] });
+    } catch (e2) {
+      setActionError(e2.message);
+    } finally {
+      setHistoryLoading(null);
     }
   };
 
@@ -74,8 +89,37 @@ export default function Template({ user }) {
                                      onClick={(e) => onToggleActive(r.template, r.isActive, e)}>
                                 {r.isActive ? "Deactivate" : "Activate"}
                               </button> },
+            { key: "_history", label: "", sortable: false,
+              render: (r) => <button className="btn btn-subtle btn-sm" disabled={historyLoading === r.template}
+                                     onClick={(e) => { e.stopPropagation(); openHistory(r.template); }}>
+                                {historyLoading === r.template ? "Loading…" : "History"}
+                              </button> },
           ]} />
       </div>
+
+      {history && (
+        <Modal title={`History — ${history.key}`} onClose={() => setHistory(null)} width={600}>
+          {history.events.length === 0 ? (
+            <div className="empty">No activate/deactivate history recorded for this template yet.</div>
+          ) : (
+            <div className="timeline">
+              {history.events.map((ev) => (
+                <div key={ev.Id} className="timeline-item">
+                  <div className="timeline-dot" />
+                  <div className="timeline-content">
+                    <div className="timeline-header">
+                      <span className="timeline-action">{ev.Action || "Unknown"}</span>
+                      <span className="timeline-time">{ev.EventDatetime || "Unknown"}</span>
+                    </div>
+                    <div className="timeline-who">{ev.UserName || "Unknown"}</div>
+                    {ev.Detail && <div className="timeline-detail">{ev.Detail}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }
