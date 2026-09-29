@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getTemplates, saveTemplate, deleteTemplate } from "./api";
+import { getTemplates, saveTemplate, deleteTemplate, activateTemplate } from "./api";
 import { DataTable, confirmDialog } from "./components";
 
 export default function Template({ user }) {
@@ -7,6 +7,7 @@ export default function Template({ user }) {
   const [view, setView] = useState("list");
   const [editKey, setEditKey] = useState(null);
   const [error, setError] = useState(null);
+  const [actionError, setActionError] = useState(null);
 
   const refresh = () => getTemplates().then(setData).catch((e) => setError(e.message));
   useEffect(() => { refresh(); }, []);
@@ -22,10 +23,19 @@ export default function Template({ user }) {
   const templates = data.templates || {};
   const keys = Object.keys(templates);
 
-  const onDelete = async (key, e) => {
+  const onToggleActive = async (key, isActive, e) => {
     e.stopPropagation();
-    if (!(await confirmDialog(`Delete template "${key}"?`, { confirmLabel: "Delete", danger: true }))) return;
-    await deleteTemplate(key, user?.user_id); refresh();
+    setActionError(null);
+    const action = isActive ? "Deactivate" : "Activate";
+    if (!(await confirmDialog(`${action} template "${key}"?`,
+          { confirmLabel: action, danger: isActive }))) return;
+    try {
+      if (isActive) await deleteTemplate(key, user?.user_id);
+      else await activateTemplate(key, user?.user_id);
+      refresh();
+    } catch (e2) {
+      setActionError(e2.message);
+    }
   };
 
   return (
@@ -35,14 +45,16 @@ export default function Template({ user }) {
           <button className="btn btn-primary" onClick={() => { setEditKey(null); setView("edit"); }}>✚ New Template</button>
           <h3 style={{ margin: 0 }}>Templates</h3>
         </div>
+        {actionError && <div className="alert alert-danger" style={{ whiteSpace: "pre-line" }}>{actionError}</div>}
         <DataTable
           rows={keys.map((key) => {
             const t = templates[key];
             const count = ["Purchase Header", "Purchase Line", "Reservation Entry"]
               .reduce((n, s) => n + Object.keys(t[s] || {}).length, 0);
+            const isActive = t.IsActive !== false;
             return { _key: key, template: key, entity: key.split("\\")[0],
                      invoiceType: key.split("\\")[1],
-                     po: t.PO_Number_Format || "", statics: count };
+                     po: t.PO_Number_Format || "", statics: count, isActive };
           })}
           searchKeys={["template", "entity", "invoiceType", "po"]} empty="No templates yet."
           columns={[
@@ -53,8 +65,15 @@ export default function Template({ user }) {
             { key: "invoiceType", label: "Invoice Type" },
             { key: "po", label: "PO Number Format" },
             { key: "statics", label: "Static values" },
+            { key: "isActive", label: "Status",
+              render: (r) => <span style={{ fontWeight: 600, color: r.isActive ? "var(--success)" : "var(--danger)" }}>
+                                {r.isActive ? "Active" : "Inactive"}
+                              </span> },
             { key: "_action", label: "", sortable: false,
-              render: (r) => <button className="btn btn-danger btn-sm" onClick={(e) => onDelete(r.template, e)}>Delete</button> },
+              render: (r) => <button className={`btn btn-sm ${r.isActive ? "btn-danger" : "btn-primary"}`}
+                                     onClick={(e) => onToggleActive(r.template, r.isActive, e)}>
+                                {r.isActive ? "Deactivate" : "Activate"}
+                              </button> },
           ]} />
       </div>
     </div>
@@ -150,7 +169,6 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
           <div className="field">
             <label className="label">Template name</label>
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Services_Chennai  or  trichy/service" />
-            {editKey && <div className="hint" style={{ marginTop: 4 }}>Changing this renames the template (and moves its Input folder) — its saved static values carry over.</div>}
           </div>
           <div className="field">
             <label className="label">PO Number Format</label>

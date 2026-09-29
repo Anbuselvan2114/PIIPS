@@ -879,6 +879,17 @@ def invoices_search(q: str = ""):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+@app.get("/api/invoices/completed")
+def invoices_completed():
+    """Completed Invoices menu: every invoice whose tracker status is
+    COMPLETED, same shape as Invoice Search's own results."""
+    import database
+    try:
+        return {"invoices": database.completed_invoices()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 @app.get("/api/invoices/{header_id}/history")
 def invoice_history(header_id: int):
     """Who did what and when for one invoice (Invoice Search menu's
@@ -887,6 +898,21 @@ def invoice_history(header_id: int):
     import database
     try:
         return {"events": database.get_audit(header_id=header_id, limit=500)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/invoices/{header_id}/details")
+def invoice_details(header_id: int):
+    """Full Purchase Header/Line/Reservation Entry field values for one
+    PART invoice (Invoice Search's own Details view) - every configured
+    column, mandatory and optional alike, no who/when (see History for
+    that)."""
+    import database
+    try:
+        return database.get_invoice_details(header_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
@@ -2147,7 +2173,17 @@ def save_template(payload: TemplateModel):
 def delete_template(payload: TemplateKeyModel):
     import template_store
     _require_not_viewer(payload.user_id)
-    return {"deleted": template_store.delete_template(payload.key, payload.user_id)}
+    try:
+        return {"deleted": template_store.delete_template(payload.key, payload.user_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/templates/activate")
+def activate_template(payload: TemplateKeyModel):
+    import template_store
+    _require_not_viewer(payload.user_id)
+    return {"activated": template_store.activate_template(payload.key, payload.user_id)}
 
 
 # ==========================================================================

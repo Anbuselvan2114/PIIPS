@@ -1858,6 +1858,51 @@ def search_invoices_by_number(query, limit=200):
     return rows
 
 
+def completed_invoices(limit=500):
+    """Every invoice whose tracker status is COMPLETED AND whose archive
+    copy actually exists in <Folder Path>/ALL_INVOICES - the "Completed
+    Invoices" menu's own list, same display shape as
+    search_invoices_by_number (file name, vendor, batch, batch status,
+    file status, ...). The DB gives the rich, reliable metadata (and the
+    ORIGINAL file/page range for View); the ALL_INVOICES folder is what
+    actually gates which rows show up here, matching that folder's own
+    filename convention "<Invoice No.>_<Vendor Name><ext>" (see
+    config_store.copy_pdf_to_all_invoices / app.py's lifecycle_advance,
+    which builds that same name) rather than parsing invoice no./vendor
+    back out of a filename, which would be ambiguous either way.
+    Sample: completed_invoices()"""
+    rows = _invoice_list("s.StatusName = 'COMPLETED'", [])
+    if not rows:
+        return rows
+
+    base = (config_store.load_config().get("folder_path") or "").strip()
+    all_invoices_dir = os.path.join(base, config_store.ALL_INVOICES_DIR) if base else ""
+    try:
+        present = set(os.listdir(all_invoices_dir)) if all_invoices_dir and os.path.isdir(all_invoices_dir) else set()
+    except OSError:
+        present = set()
+
+    def archived_name(r):
+        inv_no = config_store._safe_folder(r.get("invoice_no") or "NoInvoiceNo")
+        vendor = config_store._safe_folder(r.get("vendor") or "UnknownVendor")
+        ext = os.path.splitext(r.get("file_name") or "")[1] or ".pdf"
+        return f"{inv_no}_{vendor}{ext}"
+
+    rows = [r for r in rows if archived_name(r) in present][:limit]
+    if not rows:
+        return rows
+    batch_status_by_name = {b["batch"]: b["batch_status"] for b in list_batches()}
+    for r in rows:
+        r["batch_status"] = batch_status_by_name.get(r["batch"], "")
+        # Shown in the File Name column in place of the original upload
+        # name - this IS the ALL_INVOICES archive copy's own name, which
+        # is the whole point of this menu. "file_name" itself is left
+        # untouched: View/Download still fetch the ORIGINAL file (by its
+        # own name/page range) from its status folder, not this copy.
+        r["archived_name"] = archived_name(r)
+    return rows
+
+
 def invoices_by_status(status_id):
     """Invoices whose tracker status is `status_id` (pie-slice pop-up).
     Sample: invoices_by_status(5)"""
@@ -1902,12 +1947,12 @@ def invoices_by_statuses(status_names, active_only=False):
 # a one-time seed, not read on every request, so a stale key here only
 # matters for a brand new deployment's first run.
 _ROLE_MENU_DEFAULTS = {
-    "admin": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate",
+    "admin": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate",
               "load", "post", "complete",
               "configuration", "apiconfig", "template", "createfield", "users"],
-    "user": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load"],
-    "accounts": ["dashboard", "input", "manual", "invoicesearch", "post", "complete"],
-    "viewer": ["dashboard", "input", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
+    "user": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate", "load"],
+    "accounts": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "post", "complete"],
+    "viewer": ["dashboard", "input", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
 }
 
 
@@ -2462,6 +2507,81 @@ def _existing_cols(cur, table, wanted):
     cur.execute("SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(?)", f"dbo.{table}")
     have = {r[0].lower() for r in cur.fetchall()}
     return [c for c in wanted if c.lower() in have]
+
+
+def get_invoice_details(header_id):
+    """Every Purchase Header / Purchase Line / Reservation Entry column
+    that's actually configured (excel_export.sheet_columns - mandatory
+    AND optional alike, not just the mandatory-only subset
+    get_invoice_field_check shows) and its current stored value, for
+    Invoice Search's own "Details" view. PART only - SERVICE never calls
+    Service First at all, so most of these columns (especially
+    Reservation Entry, which only exists at all because of an SF
+    reservation) would just be empty/absent for it; raises ValueError if
+    this header is SERVICE. Deliberately carries no who/when - that's
+    what History (get_audit) already shows.
+    Sample: get_invoice_details(29)"""
+    import excel_export
+
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT it.InvoiceTypeName FROM dbo.tbl_Purchase_Tracker pt "
+            "JOIN dbo.tbl_InvoiceType it ON it.InvoiceTypeId = pt.InvoiceTypeID "
+            "WHERE pt.Purchase_Header_ID = ?", header_id,
+        )
+        type_row = cur.fetchone()
+        invoice_type = ((type_row[0] if type_row else "") or "").strip().upper()
+        if invoice_type == "SERVICE":
+            raise ValueError("Details are only available for PART invoices.")
+
+        columns = excel_export.sheet_columns()
+
+        header_cols = _existing_cols(cur, "tbl_Purchase_Header", columns.get("Purchase Header", []))
+        header = {}
+        if header_cols:
+            cur.execute(
+                f"SELECT {', '.join(_q(c) for c in header_cols)} "
+                "FROM dbo.tbl_Purchase_Header WITH (NOLOCK) WHERE Id = ?",
+                header_id)
+            row = cur.fetchone()
+            if row:
+                header = {c: ("" if v is None else str(v)) for c, v in zip(header_cols, row)}
+
+        line_cols = _existing_cols(cur, "tbl_Purchase_Line", columns.get("Purchase Line", []))
+        lines = []
+        if line_cols:
+            order_by = "TRY_CAST([Line No.] AS FLOAT)" if "Line No." in line_cols else _q(line_cols[0])
+            cur.execute(
+                f"SELECT {', '.join(_q(c) for c in line_cols)} "
+                "FROM dbo.tbl_Purchase_Line WITH (NOLOCK) WHERE Purchase_Header_ID = ? "
+                f"ORDER BY {order_by}",
+                header_id)
+            for row in cur.fetchall():
+                lines.append({c: ("" if v is None else str(v)) for c, v in zip(line_cols, row)})
+
+        res_cols = _existing_cols(cur, "tbl_Reservation_Entry", columns.get("Reservation Entry", []))
+        reservations = []
+        if res_cols:
+            order_by = "TRY_CAST([Source Ref. No.] AS FLOAT)" if "Source Ref. No." in res_cols else _q(res_cols[0])
+            cur.execute(
+                f"SELECT {', '.join(_q(c) for c in res_cols)} "
+                "FROM dbo.tbl_Reservation_Entry WITH (NOLOCK) WHERE Purchase_Header_ID = ? "
+                f"ORDER BY {order_by}",
+                header_id)
+            for row in cur.fetchall():
+                reservations.append({c: ("" if v is None else str(v)) for c, v in zip(res_cols, row)})
+
+        return {
+            "header_columns": header_cols, "header": header,
+            "line_columns": line_cols, "lines": lines,
+            "reservation_columns": res_cols, "reservations": reservations,
+        }
+    finally:
+        conn.close()
 
 
 def get_invoice_field_check(header_id):
@@ -3910,6 +4030,38 @@ _MENU_PROC_DDL = [
         SELECT 1 AS Deleted;
     END
     """,
+    # ---- Template reactivate (undo of the soft-delete above) -------------
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_ActivateTemplate
+        @TemplateKey NVARCHAR(500),
+        @UserId      INT = NULL
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_ActivateTemplate @TemplateKey='SPR\Bosch', @UserId=7
+        DECLARE @TemplateId INT;
+        SELECT @TemplateId = Id FROM dbo.tbl_Template
+         WHERE TemplateKey = @TemplateKey AND IsActive = 0;
+
+        IF @TemplateId IS NULL
+        BEGIN
+            SELECT 0 AS Activated;
+            RETURN;
+        END
+
+        UPDATE dbo.tbl_Template
+           SET IsActive = 1, ModifiedById = @UserId, ModifiedDatetime = GETDATE()
+         WHERE Id = @TemplateId;
+        -- Restores every static value the template had at the moment it was
+        -- deactivated (usp_DeleteTemplate turns the whole set off together) -
+        -- not a per-field undo, just the mirror image of that same delete.
+        UPDATE dbo.tbl_TemplateStaticValue
+           SET IsActive = 1, ModifiedById = @UserId, ModifiedDatetime = GETDATE()
+         WHERE TemplateId = @TemplateId AND IsActive = 0;
+
+        SELECT 1 AS Activated;
+    END
+    """,
     # ---- Dashboard / invoice processing: bulk insert -------------------
     # All Header/Line/Reservation rows for a batch arrive as JSON and are
     # inserted set-based (no row-by-row loop). Because the target tables
@@ -4540,13 +4692,17 @@ _MENU_PROC_DDL = [
     BEGIN
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_GetTemplates
-        SELECT Id, TemplateKey, PONumberFormat
-        FROM dbo.tbl_Template WITH (NOLOCK)
-        WHERE IsActive = 1;
+        -- Both active AND inactive templates - the Template screen now
+        -- shows/toggles both instead of a one-way delete; anything that
+        -- must only ever see ACTIVE templates (invoice processing itself)
+        -- filters IsActive on the Python side, never relies on this
+        -- proc excluding inactive rows.
+        SELECT Id, TemplateKey, PONumberFormat, IsActive
+        FROM dbo.tbl_Template WITH (NOLOCK);
 
         SELECT sv.TemplateId, sv.SheetName, sv.ColumnName, sv.StaticValue
         FROM dbo.tbl_TemplateStaticValue sv WITH (NOLOCK)
-        JOIN dbo.tbl_Template t WITH (NOLOCK) ON t.Id = sv.TemplateId AND t.IsActive = 1
+        JOIN dbo.tbl_Template t WITH (NOLOCK) ON t.Id = sv.TemplateId
         WHERE sv.IsActive = 1;
     END
     """,
@@ -5054,8 +5210,12 @@ def save_field_mapping(mapping, user_id=None):
 # ---- Template (header + normalized static values) -------------------------
 
 def get_templates_data():
-    """{key: {"PO_Number_Format": ..., sheet: {col: value}}} for active
-    templates — the shape the Template menu and the processor expect.
+    """{key: {"PO_Number_Format": ..., "IsActive": bool, sheet: {col: value}}}
+    for EVERY template, active and inactive alike - the Template screen
+    shows/toggles both. Any caller that must only ever act on an active
+    template (invoice processing itself) is responsible for checking
+    "IsActive" on the entry it looks up - this function no longer filters
+    that for them (see template_store.static_for_path).
     Sample: get_templates_data()"""
     ensure_menu_schema()
     conn = get_connection()
@@ -5064,8 +5224,8 @@ def get_templates_data():
         cur.execute("EXEC dbo.usp_GetTemplates")
 
         temps, id_to_key = {}, {}
-        for tid, key, po in cur.fetchall():
-            temps[key] = {"PO_Number_Format": po or ""}
+        for tid, key, po, is_active in cur.fetchall():
+            temps[key] = {"PO_Number_Format": po or "", "IsActive": bool(is_active)}
             id_to_key[tid] = key
 
         if cur.nextset():
@@ -5074,6 +5234,22 @@ def get_templates_data():
                 if key is not None:
                     temps[key].setdefault(sheet, {})[col] = val if val is not None else ""
         return temps
+    finally:
+        conn.close()
+
+
+def activate_template(template_key, user_id=None):
+    """Reactivate a soft-deleted template (header + the static values it
+    had at the moment it was deactivated). Returns True if one was found.
+    Sample: activate_template('SPR\\Bosch', 7)"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("EXEC dbo.usp_ActivateTemplate ?, ?", template_key, user_id)
+        row = cur.fetchone()
+        conn.commit()
+        return bool(row and row[0])
     finally:
         conn.close()
 
@@ -5091,11 +5267,9 @@ def template_folder_has_batches(entity, invoice_type, name):
     static values from a template key that no longer exists and silently
     gets nothing (see _freight_line_override / static_for_path).
     Sample: template_folder_has_batches('PT', 'PART', 'Chennai')"""
-    ensure_menu_schema()
-    prefix = "/".join(p for p in (entity, invoice_type, name) if p).replace("\\", "/")
-    if not prefix:
+    pattern = _template_relpath_pattern(entity, invoice_type, name)
+    if not pattern:
         return False
-    escaped = prefix.replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -5103,8 +5277,63 @@ def template_folder_has_batches(entity, invoice_type, name):
             "SELECT TOP 1 1 FROM dbo.tbl_InputFile_Log l "
             "JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID "
             "WHERE REPLACE(l.RelPath, '\\', '/') LIKE ?",
-            escaped + "/%")
+            pattern)
         return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def _template_relpath_pattern(entity, invoice_type, name):
+    """SQL LIKE pattern matching any tbl_InputFile_Log.RelPath under this
+    template's own Input folder (<entity>/<invoice_type>/<name>/...), with
+    entity/invoice_type/name's own LIKE wildcard characters escaped.
+    Sample: _template_relpath_pattern('PT', 'PART', 'Chennai')"""
+    ensure_menu_schema()
+    prefix = "/".join(p for p in (entity, invoice_type, name) if p).replace("\\", "/")
+    if not prefix:
+        return None
+    escaped = prefix.replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
+    return escaped + "/%"
+
+
+def template_incomplete_batches(entity, invoice_type, name):
+    """Every batch ever produced from this template's own Input folder
+    whose status isn't COMPLETED yet, as [{"batch": name, "status": status}]
+    - same per-batch status list_batches/the Dashboard shows (see
+    _current_batch_status). Also covers a file that's been uploaded/
+    initiated under this template but hasn't even been processed into a
+    header/batch yet (Purchase_Header_ID still NULL on its
+    tbl_InputFile_Log row) - a LEFT JOIN, not an inner one, so that file
+    isn't invisible to this check just because "Start" hasn't reached it
+    yet. Used to block deactivating a template until every PDF it's ever
+    received has actually reached Completed first.
+    Sample: template_incomplete_batches('PT', 'PART', 'Chennai')"""
+    pattern = _template_relpath_pattern(entity, invoice_type, name)
+    if not pattern:
+        return []
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT l.FileName, pt.BatchName "
+            "FROM dbo.tbl_InputFile_Log l "
+            "LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID "
+            "WHERE REPLACE(l.RelPath, '\\', '/') LIKE ?",
+            pattern)
+        rows = cur.fetchall()
+        incomplete, seen = [], set()
+        for file_name, batch_name in rows:
+            if not batch_name:
+                incomplete.append({"batch": f"{file_name} (uploaded, not yet processed)",
+                                    "status": "NOT PROCESSED"})
+                continue
+            if batch_name in seen:
+                continue
+            seen.add(batch_name)
+            status = _current_batch_status(cur, batch_name)
+            if status != "COMPLETED":
+                incomplete.append({"batch": batch_name, "status": status})
+        return incomplete
     finally:
         conn.close()
 

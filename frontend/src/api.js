@@ -120,8 +120,13 @@ export const getInvoicesByBatch = (batch) =>
 export const getInvoiceFieldCheck = (headerId) =>
   request(`/api/invoices/${encodeURIComponent(headerId)}/fields`);
 
+export const getInvoiceDetails = (headerId) =>
+  request(`/api/invoices/${encodeURIComponent(headerId)}/details`);
+
 export const searchInvoices = (q) =>
   request(`/api/invoices/search?q=${encodeURIComponent(q)}`);
+
+export const getCompletedInvoices = () => request("/api/invoices/completed");
 
 export const getInvoiceHistory = (headerId) =>
   request(`/api/invoices/${encodeURIComponent(headerId)}/history`);
@@ -290,6 +295,12 @@ export const saveTemplate = (payload) =>
 
 export const deleteTemplate = (key, user_id) =>
   request("/api/templates/delete", {
+    method: "POST",
+    body: JSON.stringify({ key, user_id }),
+  });
+
+export const activateTemplate = (key, user_id) =>
+  request("/api/templates/activate", {
     method: "POST",
     body: JSON.stringify({ key, user_id }),
   });
