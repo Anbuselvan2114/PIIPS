@@ -5078,6 +5078,37 @@ def get_templates_data():
         conn.close()
 
 
+def template_folder_has_batches(entity, invoice_type, name):
+    """True if any invoice was ever processed from this template's own
+    Input folder (<entity>/<invoice_type>/<name>/...), i.e. it has at
+    least one real batch behind it - matched via tbl_InputFile_Log.RelPath
+    (the file's path relative to Input, stamped at upload time) joined to
+    tbl_Purchase_Tracker so a merely-uploaded-but-never-processed file
+    doesn't count. Used to block renaming a template that already has
+    batches (see template_store.save_template) - a rename leaves any of
+    those batches' already-written Output JSON under the OLD folder name,
+    so a later resync/Buyer's Order fix for one of them re-derives its
+    static values from a template key that no longer exists and silently
+    gets nothing (see _freight_line_override / static_for_path).
+    Sample: template_folder_has_batches('PT', 'PART', 'Chennai')"""
+    ensure_menu_schema()
+    prefix = "/".join(p for p in (entity, invoice_type, name) if p).replace("\\", "/")
+    if not prefix:
+        return False
+    escaped = prefix.replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TOP 1 1 FROM dbo.tbl_InputFile_Log l "
+            "JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID "
+            "WHERE REPLACE(l.RelPath, '\\', '/') LIKE ?",
+            escaped + "/%")
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
 def save_template(entity, name, template_key, po_format, static, user_id=None, invoice_type=None, old_template_key=None):
     """Upsert one template header and MERGE its static values in bulk.
     `old_template_key`, when given and different from `template_key`, is a
