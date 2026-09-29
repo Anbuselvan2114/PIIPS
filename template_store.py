@@ -36,8 +36,12 @@ SHEETS = ["Purchase Header", "Purchase Line", "Reservation Entry"]
 
 
 def load():
-    """{"Static_Values": {key: entry}} for active templates, from the DB.
-    Returns an empty set if the database is unavailable."""
+    """{"Static_Values": {key: entry}} for EVERY template, active and
+    inactive alike (each entry carries "IsActive") - the Template screen
+    lists/toggles both. A caller that must only ever use an ACTIVE
+    template (see static_for_path) checks "IsActive" on the entry itself;
+    this function does not filter it out. Returns an empty set if the
+    database is unavailable."""
     try:
         import database
         return {"Static_Values": database.get_templates_data()}
@@ -83,6 +87,22 @@ def save_template(entity, invoice_type, name, po_format, static, user_id=None, o
 
     key = f"{entity}\\{invoice_type}\\{name}"
     is_rename = bool(original_key) and original_key != key
+    is_new = not original_key
+
+    # A genuinely new/unique name always goes straight through - this only
+    # fires on an actual collision with an existing key (rename landing on
+    # one, or a fresh create reusing one), never for editing a template
+    # under its own unchanged key.
+    if is_new or is_rename:
+        existing = load()["Static_Values"].get(key)
+        if existing is not None:
+            if existing.get("IsActive", True):
+                raise ValueError(f'A template named "{name}" already exists.')
+            raise ValueError(
+                f'You cannot create a template with the name "{name}" - one '
+                "template with the name is in inactive status. Kindly "
+                "activate it."
+            )
 
     if is_rename:
         old_parts = original_key.split("\\")
@@ -95,8 +115,6 @@ def save_template(entity, invoice_type, name, po_format, static, user_id=None, o
                 "processed under it. Only a template with no batches yet can "
                 "be renamed."
             )
-        if key in load()["Static_Values"]:
-            raise ValueError(f'A template named "{name}" already exists.')
         old_folder, _ = folder_for(old_parts[0], old_parts[1], "\\".join(old_parts[2:]))
         if old_folder and os.path.isdir(old_folder):
             if os.path.exists(folder):
@@ -181,8 +199,9 @@ def static_for_path(input_folder, pdf_path):
     """
     Given a PDF located under <input_folder>/<entity>/<invoice_type>/<name>/...,
     return (static_entry, key) for that template, or ({}, None) if the PDF
-    is not inside an entity/invoice_type/template subfolder or the template
-    isn't defined.
+    is not inside an entity/invoice_type/template subfolder, the template
+    isn't defined, or it's been deactivated (an inactive template is never
+    used for live processing, only shown/toggled on the Template screen).
     """
     entity, invoice_type, name = _split_path(input_folder, pdf_path)
     if entity is None:
@@ -190,10 +209,31 @@ def static_for_path(input_folder, pdf_path):
 
     key = f"{entity}\\{invoice_type}\\{name}"
     entry = load()["Static_Values"].get(key)
+    if entry is not None and not entry.get("IsActive", True):
+        entry = None
     return (entry or {}), (key if entry else None)
 
 
 def delete_template(key, user_id=None):
-    """Soft-delete (deactivate) a template. Returns True if one was found."""
+    """Soft-delete (deactivate) a template. Refuses while any batch it
+    produced hasn't reached Completed yet (see
+    database.template_incomplete_batches) - raises ValueError listing
+    them. Returns True if one was found."""
     import database
+    parts = key.split("\\")
+    if len(parts) >= 3:
+        incomplete = database.template_incomplete_batches(parts[0], parts[1], "\\".join(parts[2:]))
+        if incomplete:
+            listing = "\n".join(f"- {b['batch']} ({b['status']})" for b in incomplete)
+            raise ValueError(
+                "Can't deactivate - the following batches are not yet "
+                f"Completed:\n{listing}\nComplete them, then come back and "
+                "deactivate the template."
+            )
     return database.delete_template(key, user_id)
+
+
+def activate_template(key, user_id=None):
+    """Reactivate a soft-deleted template. Returns True if one was found."""
+    import database
+    return database.activate_template(key, user_id)
