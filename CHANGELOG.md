@@ -11,6 +11,29 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### SERVICE Purchase Line "No." is now a template field
+
+- SERVICE never calls Service First, so unlike PART it had no way at all
+  to resolve Purchase Line "No." (Nav Item No.) - it sat blank forever.
+  It's now a template field (per template, like Location Code) - blank
+  until configured, same "Template" source shown on the Template screen.
+  PART's own "No." is completely unaffected: a regular PART line still
+  resolves it via Service First, a freight/charge line still forces the
+  fixed "FRIEGHT IN" - verified even with a stray template value present,
+  to make sure PART never reads from it under any circumstance.
+
+### SERVICE Purchase Lines now use "Service" GST Group Type/Code, not "Goods"
+
+- Every Purchase Line on a SERVICE invoice showed GST Group Type "Goods"
+  and GST Group Code "Goods NN%" - the same generic seed every PART line
+  starts with, never corrected for SERVICE. A SERVICE invoice's lines are
+  never goods, so they now use the exact same "Service ..." shape a PART
+  freight/charge line already did: GST Group Type "Service", GST Group
+  Code "Service NN%" (from that line's own tax rate). PART is unaffected -
+  a normal PART goods line still shows "Goods"/"Goods NN%"; a PART
+  freight line's own No./GST Group Type/Code are unchanged. Verified
+  against a real SERVICE PDF and a real PART freight line.
+
 ### Invoice Search: View/Download, type-ahead suggestions, and a few polish fixes
 
 - File Name now has its own View (opens the shared PDF viewer) and
