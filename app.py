@@ -2186,6 +2186,17 @@ def activate_template(payload: TemplateKeyModel):
     return {"activated": template_store.activate_template(payload.key, payload.user_id)}
 
 
+@app.get("/api/templates/history")
+def template_history(key: str):
+    """Who activated/deactivated this template and when - a query param
+    (not a path segment) since a template key contains backslashes."""
+    import database
+    try:
+        return {"events": database.get_template_history(key)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 # ==========================================================================
 # Authentication API
 # ==========================================================================

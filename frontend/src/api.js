@@ -305,6 +305,9 @@ export const activateTemplate = (key, user_id) =>
     body: JSON.stringify({ key, user_id }),
   });
 
+export const getTemplateHistory = (key) =>
+  request(`/api/templates/history?key=${encodeURIComponent(key)}`);
+
 export const login = async (username, password) => {
   const user = await request("/api/login", {
     method: "POST",
