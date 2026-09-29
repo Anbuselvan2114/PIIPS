@@ -85,10 +85,20 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
   // key that no longer exists and creating a duplicate row.
   const [currentKey, setCurrentKey] = useState(editKey || null);
 
-  const unmapped = (sheet) => (columns[sheet] || []).filter((c) => !(mapping[sheet] && mapping[sheet][c]));
+  // Purchase Line "No." is globally mapped to Service First (PART's own
+  // Nav Item lookup), so the ordinary "already mapped -> not template-
+  // editable" rule below would hide it for SERVICE too - but SERVICE
+  // never calls Service First at all, so its own "No." is a template
+  // field instead (see excel_export._SERVICE_TEMPLATE_FIELDS / the
+  // backend override that actually uses this value at export time). This
+  // is the one deliberate carve-out; PART's own "No." stays exactly as
+  // hidden/Service-First-sourced as it always was.
+  const isServiceNo = (sheet, col) => invoiceType === "SERVICE" && sheet === "Purchase Line" && col === "No.";
+  const unmapped = (sheet) => (columns[sheet] || []).filter((c) =>
+    isServiceNo(sheet, c) || !(mapping[sheet] && mapping[sheet][c]));
   const setVal = (sheet, col, val) => setValues((v) => ({ ...v, [sheet]: { ...v[sheet], [col]: val } }));
   const sourceOf = (sheet, col) => {
-    const base = (sources[sheet] || {})[col] || "Template";
+    const base = isServiceNo(sheet, col) ? "Template" : ((sources[sheet] || {})[col] || "Template");
     const hasStatic = Boolean((values[sheet] || {})[col]);
     return base === "Template" && !hasStatic ? "None" : base;
   };

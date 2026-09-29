@@ -85,11 +85,18 @@ def save_template(entity, invoice_type, name, po_format, static, user_id=None, o
     is_rename = bool(original_key) and original_key != key
 
     if is_rename:
-        if key in load()["Static_Values"]:
-            raise ValueError(f'A template named "{name}" already exists.')
         old_parts = original_key.split("\\")
         if len(old_parts) < 3:
             raise ValueError(f"Can't resolve the current template's folder from key {original_key!r}.")
+        import database
+        if database.template_folder_has_batches(old_parts[0], old_parts[1], "\\".join(old_parts[2:])):
+            raise ValueError(
+                "Can't rename this template - it already has invoices/batches "
+                "processed under it. Only a template with no batches yet can "
+                "be renamed."
+            )
+        if key in load()["Static_Values"]:
+            raise ValueError(f'A template named "{name}" already exists.')
         old_folder, _ = folder_for(old_parts[0], old_parts[1], "\\".join(old_parts[2:]))
         if old_folder and os.path.isdir(old_folder):
             if os.path.exists(folder):
