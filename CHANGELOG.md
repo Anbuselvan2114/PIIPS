@@ -34,11 +34,17 @@ sub-versions.
   freight line's own No./GST Group Type/Code are unchanged. Verified
   against a real SERVICE PDF and a real PART freight line.
 
-### Invoice Search: View/Download, type-ahead suggestions, and a few polish fixes
+### Invoice Search: click-to-view, a Details tab, and a few polish fixes
 
-- File Name now has its own View (opens the shared PDF viewer) and
-  Download link, scoped to just that invoice's own pages the same way
-  every other PDF link in the app already is.
+- File Name is now itself the View link (click it to open the shared PDF
+  viewer, scoped to just that invoice's own pages) - the separate View/
+  Download buttons were removed in favor of this single click.
+- New "Details" button (PART invoices only) opens every configured
+  Purchase Header/Line/Reservation Entry column and its current value,
+  organized into tabs - mandatory and optional fields alike, nothing
+  hidden for being blank. The Reservation tab is left out entirely when
+  there are no reservation rows. No who/when here - that's what History
+  is for.
 - Typing in the search box now shows a live picklist of matching
   invoices (debounced) - picking one fills the box and runs the full
   search immediately; Enter/Search still work on their own regardless.
@@ -46,6 +52,51 @@ sub-versions.
   with the page's own dedicated search above it.
 - A timeline entry with a blank who/when/what field now shows "Unknown"
   there instead of a blank space.
+
+### New menu: Completed Invoices
+
+- Every invoice that has finished the full Load → Post → Complete
+  lifecycle - exactly the ones archived into `ALL_INVOICES` along the
+  way. The File Name column shows that archive copy's own name
+  ("<Invoice No.>_<Vendor Name>.pdf") instead of the original upload
+  name; View/Download still work off the original file underneath.
+  Batch Status/File Status columns are left out here since every row is
+  Completed by definition. Checkbox selection plus a "Download Selected"
+  action downloads the chosen PDFs one after another.
+
+### Templates: Active/Inactive replaces one-way Delete
+
+- The Template list now shows a Status column (Active/Inactive) and an
+  Activate/Deactivate toggle in place of the old permanent Delete -
+  deactivating was already a soft-delete under the hood, this just makes
+  it reversible from the screen too.
+- Deactivating is blocked until every batch the template has ever
+  produced - including a file merely uploaded but not yet run through
+  Start - has actually reached Completed; the block lists exactly which
+  ones are still outstanding.
+- Renaming a template is blocked once it has any batch behind it at all -
+  a rename leaves an already-processed invoice's saved data pointing at a
+  folder name that no longer resolves, which can silently blank out
+  static fields (e.g. Reservation Entry) the next time that invoice needs
+  reprocessing (a Pending-in-SF resync, a Buyer's Order fix).
+- Creating a template whose name collides with an existing one - active
+  or inactive - is now blocked with a clear message, instead of silently
+  overwriting it.
+- A new "History" button shows exactly who activated/deactivated a
+  template and when (only covers events from this point forward).
+- An inactive template is never used for live processing, and no longer
+  appears in the File Explorer's upload template picker.
+
+### User Management: login history for Super Admin
+
+- A new "History" button (Super Admin only, enforced server-side too)
+  shows a user's full LOGIN/LOGOUT timeline.
+
+### Dashboard: Duplicate column added to the Batches table
+
+- The Batches table's per-status columns never included a Duplicate
+  count even though Duplicate has always been a real, trackable status -
+  it's now shown, positioned next to New Template right after Extracted.
 
 ### New menu: Invoice Search
 
