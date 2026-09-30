@@ -5275,87 +5275,108 @@ def get_template_history(template_key, limit=200):
             "WHERE a.Entity = 'TEMPLATE' AND a.InvoiceNo = ? "
             "ORDER BY a.EventDatetime DESC", template_key)
         cols = ["Id", "EventDatetime", "Action", "Detail", "UserName"]
-        return [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
+        out = [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
+        for row in out:
+            row["EventDatetime"] = row["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if row["EventDatetime"] else ""
+        return out
     finally:
         conn.close()
 
 
+def _template_batch_name_pattern(entity, invoice_type, name):
+    """SQL LIKE pattern matching any tbl_Purchase_Tracker.BatchName
+    produced from this template - BatchName is built as
+    f"{run_batch_name}_{suffix}" where suffix is this same sanitization
+    of the template key (see processor.py's _batch_name_for). This is
+    the reliable signal: a tracker row always exists once "Start" has
+    processed a file, regardless of how that file arrived in Input (the
+    File Explorer's own upload, a network copy, a script) - unlike
+    tbl_InputFile_Log, which is only ever written by the upload endpoint
+    itself (see usp_LogInputFiles's own comment) and stays completely
+    empty for a file placed any other way.
+    Sample: _template_batch_name_pattern('PT', 'PART', 'Chennai')"""
+    key = f"{entity}\\{invoice_type}\\{name}"
+    suffix = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_")
+    if not suffix:
+        return None
+    escaped = suffix.replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
+    return "%_" + escaped
+
+
+def _template_pending_input_files(entity, invoice_type, name):
+    """Filenames still sitting, unprocessed, in this template's own Input
+    folder on disk right now - not from tbl_InputFile_Log (see
+    _template_batch_name_pattern's own note on why that table can't be
+    trusted to have a row for every file), but a direct listing of the
+    actual folder, which is unaffected by how a file got there.
+    Sample: _template_pending_input_files('PT', 'PART', 'Chennai')"""
+    folders = config_store.folders(create=False)
+    base = folders.get("input", "") if folders else ""
+    if not base:
+        return []
+    parts = [p for p in name.replace("\\", "/").split("/") if p]
+    folder = os.path.join(base, entity, invoice_type, *parts)
+    if not os.path.isdir(folder):
+        return []
+    try:
+        return sorted(f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f)))
+    except OSError:
+        return []
+
+
 def template_folder_has_batches(entity, invoice_type, name):
-    """True if any invoice was ever processed from this template's own
-    Input folder (<entity>/<invoice_type>/<name>/...), i.e. it has at
-    least one real batch behind it - matched via tbl_InputFile_Log.RelPath
-    (the file's path relative to Input, stamped at upload time) joined to
-    tbl_Purchase_Tracker so a merely-uploaded-but-never-processed file
-    doesn't count. Used to block renaming a template that already has
-    batches (see template_store.save_template) - a rename leaves any of
-    those batches' already-written Output JSON under the OLD folder name,
-    so a later resync/Buyer's Order fix for one of them re-derives its
-    static values from a template key that no longer exists and silently
-    gets nothing (see _freight_line_override / static_for_path).
+    """True if this template has at least one real batch behind it
+    (matched via tbl_Purchase_Tracker.BatchName - see
+    _template_batch_name_pattern) or any file still sitting unprocessed
+    in its Input folder. Used to block renaming a template that already
+    has batches (see template_store.save_template) - a rename leaves any
+    of those batches' already-written Output JSON under the OLD folder
+    name, so a later resync/Buyer's Order fix for one of them re-derives
+    its static values from a template key that no longer exists and
+    silently gets nothing (see _freight_line_override / static_for_path).
     Sample: template_folder_has_batches('PT', 'PART', 'Chennai')"""
-    pattern = _template_relpath_pattern(entity, invoice_type, name)
+    if _template_pending_input_files(entity, invoice_type, name):
+        return True
+    pattern = _template_batch_name_pattern(entity, invoice_type, name)
     if not pattern:
         return False
+    ensure_menu_schema()
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT TOP 1 1 FROM dbo.tbl_InputFile_Log l "
-            "JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID "
-            "WHERE REPLACE(l.RelPath, '\\', '/') LIKE ?",
+            "SELECT TOP 1 1 FROM dbo.tbl_Purchase_Tracker WHERE BatchName LIKE ?",
             pattern)
         return cur.fetchone() is not None
     finally:
         conn.close()
 
 
-def _template_relpath_pattern(entity, invoice_type, name):
-    """SQL LIKE pattern matching any tbl_InputFile_Log.RelPath under this
-    template's own Input folder (<entity>/<invoice_type>/<name>/...), with
-    entity/invoice_type/name's own LIKE wildcard characters escaped.
-    Sample: _template_relpath_pattern('PT', 'PART', 'Chennai')"""
-    ensure_menu_schema()
-    prefix = "/".join(p for p in (entity, invoice_type, name) if p).replace("\\", "/")
-    if not prefix:
-        return None
-    escaped = prefix.replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
-    return escaped + "/%"
-
-
 def template_incomplete_batches(entity, invoice_type, name):
-    """Every batch ever produced from this template's own Input folder
-    whose status isn't COMPLETED yet, as [{"batch": name, "status": status}]
-    - same per-batch status list_batches/the Dashboard shows (see
-    _current_batch_status). Also covers a file that's been uploaded/
-    initiated under this template but hasn't even been processed into a
-    header/batch yet (Purchase_Header_ID still NULL on its
-    tbl_InputFile_Log row) - a LEFT JOIN, not an inner one, so that file
-    isn't invisible to this check just because "Start" hasn't reached it
-    yet. Used to block deactivating a template until every PDF it's ever
-    received has actually reached Completed first.
+    """Every batch this template has ever produced whose status isn't
+    COMPLETED yet, as [{"batch": name, "status": status}] - same
+    per-batch status list_batches/the Dashboard shows (see
+    _current_batch_status) - plus any file still sitting unprocessed in
+    its Input folder (see _template_pending_input_files). Used to block
+    deactivating a template until every PDF it's ever received has
+    actually reached Completed first.
     Sample: template_incomplete_batches('PT', 'PART', 'Chennai')"""
-    pattern = _template_relpath_pattern(entity, invoice_type, name)
+    ensure_menu_schema()
+    incomplete = []
+    for file_name in _template_pending_input_files(entity, invoice_type, name):
+        incomplete.append({"batch": f"{file_name} (in Input, not yet processed)",
+                            "status": "NOT PROCESSED"})
+
+    pattern = _template_batch_name_pattern(entity, invoice_type, name)
     if not pattern:
-        return []
+        return incomplete
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT l.FileName, pt.BatchName "
-            "FROM dbo.tbl_InputFile_Log l "
-            "LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = l.Purchase_Header_ID "
-            "WHERE REPLACE(l.RelPath, '\\', '/') LIKE ?",
+            "SELECT DISTINCT BatchName FROM dbo.tbl_Purchase_Tracker WHERE BatchName LIKE ?",
             pattern)
-        rows = cur.fetchall()
-        incomplete, seen = [], set()
-        for file_name, batch_name in rows:
-            if not batch_name:
-                incomplete.append({"batch": f"{file_name} (uploaded, not yet processed)",
-                                    "status": "NOT PROCESSED"})
-                continue
-            if batch_name in seen:
-                continue
-            seen.add(batch_name)
+        for (batch_name,) in cur.fetchall():
             status = _current_batch_status(cur, batch_name)
             if status != "COMPLETED":
                 incomplete.append({"batch": batch_name, "status": status})
