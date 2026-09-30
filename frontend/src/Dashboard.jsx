@@ -379,6 +379,7 @@ export default function Dashboard({ user }) {
     { status: "DATA MISMATCH", label: "Data Mismatch" },
     { status: "READY TO LOAD", label: "Ready to Load" },
     { status: "LOADED", label: "Loaded" },
+    { status: "REJECTED BY ACCOUNTS", label: "Rejected by Accounts" },
     { status: "POSTED", label: "Posted" },
     { status: "COMPLETED", label: "Completed" },
   ];
