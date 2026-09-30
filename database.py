@@ -2184,11 +2184,25 @@ def revalidate_data_mismatch_header(header_id, user_id=None):
         return None
 
     import service_api
+    import template_store
     with open(json_path, "r", encoding="utf-8") as fp:
         data = json.load(fp)
     verdict = service_api.enrich_invoice(data)
     with open(json_path, "w", encoding="utf-8") as fp:
         json.dump(data, fp, indent=4, ensure_ascii=False)
+
+    # data was just reloaded straight from its saved JSON, which never
+    # carries "_static" (see processor.py - it's attached after that file
+    # is written, deliberately kept out of it). Without re-attaching it
+    # here, revalidate_header_after_description_fix's Reservation Entry
+    # rebuild below would silently blank every static field on that sheet
+    # (Purchase Line stays correct regardless, since its own rebuild only
+    # ever touches Service-First-sourced columns, never the static ones) -
+    # this is the exact bug the other caller of that same function
+    # (reextract_and_fix_description, a few lines up) already avoids.
+    output_folder = (config_store.folders(create=False) or {}).get("output", "")
+    static, _ = template_store.static_for_path(output_folder, json_path)
+    data["_static"] = static
 
     revalidate_header_after_description_fix(header_id, data, verdict, user_id)
     log_event("STATUS_CHANGED", header_id=header_id, user_id=user_id, to_status=verdict["status"],
