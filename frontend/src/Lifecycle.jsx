@@ -49,9 +49,17 @@ export default function Lifecycle({ user, stage }) {
   // Load has no batch filter - it only ever shows invoices that already
   // have a real Navision Document No. (minted at Excel-download time, see
   // database._assign_document_numbers), so there's nothing un-downloaded
-  // to filter out by batch in the first place.
+  // to filter out by batch in the first place. Rejected rows are surfaced
+  // first - they need someone to fix and reload them, so they shouldn't
+  // get buried under a page of plain Ready to Load rows.
   const visible = useMemo(() => {
-    if (stage === "load") return rows.filter((r) => r.navision_doc_no);
+    if (stage === "load") {
+      return rows.filter((r) => r.navision_doc_no).slice().sort((a, b) => {
+        const aRej = a.status === "REJECTED BY ACCOUNTS" ? 0 : 1;
+        const bRej = b.status === "REJECTED BY ACCOUNTS" ? 0 : 1;
+        return aRej - bRej;
+      });
+    }
     return batchFilter ? rows.filter((r) => r.batch === batchFilter) : rows;
   }, [rows, batchFilter, stage]);
 
@@ -153,7 +161,7 @@ export default function Lifecycle({ user, stage }) {
         </div>
         <p className="hint" style={{ marginTop: 0 }}>
           {stage === "load"
-            ? "Only invoices with a Navision Document No. (already downloaded) are shown. Select invoices and mark as loaded."
+            ? "Only invoices with a Navision Document No. (already downloaded) are shown. Select invoices and mark as loaded. Rejected rows are listed first."
             : `Select invoices and ${cfg.action.toLowerCase()}.`}
         </p>
 
