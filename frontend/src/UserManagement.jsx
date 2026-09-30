@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { getUsers, createUser, setUserActive, adminResetPassword, adminChangeUserType } from "./api";
-import { DataTable, confirmDialog, PasswordInput } from "./components";
+import { getUsers, createUser, setUserActive, adminResetPassword, adminChangeUserType,
+         getUserLoginHistory } from "./api";
+import { DataTable, confirmDialog, PasswordInput, Modal } from "./components";
 
 // Fields stacked vertically instead of the shared ".row"'s default
 // side-by-side layout — scoped here so other pages that reuse ".row"
@@ -18,6 +19,8 @@ export default function UserManagement({ user }) {
   const [assignPwBusy, setAssignPwBusy] = useState(false);
   const [typeEdits, setTypeEdits] = useState({});   // user_id -> pending selected type id
   const [typeBusyId, setTypeBusyId] = useState(null);
+  const [history, setHistory] = useState(null);   // {username, events} | null
+  const [historyLoading, setHistoryLoading] = useState(null);   // user id currently loading
 
   const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
 
@@ -120,6 +123,15 @@ export default function UserManagement({ user }) {
       refresh();
     } catch (e) { setMessage({ ok: false, text: e.message }); }
     finally { setTypeBusyId(null); }
+  };
+
+  const openHistory = async (u) => {
+    setHistoryLoading(u.UserId);
+    try {
+      const r = await getUserLoginHistory(u.UserId, user?.user_id);
+      setHistory({ username: u.UserName, events: r.events || [] });
+    } catch (e) { setMessage({ ok: false, text: e.message }); }
+    finally { setHistoryLoading(null); }
   };
 
   const onAssignPw = async (e) => {
@@ -284,10 +296,39 @@ export default function UserManagement({ user }) {
                       Reset password
                     </button>
                   )}
+                  {isSuperAdmin && (
+                    <button className="btn btn-sm btn-subtle" disabled={historyLoading === r._u.UserId}
+                            onClick={() => openHistory(r._u)}>
+                      {historyLoading === r._u.UserId ? "Loading…" : "History"}
+                    </button>
+                  )}
                 </div>
               );} },
           ]} />
       </div>
+
+      {history && (
+        <Modal title={`Login History — ${history.username}`} onClose={() => setHistory(null)} width={560}>
+          {history.events.length === 0 ? (
+            <div className="empty">No login/logout history recorded for this user yet.</div>
+          ) : (
+            <div className="timeline">
+              {history.events.map((ev) => (
+                <div key={ev.Id} className="timeline-item">
+                  <div className="timeline-dot" />
+                  <div className="timeline-content">
+                    <div className="timeline-header">
+                      <span className="timeline-action">{ev.Action || "Unknown"}</span>
+                      <span className="timeline-time">{ev.EventDatetime || "Unknown"}</span>
+                    </div>
+                    {ev.Detail && <div className="timeline-detail">{ev.Detail}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }

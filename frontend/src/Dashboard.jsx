@@ -371,11 +371,12 @@ export default function Dashboard({ user }) {
   // Status count columns shown in the batches table (label -> tbl_status name).
   // Each value is read from the batch's per-status `counts` map.
   const BATCH_STATUS_COLS = [
+    { status: "NEW TEMPLATE", label: "New Template" },
+    { status: "DUPLICATE", label: "Duplicate" },
     { status: "BUYER ORDER NO DOESN'T EXIST", label: "Buyer Order No Doesn't Exist" },
     { status: "EXCLUDED", label: "Excluded" },
     { status: "PENDING IN SF", label: "Pending in SF" },
     { status: "DATA MISMATCH", label: "Data Mismatch" },
-    { status: "NEW TEMPLATE", label: "New Template" },
     { status: "READY TO LOAD", label: "Ready to Load" },
     { status: "LOADED", label: "Loaded" },
     { status: "POSTED", label: "Posted" },
