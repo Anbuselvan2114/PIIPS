@@ -6686,6 +6686,28 @@ def audit_filter_options():
         conn.close()
 
 
+def get_user_login_history(user_id, limit=200):
+    """One user's own LOGIN/LOGOUT history, newest first - User Management's
+    History button (Super Admin only). Entity='USER' audit rows are only
+    ever LOGIN/LOGOUT (see login/logout/the idle-session auto-logout, all
+    of which log_event with entity='USER'), so no Action filter is needed.
+    Sample: get_user_login_history(11)"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TOP (?) Id, EventDatetime, Action, Detail FROM dbo.tbl_Audit_Event "
+            "WHERE Entity = 'USER' AND UserId = ? "
+            "ORDER BY EventDatetime DESC, Id DESC",
+            int(limit), int(user_id))
+        rows = cur.fetchall()
+        return [{"Id": r[0], "EventDatetime": r[1].strftime("%d-%m-%Y %H:%M:%S") if r[1] else "",
+                 "Action": r[2], "Detail": r[3]} for r in rows]
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Login tracking: last login / last logout / currently logged in (Yes/No)
 # ---------------------------------------------------------------------------

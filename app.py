@@ -2452,6 +2452,18 @@ def api_list_users():
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+@app.get("/api/users/{target_user_id}/login-history")
+def api_user_login_history(target_user_id: int, user_id: Optional[int] = None):
+    """One user's login/logout history - Super Admin only, same as the
+    User Management screen's own History button."""
+    _require_developer(user_id)
+    import database
+    try:
+        return {"events": database.get_user_login_history(target_user_id)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 @app.post("/api/users")
 def api_create_user(payload: UserCreateModel, request: Request):
     """Create a user. Normally the admin never chooses a password - one is

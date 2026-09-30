@@ -333,6 +333,9 @@ export const changePassword = (user_id, current_password, new_password) =>
 
 export const getUsers = () => request("/api/users");
 
+export const getUserLoginHistory = (targetUserId, callerUserId) =>
+  request(`/api/users/${encodeURIComponent(targetUserId)}/login-history?user_id=${encodeURIComponent(callerUserId)}`);
+
 // Sign out on the server too (stamps the logout time, cancels the token).
 export const logoutSession = () => request("/api/logout", { method: "POST", body: "{}" });
 
