@@ -1894,6 +1894,16 @@ def completed_invoices(limit=500):
     config_store.copy_pdf_to_all_invoices / app.py's lifecycle_advance,
     which builds that same name) rather than parsing invoice no./vendor
     back out of a filename, which would be ambiguous either way.
+
+    Also includes "orphan" rows - a file physically present in
+    ALL_INVOICES whose database row no longer exists at all (its batch was
+    deleted outright, e.g. via a direct SQL delete script, which only ever
+    touches the database, never this archive folder). An orphan has none
+    of the rich DB metadata (invoice_no/vendor/batch/status all blank) and
+    a distinct NEGATIVE header_id (real headers are always positive) so it
+    stays visible/viewable/downloadable instead of silently disappearing
+    just because its database trail is gone, while the frontend can still
+    tell it apart from a real row (no History/Details for it).
     Sample: completed_invoices()"""
     rows = _invoice_list("s.StatusName = 'COMPLETED'", [])
     if not rows:
@@ -1912,9 +1922,8 @@ def completed_invoices(limit=500):
         ext = os.path.splitext(r.get("file_name") or "")[1] or ".pdf"
         return f"{inv_no}_{vendor}{ext}"
 
-    rows = [r for r in rows if archived_name(r) in present][:limit]
-    if not rows:
-        return rows
+    matched = {archived_name(r) for r in rows}
+    rows = [r for r in rows if archived_name(r) in present]
     batch_status_by_name = {b["batch"]: b["batch_status"] for b in list_batches()}
     for r in rows:
         r["batch_status"] = batch_status_by_name.get(r["batch"], "")
@@ -1924,7 +1933,48 @@ def completed_invoices(limit=500):
         # untouched: View/Download still fetch the ORIGINAL file (by its
         # own name/page range) from its status folder, not this copy.
         r["archived_name"] = archived_name(r)
-    return rows
+
+    # Orphans: an ALL_INVOICES file with no surviving database row at all
+    # (e.g. its whole batch was deleted by a direct SQL script - see this
+    # session's batch-delete scripts - which only ever touches the DB, never
+    # this archive folder). The row's real invoice_no/vendor/batch are gone
+    # with the deleted record, so there's nothing reliable to show for them
+    # (parsing them back out of the archived filename would be the same
+    # ambiguous guess this function's own docstring already rules out
+    # elsewhere) - these rows exist purely so the file itself stays
+    # reachable (View/Download) and visible, not silently invisible just
+    # because its database trail was deleted. header_id is a distinct
+    # negative placeholder (never a real header - those are always
+    # positive) so the frontend's per-row selection/History-button gating
+    # doesn't collide multiple orphans onto one id.
+    orphan_names = sorted(present - matched)
+    for i, name in enumerate(orphan_names):
+        rows.append({
+            "header_id": -(i + 1),
+            "invoice_no": "",
+            "batch": "",
+            "file_name": name,
+            "archived_name": name,
+            "format": "",
+            "status": "",
+            "batch_status": "",
+            "is_active": False,
+            "is_synced": False,
+            "is_excluded": False,
+            "vendor": "",
+            "vendor_gst": "",
+            "doc_date": "",
+            "tracker_id": None,
+            "invoice_type": "",
+            "page": None,
+            "page_start": None,
+            "page_end": None,
+            "navision_doc_no": "",
+            "reject_remark": "",
+            "vendor_code": "",
+        })
+
+    return rows[:limit]
 
 
 def invoices_by_status(status_id):

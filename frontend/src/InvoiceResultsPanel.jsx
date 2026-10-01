@@ -125,12 +125,12 @@ export default function InvoiceResultsPanel({ rows, hideSearch, empty, selectabl
         </button>
       ) : null) },
     { key: "_history", label: "", sortable: false,
-      render: (row) => (
+      render: (row) => (row.header_id > 0 ? (
         <button className="btn btn-subtle btn-sm" disabled={historyLoading === row.header_id}
                 onClick={() => openHistory(row)}>
           {historyLoading === row.header_id ? "Loading…" : "History"}
         </button>
-      ) },
+      ) : null) },
   ];
 
   return (
