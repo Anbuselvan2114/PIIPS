@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   startProcessing, getStatus, getResult, getActiveJob,
-  getBatches, downloadBatchFile, getStatusCounts,
+  getBatches, downloadBatchFile, exportBatchFile, getStatusCounts,
   getInvoicesByStatus, getInvoicesByBatch, setInvoiceExcluded,
   getInvoiceFieldCheck,
 } from "./api";
@@ -108,6 +108,8 @@ export default function Dashboard({ user }) {
   const [batchInputs, setBatchInputs] = useState({});   // batch -> {docNo, entryNo}
   const [batchError, setBatchError] = useState(null);
   const [downloadingBatch, setDownloadingBatch] = useState(null);
+  const [exportingBatch, setExportingBatch] = useState(null);
+  const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
   const [statusCounts, setStatusCounts] = useState([]);
   const [modal, setModal] = useState(null);
   const [fieldModal, setFieldModal] = useState(null);
@@ -438,7 +440,35 @@ export default function Dashboard({ user }) {
     finally { setDownloadingBatch(null); }
   };
 
+  // Super Admin only - exports the batch's EXISTING data exactly as
+  // currently persisted (no minting, no locking, no marking downloaded -
+  // see app.py's export_batch). A read-only snapshot for comparing against
+  // an Excel someone says looks wrong, not a real download.
+  const doExport = async (batch) => {
+    setBatchError(null); setExportingBatch(batch);
+    try {
+      const { blob, filename } = await exportBatchFile(batch, user?.user_id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      // Nothing changed server-side - no refresh needed.
+    } catch (e) { setBatchError(e.message); }
+    finally { setExportingBatch(null); }
+  };
+
   const batchColumns = [
+    ...(isSuperAdmin ? [{
+      key: "_export", label: "", sortable: false,
+      render: (row) => (
+        <button className="btn btn-subtle btn-sm" disabled={exportingBatch === row.batch}
+                title="Download this batch's existing data as-is (no changes made)"
+                onClick={() => doExport(row.batch)}>
+          {exportingBatch === row.batch ? "…" : "⬇"}
+        </button>
+      ),
+    }] : []),
     { key: "batch", label: "Batch Name" },
     { key: "batch_status", label: "Batch Status", render: (row) => row.batch_status || "CREATED" },
     { key: "extracted", label: "Extracted", render: (row) => row.extracted ?? 0 },

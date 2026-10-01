@@ -1692,6 +1692,44 @@ def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, e
     )
 
 
+@app.get("/api/batches/export")
+def export_batch(batch: str, user_id: Optional[int] = None):
+    """Super Admin only: export a batch's EXISTING data to Excel exactly as
+    currently persisted - every header regardless of status, and every
+    Document No./Entry No. exactly as already stored (blank if the batch
+    was never downloaded). Unlike /api/batches/download, this never mints a
+    number, never locks/unlocks anything, and never marks the batch
+    downloaded - a pure read, no write of any kind (see
+    database.fetch_batch_readonly)."""
+    import database
+    import excel_export
+    import tempfile
+
+    _require_developer(user_id)
+
+    name = (batch or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="batch is required")
+
+    try:
+        sheet_data = database.fetch_batch_readonly(name, excel_export.sheet_columns())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    if not sheet_data["Purchase Header"]["rows"]:
+        raise HTTPException(status_code=404, detail=f"Batch '{name}' not found")
+
+    safe = "".join(c for c in name if c.isalnum() or c in ("-", "_")) or "batch"
+    out_path = os.path.join(tempfile.gettempdir(), f"{safe}_export.xlsx")
+    excel_export.build_workbook_from_sheets(sheet_data, out_path)
+
+    return FileResponse(
+        out_path,
+        filename=f"{safe}_export.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
 # ==========================================================================
 # User Manual download (role-specific PDF, stamped with who downloaded it)
 # ==========================================================================

@@ -1753,6 +1753,98 @@ def fetch_batch(batch_name, sheet_cols):
         conn.close()
 
 
+def fetch_batch_readonly(batch_name, sheet_cols):
+    """Read a batch's rows from the 3 tables, EXACTLY as currently persisted
+    - a pure export, with none of fetch_batch()'s side effects: no [No.]/
+    [Entry No.] minting, no status/IsActive/IsExcluded filtering (every
+    header in the batch comes back, whatever its current stage), and no
+    write of any kind. Same {sheet: {columns, rows}} shape as fetch_batch,
+    ready for excel_export.build_workbook_from_sheets - for the Dashboard's
+    Super-Admin-only "just download the batch's existing data" button
+    (app.py's /api/batches/export), which is deliberately NOT the same
+    action as a real batch download (fetch_batch): nothing here ever mints
+    a number, locks anything, or marks the batch downloaded.
+    Sample: fetch_batch_readonly('PIIPS_Batch_20260722_101500', {'Purchase Header': ['InvoiceNo'], 'Purchase Line': ['Description'], 'Reservation Entry': ['Serial No.']})
+    """
+    ensure_menu_schema()
+
+    header_cols = list(sheet_cols.get("Purchase Header", []))
+    line_cols = list(sheet_cols.get("Purchase Line", []))
+    res_cols = list(sheet_cols.get("Reservation Entry", []))
+
+    header_req = list(dict.fromkeys(header_cols + ["Id", "No.", "InvoiceNo"]))
+    line_req = list(dict.fromkeys(line_cols + ["Purchase_Header_ID", "Document No."]))
+    res_req = list(dict.fromkeys(res_cols + ["Id", "Purchase_Header_ID", "Source ID", "Entry No."]))
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "EXEC dbo.usp_FetchBatchAll ?, ?, ?, ?",
+            batch_name,
+            json.dumps(header_req),
+            json.dumps(line_req),
+            json.dumps(res_req),
+        )
+
+        def read_rows():
+            names = [d[0] for d in (cur.description or [])]
+            fetched = cur.fetchall()
+            if names == ["_empty"]:
+                return []
+            return [dict(zip(names, r)) for r in fetched]
+
+        ph_r = read_rows()
+        cur.nextset()
+        pl_r = read_rows()
+        cur.nextset()
+        re_r = read_rows()
+
+        # Same display-correctness fixups fetch_batch applies (these fix how
+        # old/pre-existing rows render, not anything that writes to the DB).
+        for row in ph_r:
+            if "Consignment Note No." in row:
+                row["Consignment Note No."] = re.sub(
+                    r"^[S5]PRPUR/?", "", row.get("Consignment Note No.") or "",
+                    flags=re.IGNORECASE)
+
+        part_header_ids = set()
+        if any(row.get("Type") == "Charge (Item)" for row in pl_r):
+            cur.execute(
+                "SELECT pt.Purchase_Header_ID FROM tbl_Purchase_Tracker pt "
+                "JOIN tbl_InvoiceType it ON it.InvoiceTypeId = pt.InvoiceTypeID "
+                "WHERE pt.BatchName = ? AND it.InvoiceTypeName = 'PART'",
+                batch_name,
+            )
+            part_header_ids = {r[0] for r in cur.fetchall()}
+
+        for row in pl_r:
+            if (row.get("Type") == "Charge (Item)"
+                    and row.get("Purchase_Header_ID") in part_header_ids):
+                if "No." in row:
+                    row["No."] = "FRIEGHT IN"
+                if "GST Group Type" in row:
+                    row["GST Group Type"] = "Service"
+                if "GST Group Code" in row:
+                    try:
+                        rate = float(row.get("GST %") or 0)
+                    except (TypeError, ValueError):
+                        rate = 0
+                    row["GST Group Code"] = f"Service {rate:g}%"
+
+        for row in re_r:
+            if "Source Subtype" in row:
+                row["Source Subtype"] = "1"
+
+        return {
+            "Purchase Header": {"columns": header_cols, "rows": ph_r},
+            "Purchase Line": {"columns": line_cols, "rows": pl_r},
+            "Reservation Entry": {"columns": res_cols, "rows": re_r},
+        }
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Invoice lists for the dashboard pop-ups (by status / by batch) and the
 # per-invoice include / exclude action.
@@ -5034,6 +5126,86 @@ _MENU_PROC_DDL = [
         END
 
         -- Reservation
+        IF OBJECT_ID('dbo.tbl_Reservation_Entry') IS NULL
+            SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+        ELSE
+        BEGIN
+            SELECT @cols = STRING_AGG(QUOTENAME(c.name), N', ')
+            FROM OPENJSON(@ResCols) j
+            JOIN sys.columns c ON c.object_id = OBJECT_ID('dbo.tbl_Reservation_Entry')
+                               AND c.name = j.value;
+            IF @cols IS NULL
+                SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+            ELSE
+            BEGIN
+                SET @sql = N'SELECT ' + @cols +
+                    N' FROM dbo.tbl_Reservation_Entry WHERE Purchase_Header_ID IN ' + @idset +
+                    N' ORDER BY Purchase_Header_ID, Id';
+                EXEC sp_executesql @sql, N'@b NVARCHAR(200)', @b = @BatchName;
+            END
+        END
+    END
+    """,
+    # ---- Read: a saved batch's rows, EVERY header, no numbering ----------
+    # Same shape/mechanism as usp_FetchBatch, but for database.
+    # fetch_batch_readonly's pure read-only export (Dashboard's Super-Admin
+    # download-icon button) - no IsActive/IsExcluded/status filtering at
+    # all, so every header ever tied to this batch comes back exactly as
+    # currently persisted, whatever stage it's at.
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_FetchBatchAll
+        @BatchName  NVARCHAR(200),
+        @HeaderCols NVARCHAR(MAX),
+        @LineCols   NVARCHAR(MAX),
+        @ResCols    NVARCHAR(MAX)
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_FetchBatchAll @BatchName='PIIPS_Batch_20260722_101500', @HeaderCols='["InvoiceNo"]', @LineCols='["Description"]', @ResCols='["Serial No."]'
+        DECLARE @sql NVARCHAR(MAX), @cols NVARCHAR(MAX);
+
+        DECLARE @idset NVARCHAR(600) =
+            N'(SELECT pt.Purchase_Header_ID FROM dbo.tbl_Purchase_Tracker pt '
+          + N'WHERE pt.BatchName = @b)';
+
+        IF OBJECT_ID('dbo.tbl_Purchase_Header') IS NULL
+            SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+        ELSE
+        BEGIN
+            SELECT @cols = STRING_AGG(QUOTENAME(c.name), N', ')
+            FROM OPENJSON(@HeaderCols) j
+            JOIN sys.columns c ON c.object_id = OBJECT_ID('dbo.tbl_Purchase_Header')
+                               AND c.name = j.value;
+            IF @cols IS NULL
+                SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+            ELSE
+            BEGIN
+                SET @sql = N'SELECT ' + @cols +
+                           N' FROM dbo.tbl_Purchase_Header WHERE Id IN ' + @idset +
+                           N' ORDER BY Id';
+                EXEC sp_executesql @sql, N'@b NVARCHAR(200)', @b = @BatchName;
+            END
+        END
+
+        IF OBJECT_ID('dbo.tbl_Purchase_Line') IS NULL
+            SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+        ELSE
+        BEGIN
+            SELECT @cols = STRING_AGG(QUOTENAME(c.name), N', ')
+            FROM OPENJSON(@LineCols) j
+            JOIN sys.columns c ON c.object_id = OBJECT_ID('dbo.tbl_Purchase_Line')
+                               AND c.name = j.value;
+            IF @cols IS NULL
+                SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+            ELSE
+            BEGIN
+                SET @sql = N'SELECT ' + @cols +
+                    N' FROM dbo.tbl_Purchase_Line WHERE Purchase_Header_ID IN ' + @idset +
+                    N' ORDER BY Purchase_Header_ID, Id';
+                EXEC sp_executesql @sql, N'@b NVARCHAR(200)', @b = @BatchName;
+            END
+        END
+
         IF OBJECT_ID('dbo.tbl_Reservation_Entry') IS NULL
             SELECT TOP 0 CAST(NULL AS INT) AS _empty;
         ELSE

@@ -267,6 +267,29 @@ export const downloadBatchFile = async (batch, docNo, entryNo) => {
   return { blob, filename: match ? match[1] : `${batch}.xlsx` };
 };
 
+// Super Admin only - exports a batch's EXISTING data (no minting, no
+// locking, no marking downloaded - see app.py's export_batch).
+export const batchExportUrl = (batch, userId) =>
+  withToken(`${API_BASE}/api/batches/export?batch=${encodeURIComponent(batch)}&user_id=${encodeURIComponent(userId)}`);
+
+export const exportBatchFile = async (batch, userId) => {
+  let res;
+  try {
+    res = await fetch(batchExportUrl(batch, userId), { headers: authHeaders() });
+  } catch {
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
+  if (!res.ok) {
+    endSessionIfExpired(res, !!getToken());
+    throw new Error(await errorMessageFor(res));
+  }
+
+  const blob = await res.blob();
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  return { blob, filename: match ? match[1] : `${batch}_export.xlsx` };
+};
+
 export const getFormats = () => request("/api/formats");
 
 export const getMapping = () => request("/api/mapping");
