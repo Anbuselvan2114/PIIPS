@@ -28,7 +28,7 @@ ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 # never reprocessable again. Unsupported gets the same treatment by
 # filesystem age instead, since it never gets a database row at all (see
 # config_store.expire_stale_files).
-STALE_STATUS_EXPIRY_DAYS = 31
+STALE_STATUS_EXPIRY_DAYS = 90
 
 
 # Ordered status values for tbl_status.
@@ -935,13 +935,21 @@ _BATCH_IGNORED_STATUSES = (
 
 def _batch_is_cleared(counts):
     """True if every invoice in a batch NOT in _BATCH_IGNORED_STATUSES has
-    reached LOADED/POSTED/COMPLETED, OR none of them have reached that far
-    YET (still sitting at Ready To Load, say) - a batch that hasn't started
-    doesn't hold up a later batch either. Only PARTIAL progress - some
-    invoices Loaded/Posted/Completed, others not - counts as not cleared,
-    since that's real, unfinished work for this batch specifically."""
+    reached LOADED/POSTED/COMPLETED/REJECTED BY ACCOUNTS, OR none of them
+    have reached that far YET (still sitting at Ready To Load, say) - a
+    batch that hasn't started doesn't hold up a later batch either. Only
+    PARTIAL progress - some invoices Loaded/Posted/Completed/Rejected,
+    others still sitting at Ready To Load - counts as not cleared, since
+    that's real, unfinished work for this batch specifically. Rejected By
+    Accounts counts toward "cleared" (not just Loaded+) because a rejection
+    doesn't get ahead of a later batch's own Document Nos. the way genuine
+    unstarted work would - it already has its number; it just needs someone
+    to fix and reload the one invoice, which shouldn't hold up every other
+    batch behind it (see _batch_status_and_lock's REJECTED/lenient-label
+    handling for the same reasoning)."""
     counted_total = sum(c for s, c in counts.items() if s not in _BATCH_IGNORED_STATUSES)
-    cleared = counts.get("LOADED", 0) + counts.get("POSTED", 0) + counts.get("COMPLETED", 0)
+    cleared = (counts.get("LOADED", 0) + counts.get("POSTED", 0)
+               + counts.get("COMPLETED", 0) + counts.get("REJECTED BY ACCOUNTS", 0))
     return cleared == 0 or cleared == counted_total
 
 
@@ -995,11 +1003,27 @@ def _batch_status_and_lock(counts, downloaded, ever_reincluded=False):
     if total > 0 and completed_or_excluded == total:
         return "COMPLETED", locked
 
+    # Rejected By Accounts is folded into the LOADED tier for this label,
+    # not treated as its own stage or ignored: an invoice must have already
+    # been Loaded to be rejected, and needs exactly the same next step a
+    # plain Loaded invoice does (fix it, then Load/Post it again) - so it
+    # belongs at the Loaded tier, same as a Loaded invoice would. 9 Posted +
+    # 1 Rejected shows "Loaded" (the least advanced tier reached, same rule
+    # as 3 Loaded + 2 Posted = Loaded); all 10 Rejected also shows "Loaded"
+    # for the same reason - every one of them needs the same next action.
+    # _batch_is_cleared already folds Rejected into "cleared" the same way.
     counted_total = sum(c for s, c in counts.items() if s not in _BATCH_IGNORED_STATUSES)
-    reached = {s for s in ("LOADED", "POSTED", "COMPLETED") if counts.get(s, 0) > 0}
+    effective_loaded = counts.get("LOADED", 0) + counts.get("REJECTED BY ACCOUNTS", 0)
+    reached = {
+        s for s, c in (
+            ("LOADED", effective_loaded),
+            ("POSTED", counts.get("POSTED", 0)),
+            ("COMPLETED", counts.get("COMPLETED", 0)),
+        ) if c > 0
+    }
     if counted_total > 0 and reached and _batch_is_cleared(counts):
-        # Every counted invoice is at least Loaded: the batch shows the
-        # least advanced stage among them (3 Loaded + 2 Posted = Loaded).
+        # Every counted invoice is at least Loaded (or Rejected, folded in
+        # above): the batch shows the least advanced stage among them.
         return next(s for s in ("LOADED", "POSTED", "COMPLETED") if s in reached), locked
     if ever_reincluded:
         return "DOWNLOADED", locked
