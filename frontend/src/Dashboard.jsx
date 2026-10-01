@@ -382,6 +382,7 @@ export default function Dashboard({ user }) {
     { status: "REJECTED BY ACCOUNTS", label: "Rejected by Accounts" },
     { status: "POSTED", label: "Posted" },
     { status: "COMPLETED", label: "Completed" },
+    { status: "MANUALLY UPDATED", label: "Manually Updated" },
   ];
 
   // Flatten the chosen status counts onto each row so the DataTable can
