@@ -311,6 +311,7 @@ def version():
 class ConfigModel(BaseModel):
     folder_path: str
     sf_api_url: Optional[str] = None
+    user_id: Optional[int] = None
 
 
 def _public_config(cfg):
@@ -320,6 +321,20 @@ def _public_config(cfg):
     public = {k: v for k, v in cfg.items() if k not in ("db_connection", "auth_secret")}
     public["db_configured"] = bool((cfg.get("db_connection") or "").strip())
     return public
+
+
+@app.get("/api/config/history")
+def config_history(kind: Optional[str] = None, user_id: Optional[int] = None):
+    """Super Admin only: who/when changed Folder/API/Database Configuration.
+    `kind` optionally narrows to one of FOLDER_CONFIG_CHANGED/
+    API_CONFIG_CHANGED/DB_CONFIG_CHANGED - each config screen's own History
+    button passes its own kind."""
+    _require_developer(user_id)
+    import database
+    try:
+        return {"events": database.get_config_history(kind)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
 @app.get("/api/config")
@@ -447,10 +462,18 @@ def update_config(payload: ConfigModel):
     # and the template subfolders are created inside it.
     folder_path = _validate_dir(payload.folder_path, "Folder Path", must_be_local=True)
 
+    old_folder_path = (config_store.load_config().get("folder_path") or "").strip()
+
     updates = {"folder_path": folder_path}
     if payload.sf_api_url is not None:
         updates["sf_api_url"] = payload.sf_api_url.strip()
     config = config_store.save_config(updates)
+
+    if folder_path != old_folder_path:
+        import database
+        database.log_event(
+            "FOLDER_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
+            detail=f"Folder Path: '{old_folder_path or '(none)'}' -> '{folder_path}'")
 
     # Create Input / New_Format (and Trained_format) under the Folder Path.
     folders = config_store.folders(create=True)
@@ -486,6 +509,7 @@ def update_config(payload: ConfigModel):
 
 class ApiConfigModel(BaseModel):
     sf_api_url: Optional[str] = ""
+    user_id: Optional[int] = None
 
 
 @app.get("/api/api-config")
@@ -496,7 +520,13 @@ def get_api_config():
 @app.post("/api/api-config")
 def save_api_config(payload: ApiConfigModel):
     url = (payload.sf_api_url or "").strip()
+    old_url = (config_store.load_config().get("sf_api_url") or "").strip()
     config_store.save_config({"sf_api_url": url})
+    if url != old_url:
+        import database
+        database.log_event(
+            "API_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
+            detail=f"Service First API URL: '{old_url or '(none)'}' -> '{url or '(none)'}'")
     return {"sf_api_url": url}
 
 
@@ -614,7 +644,17 @@ def save_db_config(payload: DbConfigModel):
     if not ok:
         raise HTTPException(status_code=400, detail=f"Could not connect: {err}")
 
+    # Never log the password/username - only server/database/auth type,
+    # which is enough to see what changed without exposing a credential.
+    old_parsed = database.parse_dotnet_connection(config_store.load_config().get("db_connection") or "")
+    old_desc = f"{old_parsed['server'] or '(none)'} / {old_parsed['database'] or '(none)'}" if old_parsed["server"] else "(none)"
+    new_desc = f"{server} / {db_name} ({'Windows' if windows else 'SQL'} auth)"
+
     config_store.save_config({"db_connection": conn_str})
+
+    database.log_event(
+        "DB_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
+        detail=f"Database connection: '{old_desc}' -> '{new_desc}' (credentials not logged)")
 
     # Make sure the target database has the app's tables/procedures.
     try:

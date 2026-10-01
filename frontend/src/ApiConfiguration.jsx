@@ -1,10 +1,15 @@
 import { useEffect, useState } from "react";
-import { getApiConfig, saveApiConfig } from "./api";
+import { getApiConfig, saveApiConfig, getConfigHistory } from "./api";
+import { Modal } from "./components";
 
-export default function ApiConfiguration() {
+export default function ApiConfiguration({ user }) {
   const [sfApiUrl, setSfApiUrl] = useState("");
   const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [history, setHistory] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
 
   useEffect(() => {
     getApiConfig()
@@ -15,7 +20,7 @@ export default function ApiConfiguration() {
   const onSave = async () => {
     setLoading(true); setMessage(null);
     try {
-      await saveApiConfig(sfApiUrl.trim());
+      await saveApiConfig(sfApiUrl.trim(), user?.user_id);
       setMessage({ ok: true, text: "API configuration saved." });
     } catch (e) {
       setMessage({ ok: false, text: e.message });
@@ -24,10 +29,30 @@ export default function ApiConfiguration() {
     }
   };
 
+  const openHistory = async () => {
+    setHistoryLoading(true);
+    try {
+      const r = await getConfigHistory("API_CONFIG_CHANGED", user?.user_id);
+      setHistory(r.events || []);
+    } catch (e) {
+      setMessage({ ok: false, text: e.message });
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
   return (
     <div className="page">
       <div className="card">
-        <h3>API configuration</h3>
+        <div className="card-title-row">
+          <h3>API configuration</h3>
+          <div style={{ flex: 1 }} />
+          {isSuperAdmin && (
+            <button className="btn btn-subtle btn-sm" disabled={historyLoading} onClick={openHistory}>
+              {historyLoading ? "Loading…" : "History"}
+            </button>
+          )}
+        </div>
 
         <div className="field">
           <label className="label">Service First API URL</label>
@@ -53,6 +78,30 @@ export default function ApiConfiguration() {
           </div>
         )}
       </div>
+
+      {history && (
+        <Modal title="API Configuration History" onClose={() => setHistory(null)} width={640}>
+          {history.length === 0 ? (
+            <div className="empty">No changes recorded yet.</div>
+          ) : (
+            <div className="timeline">
+              {history.map((ev) => (
+                <div key={ev.Id} className="timeline-item">
+                  <div className="timeline-dot" />
+                  <div className="timeline-content">
+                    <div className="timeline-header">
+                      <span className="timeline-action">{ev.Action}</span>
+                      <span className="timeline-time">{ev.EventDatetime}</span>
+                    </div>
+                    <div className="timeline-who">{ev.UserName || "Unknown"}</div>
+                    {ev.Detail && <div className="timeline-detail">{ev.Detail}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }

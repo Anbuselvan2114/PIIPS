@@ -5543,6 +5543,37 @@ def get_template_history(template_key, limit=200):
         conn.close()
 
 
+def get_config_history(kind=None, limit=200):
+    """Who/when changed Folder/API/Database Configuration, newest first -
+    each config screen's own History (Entity='CONFIG'; `kind` optionally
+    narrows to one action - 'FOLDER_CONFIG_CHANGED', 'API_CONFIG_CHANGED',
+    or 'DB_CONFIG_CHANGED' - matched on the audit row's own Action column).
+    Sample: get_config_history('DB_CONFIG_CHANGED')"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        if kind:
+            cur.execute(
+                "SELECT a.Id, a.EventDatetime, a.Action, a.Detail, u.UserName "
+                "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+                "WHERE a.Entity = 'CONFIG' AND a.Action = ? "
+                "ORDER BY a.EventDatetime DESC", kind)
+        else:
+            cur.execute(
+                "SELECT a.Id, a.EventDatetime, a.Action, a.Detail, u.UserName "
+                "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+                "WHERE a.Entity = 'CONFIG' "
+                "ORDER BY a.EventDatetime DESC")
+        cols = ["Id", "EventDatetime", "Action", "Detail", "UserName"]
+        out = [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
+        for row in out:
+            row["EventDatetime"] = row["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if row["EventDatetime"] else ""
+        return out
+    finally:
+        conn.close()
+
+
 def _template_batch_name_pattern(entity, invoice_type, name):
     """SQL LIKE pattern matching any tbl_Purchase_Tracker.BatchName
     produced from this template - BatchName is built as

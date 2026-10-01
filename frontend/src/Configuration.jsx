@@ -1,12 +1,27 @@
 import { useEffect, useState } from "react";
-import { getConfig, saveConfig, setScannedPdfsEnabled } from "./api";
+import { getConfig, saveConfig, setScannedPdfsEnabled, getConfigHistory } from "./api";
+import { Modal } from "./components";
 
 export default function Configuration({ user }) {
   const [folderPath, setFolderPath] = useState("");
   const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [history, setHistory] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
+
+  const openHistory = async () => {
+    setHistoryLoading(true);
+    try {
+      const r = await getConfigHistory("FOLDER_CONFIG_CHANGED", user?.user_id);
+      setHistory(r.events || []);
+    } catch (e) {
+      setMessage({ ok: false, text: e.message });
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
   const [scannedPdfsEnabled, setScannedPdfsEnabledState] = useState({ PART: false, SERVICE: false });
   const [scannedPdfsBusy, setScannedPdfsBusy] = useState({ PART: false, SERVICE: false });
   const [scannedPdfsMsg, setScannedPdfsMsg] = useState({ PART: null, SERVICE: null });
@@ -40,7 +55,7 @@ export default function Configuration({ user }) {
   const onSave = async () => {
     setLoading(true); setMessage(null);
     try {
-      const cfg = await saveConfig(folderPath.trim());
+      const cfg = await saveConfig(folderPath.trim(), user?.user_id);
       setMessage({ ok: true, text: "Configuration saved.", folders: cfg.folders });
     } catch (e) {
       setMessage({ ok: false, text: e.message });
@@ -52,7 +67,15 @@ export default function Configuration({ user }) {
   return (
     <div className="page">
       <div className="card">
-        <h3>Folder</h3>
+        <div className="card-title-row">
+          <h3>Folder</h3>
+          <div style={{ flex: 1 }} />
+          {isSuperAdmin && (
+            <button className="btn btn-subtle btn-sm" disabled={historyLoading} onClick={openHistory}>
+              {historyLoading ? "Loading…" : "History"}
+            </button>
+          )}
+        </div>
 
         <div className="field">
           <label className="label">Folder Path</label>
@@ -119,6 +142,30 @@ export default function Configuration({ user }) {
             </div>
           ))}
         </div>
+      )}
+
+      {history && (
+        <Modal title="Folder Configuration History" onClose={() => setHistory(null)} width={640}>
+          {history.length === 0 ? (
+            <div className="empty">No changes recorded yet.</div>
+          ) : (
+            <div className="timeline">
+              {history.map((ev) => (
+                <div key={ev.Id} className="timeline-item">
+                  <div className="timeline-dot" />
+                  <div className="timeline-content">
+                    <div className="timeline-header">
+                      <span className="timeline-action">{ev.Action}</span>
+                      <span className="timeline-time">{ev.EventDatetime}</span>
+                    </div>
+                    <div className="timeline-who">{ev.UserName || "Unknown"}</div>
+                    {ev.Detail && <div className="timeline-detail">{ev.Detail}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
       )}
     </div>
   );

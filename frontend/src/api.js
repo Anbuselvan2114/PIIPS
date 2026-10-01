@@ -89,10 +89,10 @@ export const getVersion = () => request("/api/version");
 
 export const getConfig = () => request("/api/config");
 
-export const saveConfig = (folderPath) =>
+export const saveConfig = (folderPath, userId) =>
   request("/api/config", {
     method: "POST",
-    body: JSON.stringify({ folder_path: folderPath }),
+    body: JSON.stringify({ folder_path: folderPath, user_id: userId }),
   });
 
 export const setScannedPdfsEnabled = (enabled, invoiceType, user_id) =>
@@ -103,11 +103,14 @@ export const setScannedPdfsEnabled = (enabled, invoiceType, user_id) =>
 
 export const getApiConfig = () => request("/api/api-config");
 
-export const saveApiConfig = (sfApiUrl) =>
+export const saveApiConfig = (sfApiUrl, userId) =>
   request("/api/api-config", {
     method: "POST",
-    body: JSON.stringify({ sf_api_url: sfApiUrl }),
+    body: JSON.stringify({ sf_api_url: sfApiUrl, user_id: userId }),
   });
+
+export const getConfigHistory = (kind, userId) =>
+  request(`/api/config/history?kind=${encodeURIComponent(kind)}&user_id=${encodeURIComponent(userId)}`);
 
 export const getStatusCounts = () => request("/api/stats/status-counts");
 

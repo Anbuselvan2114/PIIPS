@@ -11,6 +11,62 @@ sub-versions.
 
 ## Unreleased (next version)
 
+### Batch status: Rejected By Accounts no longer shows as a stuck "In Progress"
+
+- A rejected invoice is folded into the Loaded tier for the Dashboard's
+  batch-status label (it already passed through Loaded and needs the same
+  next step - fix it, then Load/Post it again). 9 Posted + 1 Rejected now
+  shows "Loaded" (the least-advanced tier reached) instead of the old
+  generic "In Progress"; all-Rejected also shows "Loaded" for the same
+  reason. The batch still stays locked (no Document No./Entry No.
+  renumbering), but - unlike before - a rejection no longer blocks every
+  OTHER batch's download; only genuine unstarted work (invoices still at
+  Ready to Load) does that now.
+- Load screen: Rejected rows always sort to the top, and are now listed
+  even when their Document No. is blank (can happen after an Exclude/
+  re-Include cycle) instead of silently disappearing.
+- Dashboard Batches table: two new per-status count columns, "Rejected by
+  Accounts" and "Manually Updated".
+
+### Manually Updated auto-park window widened from 31 to 90 days
+
+- A Data Mismatch/Excluded/New Template/Buyer Order/Vendor Code invoice
+  (or an Unsupported file) left untouched now takes 90 days, not 31,
+  before it auto-parks permanently as Manually Updated.
+
+### Completed Invoices now surfaces archived files with no database row
+
+- A file in ALL_INVOICES whose database row was deleted outright (e.g. its
+  whole batch removed by a direct SQL delete, which only ever touches the
+  database, never this folder) previously vanished from the app entirely
+  despite still existing on disk. It now shows up as an "orphan" row
+  (blank Invoice No./Vendor/Batch/Status, since that data is genuinely
+  gone) - still viewable/downloadable from its only remaining copy, via a
+  new ALL_INVOICES fallback in the file lookup used by View/Download.
+
+### Dashboard: Super Admin read-only batch export
+
+- A new download icon, first column in the Batches table, Super Admin
+  only - exports a batch's data exactly as currently persisted (every
+  header regardless of status, every Document No./Entry No. exactly as
+  already stored), for comparing against a disputed Excel. Unlike the
+  normal batch download, this never mints a number, locks anything, or
+  marks the batch downloaded - a pure read, no write of any kind.
+
+### Folder/API/Database Configuration: change tracking and History
+
+- Saving any of the three now records who changed it, when, and the old
+  value -> new value (the Database Configuration entry never logs the
+  username/password, only server/database/auth type). A new History
+  button on each of the three screens, Super Admin only, shows this
+  timeline - same History pattern already used by Templates and Users.
+
+### User Management: Change Password panel removed
+
+- The "assign a new password for another user" panel is gone from User
+  Management for every role. Per-row actions (Reset password to the
+  username, Inactivate) are unchanged.
+
 ### SERVICE Purchase Line "No." is now a template field
 
 - SERVICE never calls Service First, so unlike PART it had no way at all
