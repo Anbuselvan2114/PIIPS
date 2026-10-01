@@ -334,8 +334,12 @@ def ensure_status_folders(status_names):
 
 def find_pdf(filename):
     """Locate a PDF/image by name anywhere under the Folder Path (Input or any
-    status folder), skipping Output/New_Format/Trained_format/ALL_INVOICES.
-    '' if missing."""
+    status folder), skipping Output/New_Format/Trained_format/ALL_INVOICES -
+    falling back to ALL_INVOICES itself only if the name isn't found
+    anywhere else (an orphaned archive copy whose original status-folder
+    file and database row are both gone - see database.completed_invoices's
+    orphan rows - still needs to be viewable/downloadable from its only
+    remaining copy). '' if missing."""
     base = (load_config().get("folder_path") or "").strip()
     if not base or not filename:
         return ""
@@ -346,6 +350,10 @@ def find_pdf(filename):
             dirs[:] = [d for d in dirs if d not in skip]
         if filename in files:
             return os.path.join(root, filename)
+    all_invoices = os.path.join(base, ALL_INVOICES_DIR)
+    candidate = os.path.join(all_invoices, filename)
+    if os.path.isfile(candidate):
+        return candidate
     return ""
 
 
