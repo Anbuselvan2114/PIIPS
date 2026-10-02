@@ -179,6 +179,19 @@ _SERIAL_NO_RE = re.compile(
 # Dell hardware serial in its hyphenated form, printed with no label at all.
 _DELL_TAG_RE = re.compile(r"(?i)\bCN-[0-9A-Z]{6}(?:-[0-9A-Z]{3,5}){3,}\b")
 
+# A bare list of 2+ serial numbers with no "S/N:"/"Serial No." label at all
+# (e.g. Sogo Computers' own continuation line "3ZXRTD4 / 59YRTD4 / HT2S7D4 /"
+# - one serial per unit of a multi-quantity item, slash-separated). Each
+# token must be ALL-CAPS/digits only (no lowercase - real description text
+# never is) and contain at least one digit, so an ordinary part number or
+# model code standing alone (needs 2+ slash-joined tokens here) is never
+# mistaken for this.
+_BARE_SERIAL_LIST_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?=[A-Z0-9]*\d)[A-Z0-9]{5,12}"
+    r"(?:\s*/\s*(?=[A-Z0-9]*\d)[A-Z0-9]{5,12}){1,}"
+    r"\s*/?\s*(?![A-Za-z0-9])"
+)
+
 
 class OCREngine:
 
@@ -1216,13 +1229,27 @@ class OCREngine:
             # -------------------------------------
             # Many invoices print the SAME invoice several times — "ORIGINAL
             # FOR RECIPIENT", "DUPLICATE FOR TRANSPORTER", "TRIPLICATE FOR
-            # SUPPLIER". Only the first (original) copy should contribute its
-            # fields / items / tax; otherwise the line items are duplicated.
-            if re.search(
-                r"(duplicate|triplicate|quadruplicate)\s+(for|copy)"
-                r"|transporter'?s?\s+copy|extra\s+copy",
-                page.get("Text", "") or "",
-                re.IGNORECASE,
+            # SUPPLIER" — each its OWN separate page. Only the first
+            # (original) copy should contribute its fields / items / tax;
+            # otherwise the line items are duplicated.
+            #
+            # Some vendor templates (e.g. Sogo Computers) instead print all
+            # three markers together as column headers on a single page
+            # meant to be cut into 3 physical copies - there is no separate
+            # "original" page elsewhere to prefer here. Without the
+            # "original" exclusion below, that one real page gets skipped
+            # as if it were a duplicate, leaving the whole invoice with no
+            # fields/items/text at all (format detection then fails with no
+            # seller GSTIN to key off).
+            page_text = page.get("Text", "") or ""
+            if (
+                re.search(
+                    r"(duplicate|triplicate|quadruplicate)\s+(for|copy)"
+                    r"|transporter'?s?\s+copy|extra\s+copy",
+                    page_text,
+                    re.IGNORECASE,
+                )
+                and not re.search(r"original\s+(for|copy)", page_text, re.IGNORECASE)
             ):
                 continue
 
@@ -1398,6 +1425,23 @@ class OCREngine:
             seller = next((g for g in found if _norm_gstin(g) not in already), None)
             if seller:
                 merged_fields["Seller GSTIN/UIN"] = seller
+
+        # Re-number "SI" sequentially across the WHOLE merged invoice, not
+        # per source page - extract_items() (per-page) already stamps each
+        # item's SI/Line_No in that page's own row order starting at 1,
+        # which is correct for a single-page invoice but collides on a
+        # multi-page one: page 2's first item restamps SI=1 too, so
+        # invoice_schema.build_invoice_json (which trusts SI over its own
+        # loop index specifically to survive items being reordered/
+        # re-grouped after extraction) ends up minting the SAME Line No.
+        # (SI * 10000) for two genuinely different lines - e.g. a 10-line,
+        # 2-page invoice's page-1 item #1 and page-2 item #10 both landing
+        # on Line No. 10000, which Navision then can't accept as two
+        # distinct lines. Re-stamping here, once the whole invoice's items
+        # are finally in one list in true row order, is the one place that
+        # covers every invoice regardless of how many pages it spans.
+        for _idx, _item in enumerate(group["items"], start=1):
+            _item["SI"] = _idx
 
         return {
             "Text": text,
@@ -1866,7 +1910,26 @@ class OCREngine:
 
             "amount in words",
 
+            # Sogo Computers' own abbreviated phrasing ("Amt in Words :
+            # Rs.Forty-Five Thousand..." instead of "Amount in Words") -
+            # "amount in words" above doesn't substring-match "amt in
+            # words", so without this entry table_end never stops here.
+            "amt in words",
+
             "sub total",
+
+            # A separate CGST/SGST/IGST rate-breakdown table some layouts
+            # print below the item table's own Total row (its own "Taxable
+            # Value | CGST | SGST | IGST" column header - distinct from the
+            # single bare "taxable" keyword TABLE_WORDS uses to help find
+            # the table's START, which a genuine item-table header can
+            # legitimately contain too). Without this, that whole
+            # rate-breakdown block (and everything after it, up until
+            # whichever FOOTER_WORDS entry eventually matches much later)
+            # gets scanned as more table rows - e.g. Sogo Computers' "30
+            # DAYS | 38300.00 | 0 | 0.00 | 0 | 0.00 | 18 | 6894.00" rate row
+            # became a fully bogus extra line item.
+            "taxable value",
 
         ]
 
@@ -3522,6 +3585,8 @@ class OCREngine:
             )
             # Unlabelled Dell service-tag serials ("CN-05NT8R-PRC00-627-08LI-A08").
             item["Description"] = _DELL_TAG_RE.sub(" ", item["Description"])
+            # Unlabelled bare serial lists ("3ZXRTD4 / 59YRTD4 / HT2S7D4 /").
+            item["Description"] = _BARE_SERIAL_LIST_RE.sub(" ", item["Description"])
 
             item["Description"] = re.sub(
                 r"\s+",
