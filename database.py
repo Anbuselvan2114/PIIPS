@@ -1047,6 +1047,13 @@ def list_batches():
     Sample: list_batches()
     Returns [{batch, created, headers, exportable, counts, batch_status, locked, blocked_by}]."""
     ensure_menu_schema()
+    # tbl_BatchDownload's LastDocNo/LastEntryNo columns (below) are added by
+    # this same migration that mark_batch_downloaded/get_batch_download_
+    # history already call - on a fresh deploy where nothing else has
+    # triggered it yet, _table_exists alone isn't enough: the table can
+    # exist without these columns, and the SELECT below would error with
+    # "Invalid column name" and take the whole batch list down with it.
+    ensure_audit_table()
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -1142,6 +1149,7 @@ def mark_batch_downloaded(batch_name, user_id=None, doc_no=None, entry_no=None):
     Sample: mark_batch_downloaded('PIIPS_Batch_20260722_101500', doc_no='PIIPSPO-2627-000001', entry_no='1001')"""
     if not batch_name:
         return
+    ensure_audit_table()
     conn = get_connection()
     try:
         cur = conn.cursor()
