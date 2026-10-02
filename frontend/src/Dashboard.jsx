@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   startProcessing, getStatus, getResult, getActiveJob,
-  getBatches, downloadBatchFile, exportBatchFile, getStatusCounts,
+  getBatches, downloadBatchFile, exportBatchFile, getBatchHistory, getStatusCounts,
   getInvoicesByStatus, getInvoicesByBatch, setInvoiceExcluded,
   getInvoiceFieldCheck,
 } from "./api";
@@ -106,6 +106,8 @@ export default function Dashboard({ user }) {
   const [results, setResults] = useState([]);
   const [batches, setBatches] = useState([]);
   const [batchInputs, setBatchInputs] = useState({});   // batch -> {docNo, entryNo}
+  const [batchHistory, setBatchHistory] = useState(null);   // {batch, events} | null
+  const [batchHistoryLoading, setBatchHistoryLoading] = useState(null);   // batch name currently loading
   const [batchError, setBatchError] = useState(null);
   const [downloadingBatch, setDownloadingBatch] = useState(null);
   const [exportingBatch, setExportingBatch] = useState(null);
@@ -120,7 +122,33 @@ export default function Dashboard({ user }) {
   const polledRef = useRef(null);   // job id whose progress this screen is following
 
   const loadBatches = () =>
-    getBatches().then((r) => setBatches(r.batches || [])).catch(() => {});
+    getBatches().then((r) => {
+      const list = r.batches || [];
+      setBatches(list);
+      // Pre-fill each batch's Document No./Entry No. boxes with what was
+      // last actually downloaded (see database.list_batches'
+      // last_doc_no/last_entry_no) - only for a batch whose box is still
+      // untouched, so this never clobbers something the user is mid-typing.
+      // Both boxes are type="number" plain-integer OVERRIDE START values
+      // (e.g. "10"), not the full stored value - Entry No. already is a
+      // plain integer, but Document No. is the full minted string (e.g.
+      // "PIIPSPO-2627-000001"); a non-numeric string silently renders as
+      // blank in a number input, so its trailing digit run is pulled out
+      // and leading zeros stripped (empty digit run - e.g. a custom/
+      // template-less Document No. - falls back to blank, same as before).
+      const docNoSeq = (s) => {
+        const m = /(\d+)\s*$/.exec(s || "");
+        return m ? String(parseInt(m[1], 10)) : "";
+      };
+      setBatchInputs((prev) => {
+        const next = { ...prev };
+        for (const b of list) {
+          if (next[b.batch] || (!b.last_doc_no && !b.last_entry_no)) continue;
+          next[b.batch] = { docNo: docNoSeq(b.last_doc_no), entryNo: b.last_entry_no || "" };
+        }
+        return next;
+      });
+    }).catch(() => {});
   const loadStatusCounts = () =>
     getStatusCounts().then((r) => setStatusCounts(r.counts || [])).catch(() => {});
   const statusTotal = statusCounts.reduce((s, d) => s + (d.count || 0), 0);
@@ -440,6 +468,19 @@ export default function Dashboard({ user }) {
     finally { setDownloadingBatch(null); }
   };
 
+  // Super Admin only - who/when downloaded this batch, and the Document
+  // No./Entry No. each download produced (see database.
+  // get_batch_download_history - every download already logs its own
+  // tbl_Audit_Event row, this just reads them back filtered to one batch).
+  const openBatchHistory = async (batch) => {
+    setBatchHistoryLoading(batch);
+    try {
+      const r = await getBatchHistory(batch, user?.user_id);
+      setBatchHistory({ batch, events: r.events || [] });
+    } catch (e) { setBatchError(e.message); }
+    finally { setBatchHistoryLoading(null); }
+  };
+
   // Super Admin only - exports the batch's EXISTING data exactly as
   // currently persisted (no minting, no locking, no marking downloaded -
   // see app.py's export_batch). A read-only snapshot for comparing against
@@ -519,6 +560,15 @@ export default function Dashboard({ user }) {
                 ? "Kindly resolve the Data Mismatch invoice(s) in this batch before downloading."
                 : "No active / included invoices to export, or every invoice in this batch has already moved past Ready to Load"}>—</span>
       )) },
+    ...(isSuperAdmin ? [{
+      key: "_history", label: "", sortable: false,
+      render: (row) => (
+        <button className="btn btn-subtle btn-sm" disabled={batchHistoryLoading === row.batch}
+                onClick={() => openBatchHistory(row.batch)}>
+          {batchHistoryLoading === row.batch ? "Loading…" : "History"}
+        </button>
+      ),
+    }] : []),
   ];
 
   return (
@@ -706,6 +756,29 @@ export default function Dashboard({ user }) {
       )}
 
       {pdfFile && <PdfModal file={pdfFile.file} page={pdfFile.page} pageEnd={pdfFile.pageEnd} onClose={() => setPdfFile(null)} />}
+
+      {batchHistory && (
+        <Modal title={`Download History — ${batchHistory.batch}`} onClose={() => setBatchHistory(null)} width={640}>
+          {batchHistory.events.length === 0 ? (
+            <div className="empty">No downloads recorded yet.</div>
+          ) : (
+            <div className="timeline">
+              {batchHistory.events.map((ev) => (
+                <div key={ev.Id} className="timeline-item">
+                  <div className="timeline-dot" />
+                  <div className="timeline-content">
+                    <div className="timeline-header">
+                      <span className="timeline-time">{ev.EventDatetime}</span>
+                    </div>
+                    <div className="timeline-who">{ev.UserName || "Unknown"}</div>
+                    {ev.Detail && <div className="timeline-detail">{ev.Detail}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }

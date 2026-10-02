@@ -1073,12 +1073,16 @@ def list_batches():
                 by_batch[batch]["counts"][sname] = cnt or 0
 
         downloaded = set()
+        last_numbers = {}
         if _table_exists(cur, "tbl_BatchDownload") and order:
             placeholders = ", ".join("?" for _ in order)
             cur.execute(
-                f"SELECT BatchName FROM dbo.tbl_BatchDownload WHERE BatchName IN ({placeholders})",
+                f"SELECT BatchName, LastDocNo, LastEntryNo FROM dbo.tbl_BatchDownload "
+                f"WHERE BatchName IN ({placeholders})",
                 *order)
-            downloaded = {r[0] for r in cur.fetchall()}
+            for bn, doc_no, entry_no in cur.fetchall():
+                downloaded.add(bn)
+                last_numbers[bn] = (doc_no, entry_no)
 
         reincluded = set()
         if _table_exists(cur, "tbl_BatchReIncluded") and order:
@@ -1092,6 +1096,9 @@ def list_batches():
             row = by_batch[batch]
             row["batch_status"], row["locked"] = _batch_status_and_lock(
                 row["counts"], batch in downloaded, batch in reincluded)
+            last_doc_no, last_entry_no = last_numbers.get(batch, (None, None))
+            row["last_doc_no"] = last_doc_no
+            row["last_entry_no"] = last_entry_no
 
         # `order` is BatchName DESC (newest first), so everything AFTER a
         # batch in this list was created BEFORE it - exactly the "earlier
@@ -1121,10 +1128,18 @@ def is_batch_locked(batch_name):
         conn.close()
 
 
-def mark_batch_downloaded(batch_name, user_id=None):
+def mark_batch_downloaded(batch_name, user_id=None, doc_no=None, entry_no=None):
     """Record that a batch's Excel was just downloaded (for the Dashboard's
     Batch Status column - see list_batches). Upserts one row per batch.
-    Sample: mark_batch_downloaded('PIIPS_Batch_20260722_101500')"""
+    `doc_no`/`entry_no` are this download's actual first minted Document
+    No./Entry No. (not necessarily a user-typed override - see app.py's
+    download_batch, which passes whatever ended up in the exported sheet
+    either way) - stored on tbl_BatchDownload so the Dashboard can
+    pre-fill its Document No./Entry No. boxes with what was last used
+    (see list_batches' last_doc_no/last_entry_no), and included in this
+    download's own tbl_Audit_Event row so Batch History shows exactly
+    what was downloaded, not just when.
+    Sample: mark_batch_downloaded('PIIPS_Batch_20260722_101500', doc_no='PIIPSPO-2627-000001', entry_no='1001')"""
     if not batch_name:
         return
     conn = get_connection()
@@ -1134,19 +1149,49 @@ def mark_batch_downloaded(batch_name, user_id=None):
             return
         cur.execute(
             "UPDATE dbo.tbl_BatchDownload SET LastDownloadedAt = GETDATE(), "
-            "DownloadCount = DownloadCount + 1 WHERE BatchName = ?",
-            batch_name)
+            "DownloadCount = DownloadCount + 1, LastDocNo = ?, LastEntryNo = ? "
+            "WHERE BatchName = ?",
+            doc_no, entry_no, batch_name)
         if cur.rowcount == 0:
             cur.execute(
                 "INSERT INTO dbo.tbl_BatchDownload "
-                "(BatchName, FirstDownloadedAt, LastDownloadedAt, DownloadCount) "
-                "VALUES (?, GETDATE(), GETDATE(), 1)",
-                batch_name)
+                "(BatchName, FirstDownloadedAt, LastDownloadedAt, DownloadCount, LastDocNo, LastEntryNo) "
+                "VALUES (?, GETDATE(), GETDATE(), 1, ?, ?)",
+                batch_name, doc_no, entry_no)
         conn.commit()
     finally:
         conn.close()
+    detail = "Batch Excel downloaded"
+    if doc_no or entry_no:
+        detail += f" (Document No. {doc_no or '—'}, Entry No. {entry_no or '—'})"
     log_event("BATCH_DOWNLOADED", batch=batch_name, user_id=user_id, entity="BATCH",
-              detail="Batch Excel downloaded")
+              detail=detail)
+
+
+def get_batch_download_history(batch_name, limit=200):
+    """Who/when downloaded this batch's Excel, and what Document No./Entry
+    No. that download used - the Dashboard's per-batch History button
+    (Super Admin only). Reads tbl_Audit_Event WHERE Entity='BATCH' AND
+    Action='BATCH_DOWNLOADED' AND BatchName=batch_name - every download
+    already gets its own row there (see mark_batch_downloaded), so this
+    is a plain filtered read, no new table.
+    Sample: get_batch_download_history('PIIPS_Batch_20260722_101500')"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT a.Id, a.EventDatetime, a.Detail, u.UserName "
+            "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+            "WHERE a.Entity = 'BATCH' AND a.Action = 'BATCH_DOWNLOADED' AND a.BatchName = ? "
+            "ORDER BY a.EventDatetime DESC", batch_name)
+        cols = ["Id", "EventDatetime", "Detail", "UserName"]
+        out = [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
+        for row in out:
+            row["EventDatetime"] = row["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if row["EventDatetime"] else ""
+        return out
+    finally:
+        conn.close()
 
 
 def list_statuses():
@@ -6751,7 +6796,9 @@ def ensure_audit_table():
         for col, ddl in TRACKER_AUDIT_COLUMNS:
             cur.execute("IF COL_LENGTH('dbo.tbl_Purchase_Tracker', ?) IS NULL "
                         "EXEC('ALTER TABLE dbo.tbl_Purchase_Tracker ADD [' + ? + '] ' + ?)", col, col, ddl)
-        for col, ddl in (("LastDownloadedByID", "INT NULL"),):
+        for col, ddl in (("LastDownloadedByID", "INT NULL"),
+                         ("LastDocNo", "NVARCHAR(100) NULL"),
+                         ("LastEntryNo", "NVARCHAR(100) NULL")):
             cur.execute("IF OBJECT_ID('dbo.tbl_BatchDownload') IS NOT NULL AND "
                         "COL_LENGTH('dbo.tbl_BatchDownload', ?) IS NULL "
                         "EXEC('ALTER TABLE dbo.tbl_BatchDownload ADD [' + ? + '] ' + ?)", col, col, ddl)

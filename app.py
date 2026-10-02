@@ -1715,8 +1715,21 @@ def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, e
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
 
+    # The first row's No./Entry No. - representative of this download's
+    # whole minted range, since _assign_document_numbers/renumber_batch
+    # number every row sequentially from here. Recorded so the Dashboard
+    # can pre-fill its Document No./Entry No. boxes with what was last
+    # used, and so Batch History shows what each download actually
+    # produced, not just when it happened.
+    ph_rows = sheet_data["Purchase Header"]["rows"]
+    re_rows = sheet_data["Reservation Entry"]["rows"]
+    doc_no_used = ph_rows[0].get("No.") if ph_rows else None
+    entry_no_used = re_rows[0].get("Entry No.") if re_rows else None
+
     try:
-        database.mark_batch_downloaded(name, user_id=request.scope.get("state", {}).get("user_id"))
+        database.mark_batch_downloaded(
+            name, user_id=request.scope.get("state", {}).get("user_id"),
+            doc_no=doc_no_used, entry_no=entry_no_used)
     except Exception:  # noqa: BLE001 - best-effort, download still succeeds
         import traceback
         traceback.print_exc()
@@ -1730,6 +1743,18 @@ def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, e
         filename=f"{safe}.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+@app.get("/api/batches/history")
+def batch_history(batch: str, user_id: Optional[int] = None):
+    """Super Admin only: who/when downloaded this batch's Excel, and the
+    Document No./Entry No. each download produced."""
+    _require_developer(user_id)
+    import database
+    try:
+        return {"events": database.get_batch_download_history(batch)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
 @app.get("/api/batches/export")

@@ -270,6 +270,11 @@ export const downloadBatchFile = async (batch, docNo, entryNo) => {
   return { blob, filename: match ? match[1] : `${batch}.xlsx` };
 };
 
+// Super Admin only - who/when downloaded this batch, and the Document
+// No./Entry No. each download produced.
+export const getBatchHistory = (batch, userId) =>
+  request(`/api/batches/history?batch=${encodeURIComponent(batch)}&user_id=${encodeURIComponent(userId)}`);
+
 // Super Admin only - exports a batch's EXISTING data (no minting, no
 // locking, no marking downloaded - see app.py's export_batch).
 export const batchExportUrl = (batch, userId) =>
