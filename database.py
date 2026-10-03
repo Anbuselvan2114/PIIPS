@@ -2043,16 +2043,23 @@ def completed_invoices(limit=500):
     Also includes "orphan" rows - a file physically present in
     ALL_INVOICES whose database row no longer exists at all (its batch was
     deleted outright, e.g. via a direct SQL delete script, which only ever
-    touches the database, never this archive folder). An orphan has none
-    of the rich DB metadata (invoice_no/vendor/batch/status all blank) and
-    a distinct NEGATIVE header_id (real headers are always positive) so it
-    stays visible/viewable/downloadable instead of silently disappearing
-    just because its database trail is gone, while the frontend can still
-    tell it apart from a real row (no History/Details for it).
+    touches the database, never this archive folder) but DID genuinely
+    reach COMPLETED via PIIPS, confirmed against a real STATUS_CHANGED
+    audit row (not just its mere presence in the folder - a file that
+    landed there any other way, or was never actually completed through
+    the app, is never shown). An orphan has none of the rich DB metadata
+    (invoice_no/vendor/batch/status all blank) and a distinct NEGATIVE
+    header_id (real headers are always positive) so it stays visible/
+    viewable/downloadable instead of silently disappearing just because
+    its database trail is gone, while the frontend can still tell it apart
+    from a real row (no History/Details for it).
     Sample: completed_invoices()"""
     rows = _invoice_list("s.StatusName = 'COMPLETED'", [])
-    if not rows:
-        return rows
+    # No early return here even when `rows` is empty: if every COMPLETED
+    # header was deleted (not just some), orphans are now this function's
+    # ONLY possible output - returning early would silently hide every
+    # genuinely-completed-then-deleted invoice, defeating the whole reason
+    # the orphan branch below exists in the first place.
 
     base = (config_store.load_config().get("folder_path") or "").strip()
     all_invoices_dir = os.path.join(base, config_store.ALL_INVOICES_DIR) if base else ""
@@ -2092,7 +2099,35 @@ def completed_invoices(limit=500):
     # negative placeholder (never a real header - those are always
     # positive) so the frontend's per-row selection/History-button gating
     # doesn't collide multiple orphans onto one id.
-    orphan_names = sorted(present - matched)
+    #
+    # A file merely sitting in ALL_INVOICES is NOT by itself proof it was
+    # ever completed via PIIPS - only a genuine COMPLETED STATUS_CHANGED
+    # audit row is that proof, and advance_status's own log_event call
+    # already captures that header's FileName/InvoiceNo into the audit row
+    # (via _audit_ctx) at the moment of completion, before any later
+    # deletion - so it survives even once the header itself is gone.
+    # Matched by invoice-no PREFIX (not full archived_name) since the audit
+    # row never recorded the vendor half of that name; a file whose prefix
+    # doesn't correspond to any genuine COMPLETED invoice no. is left out
+    # entirely rather than shown on the strength of its mere presence.
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT InvoiceNo FROM dbo.tbl_Audit_Event "
+            "WHERE Action = 'STATUS_CHANGED' AND ToStatus = 'COMPLETED' AND InvoiceNo IS NOT NULL"
+        )
+        completed_invoice_prefixes = [
+            config_store._safe_folder(r[0]) + "_" for r in cur.fetchall() if r[0]
+        ]
+    finally:
+        conn.close()
+    candidates = present - matched
+    orphan_names = sorted(
+        name for name in candidates
+        if any(name.startswith(p) for p in completed_invoice_prefixes)
+    )
     for i, name in enumerate(orphan_names):
         rows.append({
             "header_id": -(i + 1),
