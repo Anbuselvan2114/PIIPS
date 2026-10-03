@@ -34,18 +34,22 @@ import { MENU } from "./menuConfig";
 // every menu (MENU.map below), enforced here regardless of what the Screen
 // Access menu's own table might ever contain.
 const DEFAULT_ROLE_MENUS = {
-  admin: ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate",
+  admin: ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate",
           "load", "post", "complete",
           "configuration", "apiconfig", "template", "createfield", "users"],
-  // Users process invoices, fix Buyer Order Nos / NAV Vendor Codes, and Load them.
-  user: ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate", "load"],
+  // Users process invoices, fix Buyer Order Nos, and Load them. NAV Vendor
+  // Code Entry is deliberately not listed for any configurable role below -
+  // access removed menu-wide (still reachable by Super Admin/Developer,
+  // which always sees every menu regardless of this table - see the
+  // comment above DEFAULT_ROLE_MENUS).
+  user: ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load"],
   // Accounts run the downstream Post / Complete steps.
   accounts: ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "post", "complete"],
   // Viewer sees invoice-processing data read-only (every mutating action is
   // blocked server-side too, app.py's _require_not_viewer) but not the
   // Setup/Mapping/Admin screens - those configure the app itself rather
   // than show data, and aren't meant for this role.
-  viewer: ["dashboard", "input", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
+  viewer: ["dashboard", "input", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load", "post", "complete"],
 };
 
 // Load / Post / Complete are one component parameterised by stage.

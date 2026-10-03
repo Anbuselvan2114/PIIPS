@@ -39,7 +39,6 @@ STATUS_VALUES = [
     "INITIATED",
     "EXTRACTED",
     "BUYER ORDER NO DOESN'T EXIST",
-    "NAV VENDOR CODE DOESN'T EXIST",
     "SF PROCESSED",
     "PENDING IN SF",
     "DATA MISMATCH",      # renamed from "INCOMPLETE DATA" - see migration below
@@ -2192,6 +2191,23 @@ def invoices_by_statuses(status_names, active_only=False):
     return _invoice_list(where, names)
 
 
+def invoices_vendor_code_missing():
+    """SERVICE invoices parked at DATA MISMATCH over a missing/doubtful NAV
+    vendor code (Vendor Code Entry menu). There's no dedicated status for
+    this any more (folded into the ordinary DATA MISMATCH bucket - see
+    processor.py's SERVICE verdict branch) so this is found directly by
+    the blank vendor code column instead of a status name; the same column
+    apply_manual_vendor_code/set_nav_vendor_code writes once it's keyed in.
+    Sample: invoices_vendor_code_missing()"""
+    where = (
+        "s.StatusName = 'DATA MISMATCH' AND ISNULL(pt.IsExcluded, 0) = 0 "
+        "AND pt.InvoiceTypeID IN (SELECT InvoiceTypeId FROM dbo.tbl_InvoiceType "
+        "                         WHERE InvoiceTypeName = 'SERVICE') "
+        "AND (h.[Pay-to Vendor No.] IS NULL OR h.[Pay-to Vendor No.] = '')"
+    )
+    return _invoice_list(where, [])
+
+
 # The menu keys each role can see BEFORE a Super Admin has ever saved the
 # "Screen Access" menu - i.e. what every existing deployment already
 # behaves like today. Used only to seed tbl_RoleMenu the first time it's
@@ -2201,12 +2217,15 @@ def invoices_by_statuses(status_names, active_only=False):
 # a one-time seed, not read on every request, so a stale key here only
 # matters for a brand new deployment's first run.
 _ROLE_MENU_DEFAULTS = {
-    "admin": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate",
+    "admin": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate",
               "load", "post", "complete",
               "configuration", "apiconfig", "template", "createfield", "users"],
-    "user": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate", "load"],
+    # NAV Vendor Code Entry is deliberately not listed for any role here -
+    # access removed menu-wide (still reachable by Super Admin/Developer,
+    # which always sees every menu regardless of this table).
+    "user": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load"],
     "accounts": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "post", "complete"],
-    "viewer": ["dashboard", "input", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
+    "viewer": ["dashboard", "input", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load", "post", "complete"],
 }
 
 

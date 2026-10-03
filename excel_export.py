@@ -648,6 +648,25 @@ def missing_required_fields(header, lines, reservations=None, mapping=None, invo
         if _is_blank(header.get(f)) and not _is_none_source("Purchase Header", f, mapping):
             found.append({"field": f, "sheet": "Purchase Header",
                           "source": field_source("Purchase Header", f, mapping, invoice_type)})
+    # "Pay-to Vendor No." is classified "Service First" by field_source (the
+    # same mapping convention PART uses, where SF really does fill it) -
+    # which is exactly why the generic SF-exemption two lines up skips it
+    # for SERVICE. But a SERVICE invoice never calls SF at all; this field
+    # is instead hand-keyed on the Vendor Code Entry menu, so for SERVICE
+    # specifically it IS a genuine, required, PDF/manually-sourced field -
+    # checked here on its own, bypassing that exemption on purpose, so a
+    # blank one correctly keeps the invoice at DATA MISMATCH instead of the
+    # completeness gate clearing it straight to READY TO LOAD.
+    if invoice_type == "SERVICE" and _is_blank(header.get("Pay-to Vendor No.")):
+        # source left as "Service First" (its natural field_source()
+        # classification) rather than "PDF" - processor.py's completeness
+        # gate routes a missing PDF-sourced field to NEW TEMPLATE (a
+        # training gap), but a blank vendor code is a one-off data problem
+        # for THIS invoice, not a template defect, so it must land on
+        # DATA MISMATCH instead - same category this field already used
+        # before it had its own dedicated status.
+        found.append({"field": "Pay-to Vendor No.", "sheet": "Purchase Header",
+                      "source": "Service First"})
     for line in lines:
         for f in _line_missing_fields(line, mapping, invoice_type):
             found.append({"field": f, "sheet": "Purchase Line",

@@ -1130,12 +1130,12 @@ def invoices_buyer_order_missing():
 
 @app.get("/api/invoices/vendor-code-missing")
 def invoices_vendor_code_missing():
-    """SERVICE invoices parked at 'NAV VENDOR CODE DOESN'T EXIST' (missing
-    from the scanned PDF) for the Vendor Code Entry menu."""
+    """SERVICE invoices parked at DATA MISMATCH over a missing/doubtful NAV
+    vendor code (Vendor Code Entry menu) - see database.invoices_vendor_
+    code_missing for why this is no longer a dedicated status."""
     import database
     try:
-        return {"invoices": database.invoices_by_statuses(
-            ["NAV VENDOR CODE DOESN'T EXIST"])}
+        return {"invoices": database.invoices_vendor_code_missing()}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
