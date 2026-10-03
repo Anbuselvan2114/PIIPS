@@ -855,7 +855,13 @@ def _unsupported_files_list():
 def status_counts():
     """Purchase-header counts grouped by tracker status, PLUS an INITIATED
     bucket for files still waiting in the Input folder and an UNSUPPORTED
-    bucket for files Start couldn't read (dashboard pie)."""
+    bucket for files Start couldn't read (dashboard pie). COMPLETED is
+    likewise overridden with the Completed Invoices menu's own count (see
+    database.completed_invoices) rather than the raw tracker-row count, so
+    the pie's number always matches what that list actually shows - a
+    completed header whose archive copy is missing, or an archived file
+    with no surviving database row at all and no genuine COMPLETED audit
+    trail, is counted the same way in both places."""
     import database
     try:
         counts = database.status_counts()
@@ -881,6 +887,19 @@ def status_counts():
         except Exception:  # noqa: BLE001 - synthetic count is best-effort
             import traceback
             traceback.print_exc()
+    try:
+        # Unlike INITIATED/UNSUPPORTED above, COMPLETED already has a real
+        # (and usually nonzero) tracker-based count, so this always
+        # overrides it - even down to 0 - rather than only when nonzero.
+        n = len(database.completed_invoices())
+        sid = database.status_id("COMPLETED") or 0
+        idx = next((i for i, c in enumerate(counts)
+                    if (c.get("status") or "").upper() == "COMPLETED"), len(counts))
+        counts = [c for c in counts if (c.get("status") or "").upper() != "COMPLETED"]
+        counts.insert(idx, {"status_id": sid, "status": "COMPLETED", "count": n})
+    except Exception:  # noqa: BLE001 - synthetic count is best-effort
+        import traceback
+        traceback.print_exc()
     return {"counts": counts}
 
 
@@ -888,9 +907,15 @@ def status_counts():
 def invoices_by_status(status_id: int):
     """Invoices with a given tracker status (pie-slice pop-up). For the
     INITIATED/UNSUPPORTED statuses the tracker has no rows, so the
-    corresponding folder is listed instead."""
+    corresponding folder is listed instead. For COMPLETED, uses the same
+    database.completed_invoices() the Completed Invoices menu itself uses
+    (archive-file-presence + orphan rows included) instead of a raw
+    tracker-row query, so this pop-up's count/list always matches that
+    menu's - and the pie's own synthetic COMPLETED count above."""
     import database
     try:
+        if status_id == (database.status_id("COMPLETED") or -1):
+            return {"invoices": database.completed_invoices()}
         for name, files in (("INITIATED", _input_files_list),
                              ("UNSUPPORTED", _unsupported_files_list)):
             if status_id == (database.status_id(name) or -1):
