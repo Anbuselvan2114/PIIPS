@@ -4,12 +4,14 @@ import { DataTable, PdfModal } from "./components";
 
 // Manual NAV Vendor Code entry.
 //
-// Lists SERVICE invoices parked at "NAV VENDOR CODE DOESN'T EXIST" (the
-// vendor code could not be read off the scanned PDF). SERVICE never calls
-// Service First, so this is the only source for the code at all. The user
-// types the correct code for a row and saves; the invoice becomes active
-// (status = 1) and moves to Ready to Load. Clicking the invoice/file opens
-// the PDF so the hand-written code can be read.
+// Lists SERVICE invoices parked at DATA MISMATCH over a missing/doubtful
+// vendor code (it could not be read off the scanned PDF) - no dedicated
+// status for this any more, found directly by the blank vendor code
+// column instead (see database.invoices_vendor_code_missing). SERVICE
+// never calls Service First, so this is the only source for the code at
+// all. The user types the correct code for a row and saves; the invoice
+// becomes active (status = 1) and moves to Ready to Load. Clicking the
+// invoice/file opens the PDF so the hand-written code can be read.
 export default function VendorCodeEntry({ user }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);

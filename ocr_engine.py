@@ -179,6 +179,43 @@ _SERIAL_NO_RE = re.compile(
 # Dell hardware serial in its hyphenated form, printed with no label at all.
 _DELL_TAG_RE = re.compile(r"(?i)\bCN-[0-9A-Z]{6}(?:-[0-9A-Z]{3,5}){3,}\b")
 
+# A bare list of 2+ serial numbers with no "S/N:"/"Serial No." label at all
+# (e.g. Sogo Computers' own continuation line "3ZXRTD4 / 59YRTD4 / HT2S7D4 /"
+# - one serial per unit of a multi-quantity item, slash-separated). Each
+# token must be ALL-CAPS/digits only (no lowercase - real description text
+# never is) and contain at least one digit, so an ordinary part number or
+# model code standing alone (needs 2+ slash-joined tokens here) is never
+# mistaken for this.
+_BARE_SERIAL_LIST_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?=[A-Z0-9]*\d)[A-Z0-9]{5,12}"
+    r"(?:\s*/\s*(?=[A-Z0-9]*\d)[A-Z0-9]{5,12}){1,}"
+    r"\s*/?\s*(?![A-Za-z0-9])"
+)
+
+
+# A page that IS a government-generated E-way Bill copy in its own right -
+# not an ordinary invoice page that merely prints its OWN "E-way Bill No."
+# as one field among many (that alone doesn't make the page an e-way bill;
+# plenty of tax invoices carry that single label/value pair in their
+# footer). The dedicated e-way bill document is built entirely around the
+# transport details instead - "Part-A"/"Part-B" sections, a validity
+# window, approx. distance - which an ordinary tax invoice never has, so
+# requiring BOTH the heading phrase and one of those layout markers avoids
+# misfiring on a normal invoice's own e-way-bill-number footer line.
+_EWAY_BILL_TITLE_RE = re.compile(r"\be[-\s]?way\s+bill\b", re.IGNORECASE)
+_EWAY_BILL_LAYOUT_RE = re.compile(
+    r"part[-\s]?a\b|part[-\s]?b\b|approx\.?\s*dist(?:ance)?|valid\s*(?:up\s*to|until|from)",
+    re.IGNORECASE,
+)
+
+
+def _is_eway_bill_page(page_text):
+    """True when a page is a standalone E-way Bill copy (see note above),
+    not a real invoice page of its own."""
+    if not page_text:
+        return False
+    return bool(_EWAY_BILL_TITLE_RE.search(page_text) and _EWAY_BILL_LAYOUT_RE.search(page_text))
+
 
 class OCREngine:
 
@@ -1216,31 +1253,61 @@ class OCREngine:
             # -------------------------------------
             # Many invoices print the SAME invoice several times — "ORIGINAL
             # FOR RECIPIENT", "DUPLICATE FOR TRANSPORTER", "TRIPLICATE FOR
-            # SUPPLIER". Only the first (original) copy should contribute its
-            # fields / items / tax; otherwise the line items are duplicated.
-            if re.search(
-                r"(duplicate|triplicate|quadruplicate)\s+(for|copy)"
-                r"|transporter'?s?\s+copy|extra\s+copy",
-                page.get("Text", "") or "",
-                re.IGNORECASE,
+            # SUPPLIER" — each its OWN separate page. Only the first
+            # (original) copy should contribute its fields / items / tax;
+            # otherwise the line items are duplicated.
+            #
+            # Some vendor templates (e.g. Sogo Computers) instead print all
+            # three markers together as column headers on a single page
+            # meant to be cut into 3 physical copies - there is no separate
+            # "original" page elsewhere to prefer here. Without the
+            # "original" exclusion below, that one real page gets skipped
+            # as if it were a duplicate, leaving the whole invoice with no
+            # fields/items/text at all (format detection then fails with no
+            # seller GSTIN to key off).
+            page_text = page.get("Text", "") or ""
+            if (
+                re.search(
+                    r"(duplicate|triplicate|quadruplicate)\s+(for|copy)"
+                    r"|transporter'?s?\s+copy|extra\s+copy",
+                    page_text,
+                    re.IGNORECASE,
+                )
+                and not re.search(r"original\s+(for|copy)", page_text, re.IGNORECASE)
             ):
                 continue
 
             page_fields = (page.get("Header") or {}).get("Fields", {}) or {}
             page_invoice_no = (page_fields.get("Invoice No.") or "").strip()
 
+            # A standalone E-way Bill copy (see _is_eway_bill_page) is a
+            # transport document for whichever invoice precedes it, never a
+            # second invoice of its own - fold it into the current group
+            # (page_end below, so PDF view/download still spans it) instead
+            # of letting its own differing "Invoice No." (or lack of one)
+            # start a phantom new group, and contribute none of its own
+            # text/fields/items/tax to that group's extracted data. Only
+            # applies once a real invoice has actually opened a group; an
+            # e-way bill page with nothing preceding it has nothing to
+            # attach to, so it's processed as an ordinary page instead.
+            is_eway_bill_page = bool(groups) and _is_eway_bill_page(page_text)
+
             if not groups:
                 groups.append(_new_group())
-            elif (page_invoice_no and groups[-1]["invoice_no"]
+            elif (not is_eway_bill_page and page_invoice_no and groups[-1]["invoice_no"]
                     and _invoice_no_differs(page_invoice_no, groups[-1]["invoice_no"])):
                 groups.append(_new_group())
 
             group = groups[-1]
-            if page_invoice_no and not group["invoice_no"]:
-                group["invoice_no"] = page_invoice_no
             if group["page_start"] is None:
                 group["page_start"] = page_no
             group["page_end"] = page_no
+
+            if is_eway_bill_page:
+                continue
+
+            if page_invoice_no and not group["invoice_no"]:
+                group["invoice_no"] = page_invoice_no
 
 
             # -------------------------------------
@@ -1398,6 +1465,23 @@ class OCREngine:
             seller = next((g for g in found if _norm_gstin(g) not in already), None)
             if seller:
                 merged_fields["Seller GSTIN/UIN"] = seller
+
+        # Re-number "SI" sequentially across the WHOLE merged invoice, not
+        # per source page - extract_items() (per-page) already stamps each
+        # item's SI/Line_No in that page's own row order starting at 1,
+        # which is correct for a single-page invoice but collides on a
+        # multi-page one: page 2's first item restamps SI=1 too, so
+        # invoice_schema.build_invoice_json (which trusts SI over its own
+        # loop index specifically to survive items being reordered/
+        # re-grouped after extraction) ends up minting the SAME Line No.
+        # (SI * 10000) for two genuinely different lines - e.g. a 10-line,
+        # 2-page invoice's page-1 item #1 and page-2 item #10 both landing
+        # on Line No. 10000, which Navision then can't accept as two
+        # distinct lines. Re-stamping here, once the whole invoice's items
+        # are finally in one list in true row order, is the one place that
+        # covers every invoice regardless of how many pages it spans.
+        for _idx, _item in enumerate(group["items"], start=1):
+            _item["SI"] = _idx
 
         return {
             "Text": text,
@@ -1866,7 +1950,26 @@ class OCREngine:
 
             "amount in words",
 
+            # Sogo Computers' own abbreviated phrasing ("Amt in Words :
+            # Rs.Forty-Five Thousand..." instead of "Amount in Words") -
+            # "amount in words" above doesn't substring-match "amt in
+            # words", so without this entry table_end never stops here.
+            "amt in words",
+
             "sub total",
+
+            # A separate CGST/SGST/IGST rate-breakdown table some layouts
+            # print below the item table's own Total row (its own "Taxable
+            # Value | CGST | SGST | IGST" column header - distinct from the
+            # single bare "taxable" keyword TABLE_WORDS uses to help find
+            # the table's START, which a genuine item-table header can
+            # legitimately contain too). Without this, that whole
+            # rate-breakdown block (and everything after it, up until
+            # whichever FOOTER_WORDS entry eventually matches much later)
+            # gets scanned as more table rows - e.g. Sogo Computers' "30
+            # DAYS | 38300.00 | 0 | 0.00 | 0 | 0.00 | 18 | 6894.00" rate row
+            # became a fully bogus extra line item.
+            "taxable value",
 
         ]
 
@@ -3522,6 +3625,8 @@ class OCREngine:
             )
             # Unlabelled Dell service-tag serials ("CN-05NT8R-PRC00-627-08LI-A08").
             item["Description"] = _DELL_TAG_RE.sub(" ", item["Description"])
+            # Unlabelled bare serial lists ("3ZXRTD4 / 59YRTD4 / HT2S7D4 /").
+            item["Description"] = _BARE_SERIAL_LIST_RE.sub(" ", item["Description"])
 
             item["Description"] = re.sub(
                 r"\s+",

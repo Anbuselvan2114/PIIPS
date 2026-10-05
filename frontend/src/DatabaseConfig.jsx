@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { getDbConfig, saveDbConfig } from "./api";
-import { PasswordInput } from "./components";
+import { getDbConfig, saveDbConfig, getConfigHistory } from "./api";
+import { PasswordInput, Modal } from "./components";
 
 // Fields stacked vertically instead of the shared ".row"'s default
 // side-by-side layout.
@@ -19,6 +19,23 @@ export default function DatabaseConfig({ user, onSaved }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
+  const [history, setHistory] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  const isSuperAdmin = !onSaved
+    && ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
+
+  const openHistory = async () => {
+    setHistoryLoading(true);
+    try {
+      const r = await getConfigHistory("DB_CONFIG_CHANGED", user?.user_id);
+      setHistory(r.events || []);
+    } catch (e) {
+      setMessage({ ok: false, text: e.message });
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
 
   useEffect(() => {
     getDbConfig(user?.user_id)
@@ -68,7 +85,15 @@ export default function DatabaseConfig({ user, onSaved }) {
   return (
     <div className="page">
       <div className="card">
-        <h3>Database configuration</h3>
+        <div className="card-title-row">
+          <h3>Database configuration</h3>
+          <div style={{ flex: 1 }} />
+          {isSuperAdmin && (
+            <button className="btn btn-subtle btn-sm" disabled={historyLoading} onClick={openHistory}>
+              {historyLoading ? "Loading…" : "History"}
+            </button>
+          )}
+        </div>
         <p className="hint">
           {onSaved
             ? "No database is configured yet, so there's nothing to log into. "
@@ -143,6 +168,30 @@ export default function DatabaseConfig({ user, onSaved }) {
           )}
         </div>
       </div>
+
+      {history && (
+        <Modal title="Database Configuration History" onClose={() => setHistory(null)} width={640}>
+          {history.length === 0 ? (
+            <div className="empty">No changes recorded yet.</div>
+          ) : (
+            <div className="timeline">
+              {history.map((ev) => (
+                <div key={ev.Id} className="timeline-item">
+                  <div className="timeline-dot" />
+                  <div className="timeline-content">
+                    <div className="timeline-header">
+                      <span className="timeline-action">{ev.Action}</span>
+                      <span className="timeline-time">{ev.EventDatetime}</span>
+                    </div>
+                    <div className="timeline-who">{ev.UserName || "Unknown"}</div>
+                    {ev.Detail && <div className="timeline-detail">{ev.Detail}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }

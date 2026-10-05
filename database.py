@@ -39,7 +39,6 @@ STATUS_VALUES = [
     "INITIATED",
     "EXTRACTED",
     "BUYER ORDER NO DOESN'T EXIST",
-    "NAV VENDOR CODE DOESN'T EXIST",
     "SF PROCESSED",
     "PENDING IN SF",
     "DATA MISMATCH",      # renamed from "INCOMPLETE DATA" - see migration below
@@ -1047,6 +1046,13 @@ def list_batches():
     Sample: list_batches()
     Returns [{batch, created, headers, exportable, counts, batch_status, locked, blocked_by}]."""
     ensure_menu_schema()
+    # tbl_BatchDownload's LastDocNo/LastEntryNo columns (below) are added by
+    # this same migration that mark_batch_downloaded/get_batch_download_
+    # history already call - on a fresh deploy where nothing else has
+    # triggered it yet, _table_exists alone isn't enough: the table can
+    # exist without these columns, and the SELECT below would error with
+    # "Invalid column name" and take the whole batch list down with it.
+    ensure_audit_table()
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -1073,12 +1079,16 @@ def list_batches():
                 by_batch[batch]["counts"][sname] = cnt or 0
 
         downloaded = set()
+        last_numbers = {}
         if _table_exists(cur, "tbl_BatchDownload") and order:
             placeholders = ", ".join("?" for _ in order)
             cur.execute(
-                f"SELECT BatchName FROM dbo.tbl_BatchDownload WHERE BatchName IN ({placeholders})",
+                f"SELECT BatchName, LastDocNo, LastEntryNo FROM dbo.tbl_BatchDownload "
+                f"WHERE BatchName IN ({placeholders})",
                 *order)
-            downloaded = {r[0] for r in cur.fetchall()}
+            for bn, doc_no, entry_no in cur.fetchall():
+                downloaded.add(bn)
+                last_numbers[bn] = (doc_no, entry_no)
 
         reincluded = set()
         if _table_exists(cur, "tbl_BatchReIncluded") and order:
@@ -1092,6 +1102,9 @@ def list_batches():
             row = by_batch[batch]
             row["batch_status"], row["locked"] = _batch_status_and_lock(
                 row["counts"], batch in downloaded, batch in reincluded)
+            last_doc_no, last_entry_no = last_numbers.get(batch, (None, None))
+            row["last_doc_no"] = last_doc_no
+            row["last_entry_no"] = last_entry_no
 
         # `order` is BatchName DESC (newest first), so everything AFTER a
         # batch in this list was created BEFORE it - exactly the "earlier
@@ -1121,12 +1134,21 @@ def is_batch_locked(batch_name):
         conn.close()
 
 
-def mark_batch_downloaded(batch_name, user_id=None):
+def mark_batch_downloaded(batch_name, user_id=None, doc_no=None, entry_no=None):
     """Record that a batch's Excel was just downloaded (for the Dashboard's
     Batch Status column - see list_batches). Upserts one row per batch.
-    Sample: mark_batch_downloaded('PIIPS_Batch_20260722_101500')"""
+    `doc_no`/`entry_no` are this download's actual first minted Document
+    No./Entry No. (not necessarily a user-typed override - see app.py's
+    download_batch, which passes whatever ended up in the exported sheet
+    either way) - stored on tbl_BatchDownload so the Dashboard can
+    pre-fill its Document No./Entry No. boxes with what was last used
+    (see list_batches' last_doc_no/last_entry_no), and included in this
+    download's own tbl_Audit_Event row so Batch History shows exactly
+    what was downloaded, not just when.
+    Sample: mark_batch_downloaded('PIIPS_Batch_20260722_101500', doc_no='PIIPSPO-2627-000001', entry_no='1001')"""
     if not batch_name:
         return
+    ensure_audit_table()
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -1134,19 +1156,49 @@ def mark_batch_downloaded(batch_name, user_id=None):
             return
         cur.execute(
             "UPDATE dbo.tbl_BatchDownload SET LastDownloadedAt = GETDATE(), "
-            "DownloadCount = DownloadCount + 1 WHERE BatchName = ?",
-            batch_name)
+            "DownloadCount = DownloadCount + 1, LastDocNo = ?, LastEntryNo = ? "
+            "WHERE BatchName = ?",
+            doc_no, entry_no, batch_name)
         if cur.rowcount == 0:
             cur.execute(
                 "INSERT INTO dbo.tbl_BatchDownload "
-                "(BatchName, FirstDownloadedAt, LastDownloadedAt, DownloadCount) "
-                "VALUES (?, GETDATE(), GETDATE(), 1)",
-                batch_name)
+                "(BatchName, FirstDownloadedAt, LastDownloadedAt, DownloadCount, LastDocNo, LastEntryNo) "
+                "VALUES (?, GETDATE(), GETDATE(), 1, ?, ?)",
+                batch_name, doc_no, entry_no)
         conn.commit()
     finally:
         conn.close()
+    detail = "Batch Excel downloaded"
+    if doc_no or entry_no:
+        detail += f" (Document No. {doc_no or '—'}, Entry No. {entry_no or '—'})"
     log_event("BATCH_DOWNLOADED", batch=batch_name, user_id=user_id, entity="BATCH",
-              detail="Batch Excel downloaded")
+              detail=detail)
+
+
+def get_batch_download_history(batch_name, limit=200):
+    """Who/when downloaded this batch's Excel, and what Document No./Entry
+    No. that download used - the Dashboard's per-batch History button
+    (Super Admin only). Reads tbl_Audit_Event WHERE Entity='BATCH' AND
+    Action='BATCH_DOWNLOADED' AND BatchName=batch_name - every download
+    already gets its own row there (see mark_batch_downloaded), so this
+    is a plain filtered read, no new table.
+    Sample: get_batch_download_history('PIIPS_Batch_20260722_101500')"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT a.Id, a.EventDatetime, a.Detail, u.UserName "
+            "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+            "WHERE a.Entity = 'BATCH' AND a.Action = 'BATCH_DOWNLOADED' AND a.BatchName = ? "
+            "ORDER BY a.EventDatetime DESC", batch_name)
+        cols = ["Id", "EventDatetime", "Detail", "UserName"]
+        out = [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
+        for row in out:
+            row["EventDatetime"] = row["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if row["EventDatetime"] else ""
+        return out
+    finally:
+        conn.close()
 
 
 def list_statuses():
@@ -1990,16 +2042,23 @@ def completed_invoices(limit=500):
     Also includes "orphan" rows - a file physically present in
     ALL_INVOICES whose database row no longer exists at all (its batch was
     deleted outright, e.g. via a direct SQL delete script, which only ever
-    touches the database, never this archive folder). An orphan has none
-    of the rich DB metadata (invoice_no/vendor/batch/status all blank) and
-    a distinct NEGATIVE header_id (real headers are always positive) so it
-    stays visible/viewable/downloadable instead of silently disappearing
-    just because its database trail is gone, while the frontend can still
-    tell it apart from a real row (no History/Details for it).
+    touches the database, never this archive folder) but DID genuinely
+    reach COMPLETED via PIIPS, confirmed against a real STATUS_CHANGED
+    audit row (not just its mere presence in the folder - a file that
+    landed there any other way, or was never actually completed through
+    the app, is never shown). An orphan has none of the rich DB metadata
+    (invoice_no/vendor/batch/status all blank) and a distinct NEGATIVE
+    header_id (real headers are always positive) so it stays visible/
+    viewable/downloadable instead of silently disappearing just because
+    its database trail is gone, while the frontend can still tell it apart
+    from a real row (no History/Details for it).
     Sample: completed_invoices()"""
     rows = _invoice_list("s.StatusName = 'COMPLETED'", [])
-    if not rows:
-        return rows
+    # No early return here even when `rows` is empty: if every COMPLETED
+    # header was deleted (not just some), orphans are now this function's
+    # ONLY possible output - returning early would silently hide every
+    # genuinely-completed-then-deleted invoice, defeating the whole reason
+    # the orphan branch below exists in the first place.
 
     base = (config_store.load_config().get("folder_path") or "").strip()
     all_invoices_dir = os.path.join(base, config_store.ALL_INVOICES_DIR) if base else ""
@@ -2039,7 +2098,35 @@ def completed_invoices(limit=500):
     # negative placeholder (never a real header - those are always
     # positive) so the frontend's per-row selection/History-button gating
     # doesn't collide multiple orphans onto one id.
-    orphan_names = sorted(present - matched)
+    #
+    # A file merely sitting in ALL_INVOICES is NOT by itself proof it was
+    # ever completed via PIIPS - only a genuine COMPLETED STATUS_CHANGED
+    # audit row is that proof, and advance_status's own log_event call
+    # already captures that header's FileName/InvoiceNo into the audit row
+    # (via _audit_ctx) at the moment of completion, before any later
+    # deletion - so it survives even once the header itself is gone.
+    # Matched by invoice-no PREFIX (not full archived_name) since the audit
+    # row never recorded the vendor half of that name; a file whose prefix
+    # doesn't correspond to any genuine COMPLETED invoice no. is left out
+    # entirely rather than shown on the strength of its mere presence.
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT InvoiceNo FROM dbo.tbl_Audit_Event "
+            "WHERE Action = 'STATUS_CHANGED' AND ToStatus = 'COMPLETED' AND InvoiceNo IS NOT NULL"
+        )
+        completed_invoice_prefixes = [
+            config_store._safe_folder(r[0]) + "_" for r in cur.fetchall() if r[0]
+        ]
+    finally:
+        conn.close()
+    candidates = present - matched
+    orphan_names = sorted(
+        name for name in candidates
+        if any(name.startswith(p) for p in completed_invoice_prefixes)
+    )
     for i, name in enumerate(orphan_names):
         rows.append({
             "header_id": -(i + 1),
@@ -2104,6 +2191,23 @@ def invoices_by_statuses(status_names, active_only=False):
     return _invoice_list(where, names)
 
 
+def invoices_vendor_code_missing():
+    """SERVICE invoices parked at DATA MISMATCH over a missing/doubtful NAV
+    vendor code (Vendor Code Entry menu). There's no dedicated status for
+    this any more (folded into the ordinary DATA MISMATCH bucket - see
+    processor.py's SERVICE verdict branch) so this is found directly by
+    the blank vendor code column instead of a status name; the same column
+    apply_manual_vendor_code/set_nav_vendor_code writes once it's keyed in.
+    Sample: invoices_vendor_code_missing()"""
+    where = (
+        "s.StatusName = 'DATA MISMATCH' AND ISNULL(pt.IsExcluded, 0) = 0 "
+        "AND pt.InvoiceTypeID IN (SELECT InvoiceTypeId FROM dbo.tbl_InvoiceType "
+        "                         WHERE InvoiceTypeName = 'SERVICE') "
+        "AND (h.[Pay-to Vendor No.] IS NULL OR h.[Pay-to Vendor No.] = '')"
+    )
+    return _invoice_list(where, [])
+
+
 # The menu keys each role can see BEFORE a Super Admin has ever saved the
 # "Screen Access" menu - i.e. what every existing deployment already
 # behaves like today. Used only to seed tbl_RoleMenu the first time it's
@@ -2113,12 +2217,15 @@ def invoices_by_statuses(status_names, active_only=False):
 # a one-time seed, not read on every request, so a stale key here only
 # matters for a brand new deployment's first run.
 _ROLE_MENU_DEFAULTS = {
-    "admin": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate",
+    "admin": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate",
               "load", "post", "complete",
               "configuration", "apiconfig", "template", "createfield", "users"],
-    "user": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate", "load"],
+    # NAV Vendor Code Entry is deliberately not listed for any role here -
+    # access removed menu-wide (still reachable by Super Admin/Developer,
+    # which always sees every menu regardless of this table).
+    "user": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load"],
     "accounts": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "post", "complete"],
-    "viewer": ["dashboard", "input", "invoicesearch", "completedinvoices", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
+    "viewer": ["dashboard", "input", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load", "post", "complete"],
 }
 
 
@@ -5543,6 +5650,37 @@ def get_template_history(template_key, limit=200):
         conn.close()
 
 
+def get_config_history(kind=None, limit=200):
+    """Who/when changed Folder/API/Database Configuration, newest first -
+    each config screen's own History (Entity='CONFIG'; `kind` optionally
+    narrows to one action - 'FOLDER_CONFIG_CHANGED', 'API_CONFIG_CHANGED',
+    or 'DB_CONFIG_CHANGED' - matched on the audit row's own Action column).
+    Sample: get_config_history('DB_CONFIG_CHANGED')"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        if kind:
+            cur.execute(
+                "SELECT a.Id, a.EventDatetime, a.Action, a.Detail, u.UserName "
+                "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+                "WHERE a.Entity = 'CONFIG' AND a.Action = ? "
+                "ORDER BY a.EventDatetime DESC", kind)
+        else:
+            cur.execute(
+                "SELECT a.Id, a.EventDatetime, a.Action, a.Detail, u.UserName "
+                "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+                "WHERE a.Entity = 'CONFIG' "
+                "ORDER BY a.EventDatetime DESC")
+        cols = ["Id", "EventDatetime", "Action", "Detail", "UserName"]
+        out = [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
+        for row in out:
+            row["EventDatetime"] = row["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if row["EventDatetime"] else ""
+        return out
+    finally:
+        conn.close()
+
+
 def _template_batch_name_pattern(entity, invoice_type, name):
     """SQL LIKE pattern matching any tbl_Purchase_Tracker.BatchName
     produced from this template - BatchName is built as
@@ -6720,7 +6858,9 @@ def ensure_audit_table():
         for col, ddl in TRACKER_AUDIT_COLUMNS:
             cur.execute("IF COL_LENGTH('dbo.tbl_Purchase_Tracker', ?) IS NULL "
                         "EXEC('ALTER TABLE dbo.tbl_Purchase_Tracker ADD [' + ? + '] ' + ?)", col, col, ddl)
-        for col, ddl in (("LastDownloadedByID", "INT NULL"),):
+        for col, ddl in (("LastDownloadedByID", "INT NULL"),
+                         ("LastDocNo", "NVARCHAR(100) NULL"),
+                         ("LastEntryNo", "NVARCHAR(100) NULL")):
             cur.execute("IF OBJECT_ID('dbo.tbl_BatchDownload') IS NOT NULL AND "
                         "COL_LENGTH('dbo.tbl_BatchDownload', ?) IS NULL "
                         "EXEC('ALTER TABLE dbo.tbl_BatchDownload ADD [' + ? + '] ' + ?)", col, col, ddl)
