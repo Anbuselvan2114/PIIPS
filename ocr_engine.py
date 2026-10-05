@@ -193,6 +193,30 @@ _BARE_SERIAL_LIST_RE = re.compile(
 )
 
 
+# A page that IS a government-generated E-way Bill copy in its own right -
+# not an ordinary invoice page that merely prints its OWN "E-way Bill No."
+# as one field among many (that alone doesn't make the page an e-way bill;
+# plenty of tax invoices carry that single label/value pair in their
+# footer). The dedicated e-way bill document is built entirely around the
+# transport details instead - "Part-A"/"Part-B" sections, a validity
+# window, approx. distance - which an ordinary tax invoice never has, so
+# requiring BOTH the heading phrase and one of those layout markers avoids
+# misfiring on a normal invoice's own e-way-bill-number footer line.
+_EWAY_BILL_TITLE_RE = re.compile(r"\be[-\s]?way\s+bill\b", re.IGNORECASE)
+_EWAY_BILL_LAYOUT_RE = re.compile(
+    r"part[-\s]?a\b|part[-\s]?b\b|approx\.?\s*dist(?:ance)?|valid\s*(?:up\s*to|until|from)",
+    re.IGNORECASE,
+)
+
+
+def _is_eway_bill_page(page_text):
+    """True when a page is a standalone E-way Bill copy (see note above),
+    not a real invoice page of its own."""
+    if not page_text:
+        return False
+    return bool(_EWAY_BILL_TITLE_RE.search(page_text) and _EWAY_BILL_LAYOUT_RE.search(page_text))
+
+
 class OCREngine:
 
     _ocr = None
@@ -1256,18 +1280,34 @@ class OCREngine:
             page_fields = (page.get("Header") or {}).get("Fields", {}) or {}
             page_invoice_no = (page_fields.get("Invoice No.") or "").strip()
 
+            # A standalone E-way Bill copy (see _is_eway_bill_page) is a
+            # transport document for whichever invoice precedes it, never a
+            # second invoice of its own - fold it into the current group
+            # (page_end below, so PDF view/download still spans it) instead
+            # of letting its own differing "Invoice No." (or lack of one)
+            # start a phantom new group, and contribute none of its own
+            # text/fields/items/tax to that group's extracted data. Only
+            # applies once a real invoice has actually opened a group; an
+            # e-way bill page with nothing preceding it has nothing to
+            # attach to, so it's processed as an ordinary page instead.
+            is_eway_bill_page = bool(groups) and _is_eway_bill_page(page_text)
+
             if not groups:
                 groups.append(_new_group())
-            elif (page_invoice_no and groups[-1]["invoice_no"]
+            elif (not is_eway_bill_page and page_invoice_no and groups[-1]["invoice_no"]
                     and _invoice_no_differs(page_invoice_no, groups[-1]["invoice_no"])):
                 groups.append(_new_group())
 
             group = groups[-1]
-            if page_invoice_no and not group["invoice_no"]:
-                group["invoice_no"] = page_invoice_no
             if group["page_start"] is None:
                 group["page_start"] = page_no
             group["page_end"] = page_no
+
+            if is_eway_bill_page:
+                continue
+
+            if page_invoice_no and not group["invoice_no"]:
+                group["invoice_no"] = page_invoice_no
 
 
             # -------------------------------------

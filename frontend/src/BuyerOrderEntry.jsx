@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getBuyerOrderMissing, setBuyerOrder } from "./api";
+import { getBuyerOrderMissing, setBuyerOrder, setInvoiceExcluded } from "./api";
 import { DataTable, PdfModal } from "./components";
 
 // Manual Buyer's Order No. entry.
@@ -9,6 +9,15 @@ import { DataTable, PdfModal } from "./components";
 // saves; the backend re-validates the invoice and, if nothing else is wrong,
 // makes it active (status = 1) and advances it. Clicking the invoice/file
 // opens the PDF so a handwritten PO can be read.
+//
+// Some rows here were never a real invoice to begin with - e.g. a PDF with
+// an E-way Bill copy on its own page gets that page grouped as a phantom
+// second "invoice" (see ocr_engine.py's per-Invoice-No. page grouping),
+// which naturally has no PO to enter. Exclude is the only real resolution
+// for a row like that, so it's offered here too (same action/backend as
+// the Dashboard's Include/Exclude toggle - set_excluded has no own-status
+// restriction beyond the locked statuses, so this was always allowed
+// server-side, just not reachable from this screen before).
 export default function BuyerOrderEntry({ user }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -16,6 +25,7 @@ export default function BuyerOrderEntry({ user }) {
   const [msg, setMsg] = useState(null);
   const [drafts, setDrafts] = useState({});   // header_id -> typed PO
   const [saving, setSaving] = useState(null);  // header_id being saved
+  const [excluding, setExcluding] = useState(null);  // header_id being excluded
   const [pdfFile, setPdfFile] = useState(null);
 
   const load = () => {
@@ -40,6 +50,16 @@ export default function BuyerOrderEntry({ user }) {
       load();
     } catch (e) { setError(e.message); }
     finally { setSaving(null); }
+  };
+
+  const exclude = async (row) => {
+    setExcluding(row.header_id); setError(null); setMsg(null);
+    try {
+      await setInvoiceExcluded(row.header_id, true, user?.user_id);
+      setMsg(`${row.invoice_no || row.file_name}: Excluded`);
+      load();
+    } catch (e) { setError(e.message); }
+    finally { setExcluding(null); }
   };
 
   const invoiceCell = (row) => (
@@ -69,6 +89,14 @@ export default function BuyerOrderEntry({ user }) {
         <button className="btn btn-primary btn-sm" disabled={saving === row.header_id}
                 onClick={() => save(row)}>
           {saving === row.header_id ? "Saving…" : "Save"}
+        </button>
+      ) },
+    { key: "exclude", label: "", sortable: false,
+      render: (row) => (
+        <button className="btn btn-subtle btn-sm" disabled={excluding === row.header_id}
+                title="Exclude this invoice (e.g. a phantom row with no real PO to enter, like an E-way Bill copy page)"
+                onClick={() => exclude(row)}>
+          {excluding === row.header_id ? "Excluding…" : "Exclude"}
         </button>
       ) },
   ];

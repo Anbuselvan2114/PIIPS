@@ -363,7 +363,9 @@ export default function Dashboard({ user }) {
   // Include/Exclude only makes sense once an invoice is actually staged
   // for export (READY TO LOAD), or to undo a previous exclude (EXCLUDED) —
   // for every other status it's not shown at all, rather than offered and
-  // doing something confusing.
+  // doing something confusing. (A dedicated Exclude action for Buyer Order
+  // No. Doesn't Exist rows lives directly on the Buyer Order Entry screen
+  // instead - see BuyerOrderEntry.jsx.)
   const batchModalColumns = [
     ...invoiceColumns.filter((c) => c.key !== "batch"),
     ...(["READY TO LOAD", "EXCLUDED"].includes(modal?.status) ? [
