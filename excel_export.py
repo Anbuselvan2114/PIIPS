@@ -648,23 +648,19 @@ def missing_required_fields(header, lines, reservations=None, mapping=None, invo
         if _is_blank(header.get(f)) and not _is_none_source("Purchase Header", f, mapping):
             found.append({"field": f, "sheet": "Purchase Header",
                           "source": field_source("Purchase Header", f, mapping, invoice_type)})
-    # "Pay-to Vendor No." is classified "Service First" by field_source (the
-    # same mapping convention PART uses, where SF really does fill it) -
-    # which is exactly why the generic SF-exemption two lines up skips it
-    # for SERVICE. But a SERVICE invoice never calls SF at all; this field
-    # is instead hand-keyed on the Vendor Code Entry menu, so for SERVICE
-    # specifically it IS a genuine, required, PDF/manually-sourced field -
-    # checked here on its own, bypassing that exemption on purpose, so a
-    # blank one correctly keeps the invoice at DATA MISMATCH instead of the
-    # completeness gate clearing it straight to READY TO LOAD.
-    if invoice_type == "SERVICE" and _is_blank(header.get("Pay-to Vendor No.")):
-        # source left as "Service First" (its natural field_source()
-        # classification) rather than "PDF" - processor.py's completeness
-        # gate routes a missing PDF-sourced field to NEW TEMPLATE (a
-        # training gap), but a blank vendor code is a one-off data problem
-        # for THIS invoice, not a template defect, so it must land on
-        # DATA MISMATCH instead - same category this field already used
-        # before it had its own dedicated status.
+    # "Pay-to Vendor No." (Vendor Code) is never optional for any invoice
+    # type - checked here directly, unconditionally, rather than via
+    # REQUIRED_HEADER_FIELDS' generic loop above (which it's deliberately
+    # left out of, since that loop's own SF-exemption two lines up would
+    # otherwise wave a blank one through for PART too). PART gets it from
+    # Service First (field_source's natural classification); SERVICE never
+    # calls SF at all, so it's instead hand-keyed on the Vendor Code Entry
+    # menu - either way, a blank one is a genuine, one-off data problem for
+    # THIS invoice, not a template defect, so "source" is left as "Service
+    # First" rather than "PDF" even for SERVICE: processor.py's completeness
+    # gate routes a missing PDF-sourced field to NEW TEMPLATE (a training
+    # gap), and this must land on DATA MISMATCH instead.
+    if _is_blank(header.get("Pay-to Vendor No.")):
         found.append({"field": "Pay-to Vendor No.", "sheet": "Purchase Header",
                       "source": "Service First"})
     for line in lines:

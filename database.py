@@ -502,11 +502,13 @@ def apply_manual_buyer_order(header_id, order_no, user_id=None):
     except OSError:
         pass
 
+    output_folder = (config_store.folders(create=False) or {}).get("output", "")
+    static, _ = template_store.static_for_path(output_folder, json_path)
+    data["_static"] = static
+    invoice_type = _invoice_type_from_source_json(json_path)
+
     # If the part is now received in SF, rebuild this header's reservation rows.
     if data.get("sf_items"):
-        output_folder = (config_store.folders(create=False) or {}).get("output", "")
-        static, _ = template_store.static_for_path(output_folder, json_path)
-        data["_static"] = static
         grouped = excel_export.build_rows_grouped([data])
         group = grouped["groups"][0] if grouped["groups"] else {"reservations": []}
         re_cols = grouped["columns"]["Reservation Entry"]
@@ -521,6 +523,14 @@ def apply_manual_buyer_order(header_id, order_no, user_id=None):
             conn.commit()
         finally:
             conn.close()
+
+    # Re-entering the PO re-runs Service First, which can (re)supply ANY of
+    # its own header/line fields (vendor code, Location Code, HSN/GST
+    # columns, ...) or pick up a Template value that's since changed - sync
+    # all of them back to the database now, since this re-validation path
+    # otherwise only ever touches the PO/status columns (see
+    # set_buyer_order_no).
+    _sync_resolved_fields(header_id, data, invoice_type=invoice_type)
 
     # Update the tracker PO / status / IsActive / IsSynced and the header column.
     res = set_buyer_order_no(header_id, order_no, verdict, user_id)
@@ -1907,6 +1917,11 @@ def _hdr_col(cur, name):
     return cur.fetchone()[0] is not None
 
 
+def _line_col(cur, name):
+    cur.execute("SELECT COL_LENGTH('dbo.tbl_Purchase_Line', ?)", name)
+    return cur.fetchone()[0] is not None
+
+
 def _invoice_type_from_source_json(path):
     """'PART'/'SERVICE' parsed from a SourceJson path
     (.../Output/<entity>/<invoice_type>/<name>/<file>.json), or '' if it
@@ -2467,17 +2482,18 @@ def revalidate_data_mismatch_header(header_id, user_id=None):
     # data was just reloaded straight from its saved JSON, which never
     # carries "_static" (see processor.py - it's attached after that file
     # is written, deliberately kept out of it). Without re-attaching it
-    # here, revalidate_header_after_description_fix's Reservation Entry
-    # rebuild below would silently blank every static field on that sheet
-    # (Purchase Line stays correct regardless, since its own rebuild only
-    # ever touches Service-First-sourced columns, never the static ones) -
-    # this is the exact bug the other caller of that same function
-    # (reextract_and_fix_description, a few lines up) already avoids.
+    # here, revalidate_header_after_description_fix's rebuild below would
+    # silently blank every Template-sourced column it touches - Reservation
+    # Entry (always), and now Purchase Header/Line too (_sync_resolved_
+    # fields syncs Template-sourced columns there as well, not just
+    # Service-First-sourced ones) - this is the exact bug the other caller
+    # of that same function (reextract_and_fix_description, a few lines up)
+    # already avoids.
     output_folder = (config_store.folders(create=False) or {}).get("output", "")
     static, _ = template_store.static_for_path(output_folder, json_path)
     data["_static"] = static
 
-    revalidate_header_after_description_fix(header_id, data, verdict, user_id)
+    revalidate_header_after_description_fix(header_id, data, verdict, user_id, invoice_type)
     log_event("STATUS_CHANGED", header_id=header_id, user_id=user_id, to_status=verdict["status"],
               detail="Re-checked against Service First after a Part Description Mapping update")
     return {"file_name": file_name, "new_status": verdict["status"],
@@ -2623,7 +2639,7 @@ def reextract_and_fix_description(candidate, ocr=None, output_folder=None):
         verdict = service_api.enrich_invoice(data)
 
     lines_changed = fix_purchase_line_descriptions(header_id, new_items) if items_changed else 0
-    revalidate_header_after_description_fix(header_id, data, verdict)
+    revalidate_header_after_description_fix(header_id, data, verdict, invoice_type=invoice_type)
     detail_parts = []
     if items_changed:
         detail_parts.append("Purchase Line Description corrected (continuation-line extraction fix)")
@@ -2688,53 +2704,30 @@ def revalidate_all_data_mismatch(user_id=None):
     return {"checked": len(candidates), "moved": moved}
 
 
-# Purchase Line columns whose value comes straight from Service First (see
-# service_api._apply_hsn_map) - the only ones revalidate_header_after_
-# description_fix ever touches on tbl_Purchase_Line itself, matched
-# positionally by [Line No.] (see fix_purchase_line_descriptions - Line No.
-# is minted sequentially in extraction order, so the Nth existing line is
-# always the Nth item in `data["items"]`).
-_SF_SOURCED_LINE_COLUMNS = ("No.", "HSN/SAC Code", "GST Group Code", "GST Group Type", "GST %")
-
-
-def revalidate_header_after_description_fix(header_id, data, verdict, user_id=None):
+def revalidate_header_after_description_fix(header_id, data, verdict, user_id=None, invoice_type=None):
     """Persist a freshly-recomputed verdict for one header after its
     Purchase Line Description(s) were corrected by re-extraction (see the
     one-time migration in app.py), or after a sibling on the same PO let
     Service First resolve THIS line too (a vendor prints the same physical
     part as separate serialized units - SF only tracks it as one part, so
     confirming one unit's description can now resolve another's Nav Item No
-    too - see service_api._apply_hsn_map's sibling fallback): rebuilds
-    Reservation Entry rows from `data` (empty for a SERVICE invoice, which
-    never has any), re-syncs the Service-First-sourced Purchase Line
-    columns (_SF_SOURCED_LINE_COLUMNS - description/PDF-sourced columns are
-    never touched here), and updates the tracker's StatusID / IsActive via
-    usp_ReplaceReservation, exactly like a Buyer Order No / NAV vendor code
-    correction does.
-    Sample: revalidate_header_after_description_fix(7378, data, {"status": "READY TO LOAD", "is_active": True}, 7)"""
+    too - see service_api._apply_hsn_map's sibling fallback): re-syncs every
+    Service-First-/Template-sourced Purchase Header and Purchase Line
+    column (_sync_resolved_fields - "Description" itself is deliberately
+    never touched, see _LINE_SYNC_EXCLUDED_COLUMNS), rebuilds Reservation
+    Entry rows from `data` (empty for a SERVICE invoice, which never has
+    any), and updates the tracker's StatusID / IsActive via
+    usp_ReplaceReservation, exactly like a Buyer Order No correction does.
+    Sample: revalidate_header_after_description_fix(7378, data, {"status": "READY TO LOAD", "is_active": True}, 7, "PART")"""
     import excel_export
+    _sync_resolved_fields(header_id, data, invoice_type=invoice_type)
+
     grouped = excel_export.build_rows_grouped([data])
-    group = grouped["groups"][0] if grouped["groups"] else {"reservations": [], "lines": []}
+    group = grouped["groups"][0] if grouped["groups"] else {"reservations": []}
     re_cols = grouped["columns"]["Reservation Entry"]
     conn = get_connection()
     try:
         cur = conn.cursor()
-
-        new_lines = group.get("lines") or []
-        if new_lines:
-            cur.execute(
-                "SELECT Id FROM dbo.tbl_Purchase_Line WHERE Purchase_Header_ID = ? "
-                "ORDER BY [Line No.]", header_id)
-            existing_ids = [r[0] for r in cur.fetchall()]
-            cols = [c for c in _SF_SOURCED_LINE_COLUMNS if c in (new_lines[0] or {})]
-            if cols:
-                set_clause = ", ".join(f"[{c}] = ?" for c in cols)
-                for line_id, line in zip(existing_ids, new_lines):
-                    cur.execute(
-                        f"UPDATE dbo.tbl_Purchase_Line SET {set_clause} WHERE Id = ?",
-                        *[line.get(c, "") for c in cols], line_id,
-                    )
-
         cur.execute(
             "EXEC dbo.usp_ReplaceReservation ?, ?, ?, ?, ?, ?",
             header_id, json.dumps(re_cols), json.dumps(group["reservations"]),
@@ -3195,14 +3188,13 @@ def get_invoice_field_check(header_id):
             # this specific, expected case.
             "optional": is_service and buyer_order_missing,
         }
-        # Vendor Code (Nav_VendorCode / "Buy-from Vendor No.") — mirrors
-        # Buyer Order No above but with the two invoice types swapped: for
-        # PART it's an ordinary Service-First-sourced field, so a blank one
-        # is nothing new to flag here; for SERVICE, which never calls SF at
-        # all, it's the one field hand-written onto the scanned PDF and
-        # required before Load (see processor.py's NAV VENDOR CODE DOESN'T
-        # EXIST status and the Vendor Code Entry menu) - a blank one there
-        # is a genuine, actionable "Missing", not "Optional".
+        # Vendor Code (Nav_VendorCode / "Buy-from Vendor No.") — required for
+        # every invoice type, never "Optional": PART gets it from Service
+        # First; SERVICE never calls SF at all, so it's instead hand-written
+        # onto the scanned PDF (see anchor_extract.py's "Vendor Code" label).
+        # Either way a blank one is a genuine, actionable "Missing" (see
+        # excel_export.missing_required_fields's own unconditional check,
+        # which now routes either type's blank Vendor Code to DATA MISMATCH).
         vendor_code = ""
         if _hdr_col(cur, "Buy-from Vendor No."):
             cur.execute(
@@ -3220,7 +3212,7 @@ def get_invoice_field_check(header_id):
             # PDF (see anchor_extract.py's "Vendor Code" label / invoice_
             # schema.py's vendor_code) - the popup should say so honestly.
             "source": "PDF" if is_service else "Service First",
-            "optional": (not is_service) and vendor_code_missing,
+            "optional": False,
         }
 
         # Shown right before InvoiceNo (REQUIRED_HEADER_FIELDS' own last
@@ -3270,6 +3262,86 @@ def get_invoice_field_check(header_id):
                 for i, rs in enumerate(res_rows)
             ],
         }
+    finally:
+        conn.close()
+
+
+# A Purchase Line column never touched by _sync_resolved_fields even when
+# field_source() would call it Service-First/Template-sourced for some
+# vendor's own mapping - "Description" is the one column a user can
+# directly confirm/correct themselves (Part Description Mapping), and this
+# sync is ALSO what runs right after such a correction (see
+# revalidate_header_after_description_fix) - overwriting it back from a
+# generic resolved value the same instant would silently discard the very
+# fix the user just made.
+_LINE_SYNC_EXCLUDED_COLUMNS = {"Description"}
+
+
+def _sync_resolved_fields(header_id, data, invoice_type=None, mapping=None):
+    """Write every Purchase Header / Purchase Line column whose value is
+    Service-First- or Template-sourced (field_source(...) in ("Service
+    First", "Template")) from `data`'s freshly resolved mapping output
+    (build_rows_grouped) back into the database - run this after anything
+    that can change what SF/the Template now supplies for an
+    ALREADY-SAVED invoice (a Buyer's Order No. keyed in on Buyer Order
+    Entry, a Part Description confirmed on Part Description Mapping), so
+    the stored row reflects today's resolution instead of staying frozen
+    at whatever was first saved. A column that resolves blank this time is
+    left untouched rather than overwritten - most often that just means
+    THIS particular call got no row back from SF (e.g. a transient API
+    timeout), not that a previously confirmed value has genuinely gone
+    away. Purchase Line rows are matched to data["items"] positionally in
+    [Line No.] order - the same stable join fix_purchase_line_descriptions
+    already relies on. Reservation Entry isn't handled here: every caller
+    already fully rebuilds it via usp_ReplaceReservation instead of
+    patching it column by column.
+    Sample: _sync_resolved_fields(42, data, invoice_type="PART")"""
+    import excel_export
+    mapping = mapping if mapping is not None else excel_export.load_mapping()
+    grouped = excel_export.build_rows_grouped([data])
+    group = grouped["groups"][0] if grouped["groups"] else {"header": {}, "lines": []}
+
+    def _syncable(sheet, col, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return False
+        return excel_export.field_source(sheet, col, mapping, invoice_type) in ("Service First", "Template")
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+
+        sets, params = [], []
+        for col, value in (group.get("header") or {}).items():
+            if _syncable("Purchase Header", col, value) and _hdr_col(cur, col):
+                sets.append(f"{_q(col)} = ?")
+                params.append(value)
+        if sets:
+            params.append(header_id)
+            cur.execute(f"UPDATE dbo.tbl_Purchase_Header SET {', '.join(sets)} WHERE Id = ?", *params)
+
+        new_lines = group.get("lines") or []
+        if new_lines:
+            cur.execute(
+                "SELECT Id FROM dbo.tbl_Purchase_Line WHERE Purchase_Header_ID = ? "
+                "ORDER BY [Line No.]", header_id)
+            existing_ids = [r[0] for r in cur.fetchall()]
+            line_cols = sorted({
+                c for line in new_lines for c in line
+                if c not in ("_pdf_hsn",) and c not in _LINE_SYNC_EXCLUDED_COLUMNS
+                and _line_col(cur, c)
+            })
+            for line_id, line in zip(existing_ids, new_lines):
+                sets, params = [], []
+                for c in line_cols:
+                    value = line.get(c)
+                    if _syncable("Purchase Line", c, value):
+                        sets.append(f"{_q(c)} = ?")
+                        params.append(value)
+                if sets:
+                    params.append(line_id)
+                    cur.execute(f"UPDATE dbo.tbl_Purchase_Line SET {', '.join(sets)} WHERE Id = ?", *params)
+
+        conn.commit()
     finally:
         conn.close()
 
