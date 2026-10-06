@@ -311,6 +311,7 @@ def version():
 class ConfigModel(BaseModel):
     folder_path: str
     sf_api_url: Optional[str] = None
+    user_id: Optional[int] = None
 
 
 def _public_config(cfg):
@@ -320,6 +321,20 @@ def _public_config(cfg):
     public = {k: v for k, v in cfg.items() if k not in ("db_connection", "auth_secret")}
     public["db_configured"] = bool((cfg.get("db_connection") or "").strip())
     return public
+
+
+@app.get("/api/config/history")
+def config_history(kind: Optional[str] = None, user_id: Optional[int] = None):
+    """Super Admin only: who/when changed Folder/API/Database Configuration.
+    `kind` optionally narrows to one of FOLDER_CONFIG_CHANGED/
+    API_CONFIG_CHANGED/DB_CONFIG_CHANGED - each config screen's own History
+    button passes its own kind."""
+    _require_developer(user_id)
+    import database
+    try:
+        return {"events": database.get_config_history(kind)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
 @app.get("/api/config")
@@ -447,10 +462,18 @@ def update_config(payload: ConfigModel):
     # and the template subfolders are created inside it.
     folder_path = _validate_dir(payload.folder_path, "Folder Path", must_be_local=True)
 
+    old_folder_path = (config_store.load_config().get("folder_path") or "").strip()
+
     updates = {"folder_path": folder_path}
     if payload.sf_api_url is not None:
         updates["sf_api_url"] = payload.sf_api_url.strip()
     config = config_store.save_config(updates)
+
+    if folder_path != old_folder_path:
+        import database
+        database.log_event(
+            "FOLDER_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
+            detail=f"Folder Path: '{old_folder_path or '(none)'}' -> '{folder_path}'")
 
     # Create Input / New_Format (and Trained_format) under the Folder Path.
     folders = config_store.folders(create=True)
@@ -486,6 +509,7 @@ def update_config(payload: ConfigModel):
 
 class ApiConfigModel(BaseModel):
     sf_api_url: Optional[str] = ""
+    user_id: Optional[int] = None
 
 
 @app.get("/api/api-config")
@@ -496,7 +520,13 @@ def get_api_config():
 @app.post("/api/api-config")
 def save_api_config(payload: ApiConfigModel):
     url = (payload.sf_api_url or "").strip()
+    old_url = (config_store.load_config().get("sf_api_url") or "").strip()
     config_store.save_config({"sf_api_url": url})
+    if url != old_url:
+        import database
+        database.log_event(
+            "API_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
+            detail=f"Service First API URL: '{old_url or '(none)'}' -> '{url or '(none)'}'")
     return {"sf_api_url": url}
 
 
@@ -614,7 +644,17 @@ def save_db_config(payload: DbConfigModel):
     if not ok:
         raise HTTPException(status_code=400, detail=f"Could not connect: {err}")
 
+    # Never log the password/username - only server/database/auth type,
+    # which is enough to see what changed without exposing a credential.
+    old_parsed = database.parse_dotnet_connection(config_store.load_config().get("db_connection") or "")
+    old_desc = f"{old_parsed['server'] or '(none)'} / {old_parsed['database'] or '(none)'}" if old_parsed["server"] else "(none)"
+    new_desc = f"{server} / {db_name} ({'Windows' if windows else 'SQL'} auth)"
+
     config_store.save_config({"db_connection": conn_str})
+
+    database.log_event(
+        "DB_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
+        detail=f"Database connection: '{old_desc}' -> '{new_desc}' (credentials not logged)")
 
     # Make sure the target database has the app's tables/procedures.
     try:
@@ -815,7 +855,13 @@ def _unsupported_files_list():
 def status_counts():
     """Purchase-header counts grouped by tracker status, PLUS an INITIATED
     bucket for files still waiting in the Input folder and an UNSUPPORTED
-    bucket for files Start couldn't read (dashboard pie)."""
+    bucket for files Start couldn't read (dashboard pie). COMPLETED is
+    likewise overridden with the Completed Invoices menu's own count (see
+    database.completed_invoices) rather than the raw tracker-row count, so
+    the pie's number always matches what that list actually shows - a
+    completed header whose archive copy is missing, or an archived file
+    with no surviving database row at all and no genuine COMPLETED audit
+    trail, is counted the same way in both places."""
     import database
     try:
         counts = database.status_counts()
@@ -841,6 +887,19 @@ def status_counts():
         except Exception:  # noqa: BLE001 - synthetic count is best-effort
             import traceback
             traceback.print_exc()
+    try:
+        # Unlike INITIATED/UNSUPPORTED above, COMPLETED already has a real
+        # (and usually nonzero) tracker-based count, so this always
+        # overrides it - even down to 0 - rather than only when nonzero.
+        n = len(database.completed_invoices())
+        sid = database.status_id("COMPLETED") or 0
+        idx = next((i for i, c in enumerate(counts)
+                    if (c.get("status") or "").upper() == "COMPLETED"), len(counts))
+        counts = [c for c in counts if (c.get("status") or "").upper() != "COMPLETED"]
+        counts.insert(idx, {"status_id": sid, "status": "COMPLETED", "count": n})
+    except Exception:  # noqa: BLE001 - synthetic count is best-effort
+        import traceback
+        traceback.print_exc()
     return {"counts": counts}
 
 
@@ -848,9 +907,15 @@ def status_counts():
 def invoices_by_status(status_id: int):
     """Invoices with a given tracker status (pie-slice pop-up). For the
     INITIATED/UNSUPPORTED statuses the tracker has no rows, so the
-    corresponding folder is listed instead."""
+    corresponding folder is listed instead. For COMPLETED, uses the same
+    database.completed_invoices() the Completed Invoices menu itself uses
+    (archive-file-presence + orphan rows included) instead of a raw
+    tracker-row query, so this pop-up's count/list always matches that
+    menu's - and the pie's own synthetic COMPLETED count above."""
     import database
     try:
+        if status_id == (database.status_id("COMPLETED") or -1):
+            return {"invoices": database.completed_invoices()}
         for name, files in (("INITIATED", _input_files_list),
                              ("UNSUPPORTED", _unsupported_files_list)):
             if status_id == (database.status_id(name) or -1):
@@ -879,6 +944,17 @@ def invoices_search(q: str = ""):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
+@app.get("/api/invoices/completed")
+def invoices_completed():
+    """Completed Invoices menu: every invoice whose tracker status is
+    COMPLETED, same shape as Invoice Search's own results."""
+    import database
+    try:
+        return {"invoices": database.completed_invoices()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
 @app.get("/api/invoices/{header_id}/history")
 def invoice_history(header_id: int):
     """Who did what and when for one invoice (Invoice Search menu's
@@ -887,6 +963,21 @@ def invoice_history(header_id: int):
     import database
     try:
         return {"events": database.get_audit(header_id=header_id, limit=500)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/invoices/{header_id}/details")
+def invoice_details(header_id: int):
+    """Full Purchase Header/Line/Reservation Entry field values for one
+    PART invoice (Invoice Search's own Details view) - every configured
+    column, mandatory and optional alike, no who/when (see History for
+    that)."""
+    import database
+    try:
+        return database.get_invoice_details(header_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
@@ -1039,12 +1130,12 @@ def invoices_buyer_order_missing():
 
 @app.get("/api/invoices/vendor-code-missing")
 def invoices_vendor_code_missing():
-    """SERVICE invoices parked at 'NAV VENDOR CODE DOESN'T EXIST' (missing
-    from the scanned PDF) for the Vendor Code Entry menu."""
+    """SERVICE invoices parked at DATA MISMATCH over a missing/doubtful NAV
+    vendor code (Vendor Code Entry menu) - see database.invoices_vendor_
+    code_missing for why this is no longer a dedicated status."""
     import database
     try:
-        return {"invoices": database.invoices_by_statuses(
-            ["NAV VENDOR CODE DOESN'T EXIST"])}
+        return {"invoices": database.invoices_vendor_code_missing()}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
@@ -1649,8 +1740,21 @@ def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, e
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
 
+    # The first row's No./Entry No. - representative of this download's
+    # whole minted range, since _assign_document_numbers/renumber_batch
+    # number every row sequentially from here. Recorded so the Dashboard
+    # can pre-fill its Document No./Entry No. boxes with what was last
+    # used, and so Batch History shows what each download actually
+    # produced, not just when it happened.
+    ph_rows = sheet_data["Purchase Header"]["rows"]
+    re_rows = sheet_data["Reservation Entry"]["rows"]
+    doc_no_used = ph_rows[0].get("No.") if ph_rows else None
+    entry_no_used = re_rows[0].get("Entry No.") if re_rows else None
+
     try:
-        database.mark_batch_downloaded(name, user_id=request.scope.get("state", {}).get("user_id"))
+        database.mark_batch_downloaded(
+            name, user_id=request.scope.get("state", {}).get("user_id"),
+            doc_no=doc_no_used, entry_no=entry_no_used)
     except Exception:  # noqa: BLE001 - best-effort, download still succeeds
         import traceback
         traceback.print_exc()
@@ -1662,6 +1766,56 @@ def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, e
     return FileResponse(
         out_path,
         filename=f"{safe}.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.get("/api/batches/history")
+def batch_history(batch: str, user_id: Optional[int] = None):
+    """Super Admin only: who/when downloaded this batch's Excel, and the
+    Document No./Entry No. each download produced."""
+    _require_developer(user_id)
+    import database
+    try:
+        return {"events": database.get_batch_download_history(batch)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/batches/export")
+def export_batch(batch: str, user_id: Optional[int] = None):
+    """Super Admin only: export a batch's EXISTING data to Excel exactly as
+    currently persisted - every header regardless of status, and every
+    Document No./Entry No. exactly as already stored (blank if the batch
+    was never downloaded). Unlike /api/batches/download, this never mints a
+    number, never locks/unlocks anything, and never marks the batch
+    downloaded - a pure read, no write of any kind (see
+    database.fetch_batch_readonly)."""
+    import database
+    import excel_export
+    import tempfile
+
+    _require_developer(user_id)
+
+    name = (batch or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="batch is required")
+
+    try:
+        sheet_data = database.fetch_batch_readonly(name, excel_export.sheet_columns())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    if not sheet_data["Purchase Header"]["rows"]:
+        raise HTTPException(status_code=404, detail=f"Batch '{name}' not found")
+
+    safe = "".join(c for c in name if c.isalnum() or c in ("-", "_")) or "batch"
+    out_path = os.path.join(tempfile.gettempdir(), f"{safe}_export.xlsx")
+    excel_export.build_workbook_from_sheets(sheet_data, out_path)
+
+    return FileResponse(
+        out_path,
+        filename=f"{safe}_export.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -2147,7 +2301,28 @@ def save_template(payload: TemplateModel):
 def delete_template(payload: TemplateKeyModel):
     import template_store
     _require_not_viewer(payload.user_id)
-    return {"deleted": template_store.delete_template(payload.key, payload.user_id)}
+    try:
+        return {"deleted": template_store.delete_template(payload.key, payload.user_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/templates/activate")
+def activate_template(payload: TemplateKeyModel):
+    import template_store
+    _require_not_viewer(payload.user_id)
+    return {"activated": template_store.activate_template(payload.key, payload.user_id)}
+
+
+@app.get("/api/templates/history")
+def template_history(key: str):
+    """Who activated/deactivated this template and when - a query param
+    (not a path segment) since a template key contains backslashes."""
+    import database
+    try:
+        return {"events": database.get_template_history(key)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
 # ==========================================================================
@@ -2401,6 +2576,18 @@ def api_list_users():
             "users": database.list_users(),
             "user_types": database.list_user_types(),
         }
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/api/users/{target_user_id}/login-history")
+def api_user_login_history(target_user_id: int, user_id: Optional[int] = None):
+    """One user's login/logout history - Super Admin only, same as the
+    User Management screen's own History button."""
+    _require_developer(user_id)
+    import database
+    try:
+        return {"events": database.get_user_login_history(target_user_id)}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 

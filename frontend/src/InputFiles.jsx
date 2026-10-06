@@ -18,7 +18,13 @@ export default function InputFiles({ user }) {
 
   useEffect(() => {
     getTemplates()
-      .then((r) => setTemplates(Object.keys(r.templates || {})))
+      .then((r) => {
+        const all = r.templates || {};
+        // Only an active template can receive new uploads - an inactive
+        // one still shows on the Template screen (to be reactivated or
+        // left alone) but shouldn't be pickable here.
+        setTemplates(Object.keys(all).filter((k) => all[k]?.IsActive !== false));
+      })
       .catch((e) => setError(e.message));
   }, []);
 

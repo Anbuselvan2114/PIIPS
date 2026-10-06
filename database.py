@@ -28,7 +28,7 @@ ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 # never reprocessable again. Unsupported gets the same treatment by
 # filesystem age instead, since it never gets a database row at all (see
 # config_store.expire_stale_files).
-STALE_STATUS_EXPIRY_DAYS = 31
+STALE_STATUS_EXPIRY_DAYS = 90
 
 
 # Ordered status values for tbl_status.
@@ -39,7 +39,6 @@ STATUS_VALUES = [
     "INITIATED",
     "EXTRACTED",
     "BUYER ORDER NO DOESN'T EXIST",
-    "NAV VENDOR CODE DOESN'T EXIST",
     "SF PROCESSED",
     "PENDING IN SF",
     "DATA MISMATCH",      # renamed from "INCOMPLETE DATA" - see migration below
@@ -503,11 +502,13 @@ def apply_manual_buyer_order(header_id, order_no, user_id=None):
     except OSError:
         pass
 
+    output_folder = (config_store.folders(create=False) or {}).get("output", "")
+    static, _ = template_store.static_for_path(output_folder, json_path)
+    data["_static"] = static
+    invoice_type = _invoice_type_from_source_json(json_path)
+
     # If the part is now received in SF, rebuild this header's reservation rows.
     if data.get("sf_items"):
-        output_folder = (config_store.folders(create=False) or {}).get("output", "")
-        static, _ = template_store.static_for_path(output_folder, json_path)
-        data["_static"] = static
         grouped = excel_export.build_rows_grouped([data])
         group = grouped["groups"][0] if grouped["groups"] else {"reservations": []}
         re_cols = grouped["columns"]["Reservation Entry"]
@@ -522,6 +523,14 @@ def apply_manual_buyer_order(header_id, order_no, user_id=None):
             conn.commit()
         finally:
             conn.close()
+
+    # Re-entering the PO re-runs Service First, which can (re)supply ANY of
+    # its own header/line fields (vendor code, Location Code, HSN/GST
+    # columns, ...) or pick up a Template value that's since changed - sync
+    # all of them back to the database now, since this re-validation path
+    # otherwise only ever touches the PO/status columns (see
+    # set_buyer_order_no).
+    _sync_resolved_fields(header_id, data, invoice_type=invoice_type)
 
     # Update the tracker PO / status / IsActive / IsSynced and the header column.
     res = set_buyer_order_no(header_id, order_no, verdict, user_id)
@@ -935,13 +944,21 @@ _BATCH_IGNORED_STATUSES = (
 
 def _batch_is_cleared(counts):
     """True if every invoice in a batch NOT in _BATCH_IGNORED_STATUSES has
-    reached LOADED/POSTED/COMPLETED, OR none of them have reached that far
-    YET (still sitting at Ready To Load, say) - a batch that hasn't started
-    doesn't hold up a later batch either. Only PARTIAL progress - some
-    invoices Loaded/Posted/Completed, others not - counts as not cleared,
-    since that's real, unfinished work for this batch specifically."""
+    reached LOADED/POSTED/COMPLETED/REJECTED BY ACCOUNTS, OR none of them
+    have reached that far YET (still sitting at Ready To Load, say) - a
+    batch that hasn't started doesn't hold up a later batch either. Only
+    PARTIAL progress - some invoices Loaded/Posted/Completed/Rejected,
+    others still sitting at Ready To Load - counts as not cleared, since
+    that's real, unfinished work for this batch specifically. Rejected By
+    Accounts counts toward "cleared" (not just Loaded+) because a rejection
+    doesn't get ahead of a later batch's own Document Nos. the way genuine
+    unstarted work would - it already has its number; it just needs someone
+    to fix and reload the one invoice, which shouldn't hold up every other
+    batch behind it (see _batch_status_and_lock's REJECTED/lenient-label
+    handling for the same reasoning)."""
     counted_total = sum(c for s, c in counts.items() if s not in _BATCH_IGNORED_STATUSES)
-    cleared = counts.get("LOADED", 0) + counts.get("POSTED", 0) + counts.get("COMPLETED", 0)
+    cleared = (counts.get("LOADED", 0) + counts.get("POSTED", 0)
+               + counts.get("COMPLETED", 0) + counts.get("REJECTED BY ACCOUNTS", 0))
     return cleared == 0 or cleared == counted_total
 
 
@@ -995,11 +1012,27 @@ def _batch_status_and_lock(counts, downloaded, ever_reincluded=False):
     if total > 0 and completed_or_excluded == total:
         return "COMPLETED", locked
 
+    # Rejected By Accounts is folded into the LOADED tier for this label,
+    # not treated as its own stage or ignored: an invoice must have already
+    # been Loaded to be rejected, and needs exactly the same next step a
+    # plain Loaded invoice does (fix it, then Load/Post it again) - so it
+    # belongs at the Loaded tier, same as a Loaded invoice would. 9 Posted +
+    # 1 Rejected shows "Loaded" (the least advanced tier reached, same rule
+    # as 3 Loaded + 2 Posted = Loaded); all 10 Rejected also shows "Loaded"
+    # for the same reason - every one of them needs the same next action.
+    # _batch_is_cleared already folds Rejected into "cleared" the same way.
     counted_total = sum(c for s, c in counts.items() if s not in _BATCH_IGNORED_STATUSES)
-    reached = {s for s in ("LOADED", "POSTED", "COMPLETED") if counts.get(s, 0) > 0}
+    effective_loaded = counts.get("LOADED", 0) + counts.get("REJECTED BY ACCOUNTS", 0)
+    reached = {
+        s for s, c in (
+            ("LOADED", effective_loaded),
+            ("POSTED", counts.get("POSTED", 0)),
+            ("COMPLETED", counts.get("COMPLETED", 0)),
+        ) if c > 0
+    }
     if counted_total > 0 and reached and _batch_is_cleared(counts):
-        # Every counted invoice is at least Loaded: the batch shows the
-        # least advanced stage among them (3 Loaded + 2 Posted = Loaded).
+        # Every counted invoice is at least Loaded (or Rejected, folded in
+        # above): the batch shows the least advanced stage among them.
         return next(s for s in ("LOADED", "POSTED", "COMPLETED") if s in reached), locked
     if ever_reincluded:
         return "DOWNLOADED", locked
@@ -1023,6 +1056,13 @@ def list_batches():
     Sample: list_batches()
     Returns [{batch, created, headers, exportable, counts, batch_status, locked, blocked_by}]."""
     ensure_menu_schema()
+    # tbl_BatchDownload's LastDocNo/LastEntryNo columns (below) are added by
+    # this same migration that mark_batch_downloaded/get_batch_download_
+    # history already call - on a fresh deploy where nothing else has
+    # triggered it yet, _table_exists alone isn't enough: the table can
+    # exist without these columns, and the SELECT below would error with
+    # "Invalid column name" and take the whole batch list down with it.
+    ensure_audit_table()
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -1049,12 +1089,16 @@ def list_batches():
                 by_batch[batch]["counts"][sname] = cnt or 0
 
         downloaded = set()
+        last_numbers = {}
         if _table_exists(cur, "tbl_BatchDownload") and order:
             placeholders = ", ".join("?" for _ in order)
             cur.execute(
-                f"SELECT BatchName FROM dbo.tbl_BatchDownload WHERE BatchName IN ({placeholders})",
+                f"SELECT BatchName, LastDocNo, LastEntryNo FROM dbo.tbl_BatchDownload "
+                f"WHERE BatchName IN ({placeholders})",
                 *order)
-            downloaded = {r[0] for r in cur.fetchall()}
+            for bn, doc_no, entry_no in cur.fetchall():
+                downloaded.add(bn)
+                last_numbers[bn] = (doc_no, entry_no)
 
         reincluded = set()
         if _table_exists(cur, "tbl_BatchReIncluded") and order:
@@ -1068,6 +1112,9 @@ def list_batches():
             row = by_batch[batch]
             row["batch_status"], row["locked"] = _batch_status_and_lock(
                 row["counts"], batch in downloaded, batch in reincluded)
+            last_doc_no, last_entry_no = last_numbers.get(batch, (None, None))
+            row["last_doc_no"] = last_doc_no
+            row["last_entry_no"] = last_entry_no
 
         # `order` is BatchName DESC (newest first), so everything AFTER a
         # batch in this list was created BEFORE it - exactly the "earlier
@@ -1097,12 +1144,21 @@ def is_batch_locked(batch_name):
         conn.close()
 
 
-def mark_batch_downloaded(batch_name, user_id=None):
+def mark_batch_downloaded(batch_name, user_id=None, doc_no=None, entry_no=None):
     """Record that a batch's Excel was just downloaded (for the Dashboard's
     Batch Status column - see list_batches). Upserts one row per batch.
-    Sample: mark_batch_downloaded('PIIPS_Batch_20260722_101500')"""
+    `doc_no`/`entry_no` are this download's actual first minted Document
+    No./Entry No. (not necessarily a user-typed override - see app.py's
+    download_batch, which passes whatever ended up in the exported sheet
+    either way) - stored on tbl_BatchDownload so the Dashboard can
+    pre-fill its Document No./Entry No. boxes with what was last used
+    (see list_batches' last_doc_no/last_entry_no), and included in this
+    download's own tbl_Audit_Event row so Batch History shows exactly
+    what was downloaded, not just when.
+    Sample: mark_batch_downloaded('PIIPS_Batch_20260722_101500', doc_no='PIIPSPO-2627-000001', entry_no='1001')"""
     if not batch_name:
         return
+    ensure_audit_table()
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -1110,19 +1166,49 @@ def mark_batch_downloaded(batch_name, user_id=None):
             return
         cur.execute(
             "UPDATE dbo.tbl_BatchDownload SET LastDownloadedAt = GETDATE(), "
-            "DownloadCount = DownloadCount + 1 WHERE BatchName = ?",
-            batch_name)
+            "DownloadCount = DownloadCount + 1, LastDocNo = ?, LastEntryNo = ? "
+            "WHERE BatchName = ?",
+            doc_no, entry_no, batch_name)
         if cur.rowcount == 0:
             cur.execute(
                 "INSERT INTO dbo.tbl_BatchDownload "
-                "(BatchName, FirstDownloadedAt, LastDownloadedAt, DownloadCount) "
-                "VALUES (?, GETDATE(), GETDATE(), 1)",
-                batch_name)
+                "(BatchName, FirstDownloadedAt, LastDownloadedAt, DownloadCount, LastDocNo, LastEntryNo) "
+                "VALUES (?, GETDATE(), GETDATE(), 1, ?, ?)",
+                batch_name, doc_no, entry_no)
         conn.commit()
     finally:
         conn.close()
+    detail = "Batch Excel downloaded"
+    if doc_no or entry_no:
+        detail += f" (Document No. {doc_no or '—'}, Entry No. {entry_no or '—'})"
     log_event("BATCH_DOWNLOADED", batch=batch_name, user_id=user_id, entity="BATCH",
-              detail="Batch Excel downloaded")
+              detail=detail)
+
+
+def get_batch_download_history(batch_name, limit=200):
+    """Who/when downloaded this batch's Excel, and what Document No./Entry
+    No. that download used - the Dashboard's per-batch History button
+    (Super Admin only). Reads tbl_Audit_Event WHERE Entity='BATCH' AND
+    Action='BATCH_DOWNLOADED' AND BatchName=batch_name - every download
+    already gets its own row there (see mark_batch_downloaded), so this
+    is a plain filtered read, no new table.
+    Sample: get_batch_download_history('PIIPS_Batch_20260722_101500')"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT a.Id, a.EventDatetime, a.Detail, u.UserName "
+            "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+            "WHERE a.Entity = 'BATCH' AND a.Action = 'BATCH_DOWNLOADED' AND a.BatchName = ? "
+            "ORDER BY a.EventDatetime DESC", batch_name)
+        cols = ["Id", "EventDatetime", "Detail", "UserName"]
+        out = [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
+        for row in out:
+            row["EventDatetime"] = row["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if row["EventDatetime"] else ""
+        return out
+    finally:
+        conn.close()
 
 
 def list_statuses():
@@ -1729,6 +1815,98 @@ def fetch_batch(batch_name, sheet_cols):
         conn.close()
 
 
+def fetch_batch_readonly(batch_name, sheet_cols):
+    """Read a batch's rows from the 3 tables, EXACTLY as currently persisted
+    - a pure export, with none of fetch_batch()'s side effects: no [No.]/
+    [Entry No.] minting, no status/IsActive/IsExcluded filtering (every
+    header in the batch comes back, whatever its current stage), and no
+    write of any kind. Same {sheet: {columns, rows}} shape as fetch_batch,
+    ready for excel_export.build_workbook_from_sheets - for the Dashboard's
+    Super-Admin-only "just download the batch's existing data" button
+    (app.py's /api/batches/export), which is deliberately NOT the same
+    action as a real batch download (fetch_batch): nothing here ever mints
+    a number, locks anything, or marks the batch downloaded.
+    Sample: fetch_batch_readonly('PIIPS_Batch_20260722_101500', {'Purchase Header': ['InvoiceNo'], 'Purchase Line': ['Description'], 'Reservation Entry': ['Serial No.']})
+    """
+    ensure_menu_schema()
+
+    header_cols = list(sheet_cols.get("Purchase Header", []))
+    line_cols = list(sheet_cols.get("Purchase Line", []))
+    res_cols = list(sheet_cols.get("Reservation Entry", []))
+
+    header_req = list(dict.fromkeys(header_cols + ["Id", "No.", "InvoiceNo"]))
+    line_req = list(dict.fromkeys(line_cols + ["Purchase_Header_ID", "Document No."]))
+    res_req = list(dict.fromkeys(res_cols + ["Id", "Purchase_Header_ID", "Source ID", "Entry No."]))
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "EXEC dbo.usp_FetchBatchAll ?, ?, ?, ?",
+            batch_name,
+            json.dumps(header_req),
+            json.dumps(line_req),
+            json.dumps(res_req),
+        )
+
+        def read_rows():
+            names = [d[0] for d in (cur.description or [])]
+            fetched = cur.fetchall()
+            if names == ["_empty"]:
+                return []
+            return [dict(zip(names, r)) for r in fetched]
+
+        ph_r = read_rows()
+        cur.nextset()
+        pl_r = read_rows()
+        cur.nextset()
+        re_r = read_rows()
+
+        # Same display-correctness fixups fetch_batch applies (these fix how
+        # old/pre-existing rows render, not anything that writes to the DB).
+        for row in ph_r:
+            if "Consignment Note No." in row:
+                row["Consignment Note No."] = re.sub(
+                    r"^[S5]PRPUR/?", "", row.get("Consignment Note No.") or "",
+                    flags=re.IGNORECASE)
+
+        part_header_ids = set()
+        if any(row.get("Type") == "Charge (Item)" for row in pl_r):
+            cur.execute(
+                "SELECT pt.Purchase_Header_ID FROM tbl_Purchase_Tracker pt "
+                "JOIN tbl_InvoiceType it ON it.InvoiceTypeId = pt.InvoiceTypeID "
+                "WHERE pt.BatchName = ? AND it.InvoiceTypeName = 'PART'",
+                batch_name,
+            )
+            part_header_ids = {r[0] for r in cur.fetchall()}
+
+        for row in pl_r:
+            if (row.get("Type") == "Charge (Item)"
+                    and row.get("Purchase_Header_ID") in part_header_ids):
+                if "No." in row:
+                    row["No."] = "FRIEGHT IN"
+                if "GST Group Type" in row:
+                    row["GST Group Type"] = "Service"
+                if "GST Group Code" in row:
+                    try:
+                        rate = float(row.get("GST %") or 0)
+                    except (TypeError, ValueError):
+                        rate = 0
+                    row["GST Group Code"] = f"Service {rate:g}%"
+
+        for row in re_r:
+            if "Source Subtype" in row:
+                row["Source Subtype"] = "1"
+
+        return {
+            "Purchase Header": {"columns": header_cols, "rows": ph_r},
+            "Purchase Line": {"columns": line_cols, "rows": pl_r},
+            "Reservation Entry": {"columns": res_cols, "rows": re_r},
+        }
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Invoice lists for the dashboard pop-ups (by status / by batch) and the
 # per-invoice include / exclude action.
@@ -1736,6 +1914,11 @@ def fetch_batch(batch_name, sheet_cols):
 
 def _hdr_col(cur, name):
     cur.execute("SELECT COL_LENGTH('dbo.tbl_Purchase_Header', ?)", name)
+    return cur.fetchone()[0] is not None
+
+
+def _line_col(cur, name):
+    cur.execute("SELECT COL_LENGTH('dbo.tbl_Purchase_Line', ?)", name)
     return cur.fetchone()[0] is not None
 
 
@@ -1858,6 +2041,136 @@ def search_invoices_by_number(query, limit=200):
     return rows
 
 
+def completed_invoices(limit=500):
+    """Every invoice whose tracker status is COMPLETED AND whose archive
+    copy actually exists in <Folder Path>/ALL_INVOICES - the "Completed
+    Invoices" menu's own list, same display shape as
+    search_invoices_by_number (file name, vendor, batch, batch status,
+    file status, ...). The DB gives the rich, reliable metadata (and the
+    ORIGINAL file/page range for View); the ALL_INVOICES folder is what
+    actually gates which rows show up here, matching that folder's own
+    filename convention "<Invoice No.>_<Vendor Name><ext>" (see
+    config_store.copy_pdf_to_all_invoices / app.py's lifecycle_advance,
+    which builds that same name) rather than parsing invoice no./vendor
+    back out of a filename, which would be ambiguous either way.
+
+    Also includes "orphan" rows - a file physically present in
+    ALL_INVOICES whose database row no longer exists at all (its batch was
+    deleted outright, e.g. via a direct SQL delete script, which only ever
+    touches the database, never this archive folder) but DID genuinely
+    reach COMPLETED via PIIPS, confirmed against a real STATUS_CHANGED
+    audit row (not just its mere presence in the folder - a file that
+    landed there any other way, or was never actually completed through
+    the app, is never shown). An orphan has none of the rich DB metadata
+    (invoice_no/vendor/batch/status all blank) and a distinct NEGATIVE
+    header_id (real headers are always positive) so it stays visible/
+    viewable/downloadable instead of silently disappearing just because
+    its database trail is gone, while the frontend can still tell it apart
+    from a real row (no History/Details for it).
+    Sample: completed_invoices()"""
+    rows = _invoice_list("s.StatusName = 'COMPLETED'", [])
+    # No early return here even when `rows` is empty: if every COMPLETED
+    # header was deleted (not just some), orphans are now this function's
+    # ONLY possible output - returning early would silently hide every
+    # genuinely-completed-then-deleted invoice, defeating the whole reason
+    # the orphan branch below exists in the first place.
+
+    base = (config_store.load_config().get("folder_path") or "").strip()
+    all_invoices_dir = os.path.join(base, config_store.ALL_INVOICES_DIR) if base else ""
+    try:
+        present = set(os.listdir(all_invoices_dir)) if all_invoices_dir and os.path.isdir(all_invoices_dir) else set()
+    except OSError:
+        present = set()
+
+    def archived_name(r):
+        inv_no = config_store._safe_folder(r.get("invoice_no") or "NoInvoiceNo")
+        vendor = config_store._safe_folder(r.get("vendor") or "UnknownVendor")
+        ext = os.path.splitext(r.get("file_name") or "")[1] or ".pdf"
+        return f"{inv_no}_{vendor}{ext}"
+
+    matched = {archived_name(r) for r in rows}
+    rows = [r for r in rows if archived_name(r) in present]
+    batch_status_by_name = {b["batch"]: b["batch_status"] for b in list_batches()}
+    for r in rows:
+        r["batch_status"] = batch_status_by_name.get(r["batch"], "")
+        # Shown in the File Name column in place of the original upload
+        # name - this IS the ALL_INVOICES archive copy's own name, which
+        # is the whole point of this menu. "file_name" itself is left
+        # untouched: View/Download still fetch the ORIGINAL file (by its
+        # own name/page range) from its status folder, not this copy.
+        r["archived_name"] = archived_name(r)
+
+    # Orphans: an ALL_INVOICES file with no surviving database row at all
+    # (e.g. its whole batch was deleted by a direct SQL script - see this
+    # session's batch-delete scripts - which only ever touches the DB, never
+    # this archive folder). The row's real invoice_no/vendor/batch are gone
+    # with the deleted record, so there's nothing reliable to show for them
+    # (parsing them back out of the archived filename would be the same
+    # ambiguous guess this function's own docstring already rules out
+    # elsewhere) - these rows exist purely so the file itself stays
+    # reachable (View/Download) and visible, not silently invisible just
+    # because its database trail was deleted. header_id is a distinct
+    # negative placeholder (never a real header - those are always
+    # positive) so the frontend's per-row selection/History-button gating
+    # doesn't collide multiple orphans onto one id.
+    #
+    # A file merely sitting in ALL_INVOICES is NOT by itself proof it was
+    # ever completed via PIIPS - only a genuine COMPLETED STATUS_CHANGED
+    # audit row is that proof, and advance_status's own log_event call
+    # already captures that header's FileName/InvoiceNo into the audit row
+    # (via _audit_ctx) at the moment of completion, before any later
+    # deletion - so it survives even once the header itself is gone.
+    # Matched by invoice-no PREFIX (not full archived_name) since the audit
+    # row never recorded the vendor half of that name; a file whose prefix
+    # doesn't correspond to any genuine COMPLETED invoice no. is left out
+    # entirely rather than shown on the strength of its mere presence.
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT InvoiceNo FROM dbo.tbl_Audit_Event "
+            "WHERE Action = 'STATUS_CHANGED' AND ToStatus = 'COMPLETED' AND InvoiceNo IS NOT NULL"
+        )
+        completed_invoice_prefixes = [
+            config_store._safe_folder(r[0]) + "_" for r in cur.fetchall() if r[0]
+        ]
+    finally:
+        conn.close()
+    candidates = present - matched
+    orphan_names = sorted(
+        name for name in candidates
+        if any(name.startswith(p) for p in completed_invoice_prefixes)
+    )
+    for i, name in enumerate(orphan_names):
+        rows.append({
+            "header_id": -(i + 1),
+            "invoice_no": "",
+            "batch": "",
+            "file_name": name,
+            "archived_name": name,
+            "format": "",
+            "status": "",
+            "batch_status": "",
+            "is_active": False,
+            "is_synced": False,
+            "is_excluded": False,
+            "vendor": "",
+            "vendor_gst": "",
+            "doc_date": "",
+            "tracker_id": None,
+            "invoice_type": "",
+            "page": None,
+            "page_start": None,
+            "page_end": None,
+            "navision_doc_no": "",
+            "reject_remark": "",
+            "vendor_code": "",
+        })
+
+    return rows[:limit]
+
+
 def invoices_by_status(status_id):
     """Invoices whose tracker status is `status_id` (pie-slice pop-up).
     Sample: invoices_by_status(5)"""
@@ -1893,6 +2206,23 @@ def invoices_by_statuses(status_names, active_only=False):
     return _invoice_list(where, names)
 
 
+def invoices_vendor_code_missing():
+    """SERVICE invoices parked at DATA MISMATCH over a missing/doubtful NAV
+    vendor code (Vendor Code Entry menu). There's no dedicated status for
+    this any more (folded into the ordinary DATA MISMATCH bucket - see
+    processor.py's SERVICE verdict branch) so this is found directly by
+    the blank vendor code column instead of a status name; the same column
+    apply_manual_vendor_code/set_nav_vendor_code writes once it's keyed in.
+    Sample: invoices_vendor_code_missing()"""
+    where = (
+        "s.StatusName = 'DATA MISMATCH' AND ISNULL(pt.IsExcluded, 0) = 0 "
+        "AND pt.InvoiceTypeID IN (SELECT InvoiceTypeId FROM dbo.tbl_InvoiceType "
+        "                         WHERE InvoiceTypeName = 'SERVICE') "
+        "AND (h.[Pay-to Vendor No.] IS NULL OR h.[Pay-to Vendor No.] = '')"
+    )
+    return _invoice_list(where, [])
+
+
 # The menu keys each role can see BEFORE a Super Admin has ever saved the
 # "Screen Access" menu - i.e. what every existing deployment already
 # behaves like today. Used only to seed tbl_RoleMenu the first time it's
@@ -1902,12 +2232,15 @@ def invoices_by_statuses(status_names, active_only=False):
 # a one-time seed, not read on every request, so a stale key here only
 # matters for a brand new deployment's first run.
 _ROLE_MENU_DEFAULTS = {
-    "admin": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate",
+    "admin": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate",
               "load", "post", "complete",
               "configuration", "apiconfig", "template", "createfield", "users"],
-    "user": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load"],
-    "accounts": ["dashboard", "input", "manual", "invoicesearch", "post", "complete"],
-    "viewer": ["dashboard", "input", "invoicesearch", "buyerorder", "vendorcode", "partdescupdate", "load", "post", "complete"],
+    # NAV Vendor Code Entry is deliberately not listed for any role here -
+    # access removed menu-wide (still reachable by Super Admin/Developer,
+    # which always sees every menu regardless of this table).
+    "user": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load"],
+    "accounts": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "post", "complete"],
+    "viewer": ["dashboard", "input", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load", "post", "complete"],
 }
 
 
@@ -2139,13 +2472,28 @@ def revalidate_data_mismatch_header(header_id, user_id=None):
         return None
 
     import service_api
+    import template_store
     with open(json_path, "r", encoding="utf-8") as fp:
         data = json.load(fp)
     verdict = service_api.enrich_invoice(data)
     with open(json_path, "w", encoding="utf-8") as fp:
         json.dump(data, fp, indent=4, ensure_ascii=False)
 
-    revalidate_header_after_description_fix(header_id, data, verdict, user_id)
+    # data was just reloaded straight from its saved JSON, which never
+    # carries "_static" (see processor.py - it's attached after that file
+    # is written, deliberately kept out of it). Without re-attaching it
+    # here, revalidate_header_after_description_fix's rebuild below would
+    # silently blank every Template-sourced column it touches - Reservation
+    # Entry (always), and now Purchase Header/Line too (_sync_resolved_
+    # fields syncs Template-sourced columns there as well, not just
+    # Service-First-sourced ones) - this is the exact bug the other caller
+    # of that same function (reextract_and_fix_description, a few lines up)
+    # already avoids.
+    output_folder = (config_store.folders(create=False) or {}).get("output", "")
+    static, _ = template_store.static_for_path(output_folder, json_path)
+    data["_static"] = static
+
+    revalidate_header_after_description_fix(header_id, data, verdict, user_id, invoice_type)
     log_event("STATUS_CHANGED", header_id=header_id, user_id=user_id, to_status=verdict["status"],
               detail="Re-checked against Service First after a Part Description Mapping update")
     return {"file_name": file_name, "new_status": verdict["status"],
@@ -2291,7 +2639,7 @@ def reextract_and_fix_description(candidate, ocr=None, output_folder=None):
         verdict = service_api.enrich_invoice(data)
 
     lines_changed = fix_purchase_line_descriptions(header_id, new_items) if items_changed else 0
-    revalidate_header_after_description_fix(header_id, data, verdict)
+    revalidate_header_after_description_fix(header_id, data, verdict, invoice_type=invoice_type)
     detail_parts = []
     if items_changed:
         detail_parts.append("Purchase Line Description corrected (continuation-line extraction fix)")
@@ -2356,53 +2704,30 @@ def revalidate_all_data_mismatch(user_id=None):
     return {"checked": len(candidates), "moved": moved}
 
 
-# Purchase Line columns whose value comes straight from Service First (see
-# service_api._apply_hsn_map) - the only ones revalidate_header_after_
-# description_fix ever touches on tbl_Purchase_Line itself, matched
-# positionally by [Line No.] (see fix_purchase_line_descriptions - Line No.
-# is minted sequentially in extraction order, so the Nth existing line is
-# always the Nth item in `data["items"]`).
-_SF_SOURCED_LINE_COLUMNS = ("No.", "HSN/SAC Code", "GST Group Code", "GST Group Type", "GST %")
-
-
-def revalidate_header_after_description_fix(header_id, data, verdict, user_id=None):
+def revalidate_header_after_description_fix(header_id, data, verdict, user_id=None, invoice_type=None):
     """Persist a freshly-recomputed verdict for one header after its
     Purchase Line Description(s) were corrected by re-extraction (see the
     one-time migration in app.py), or after a sibling on the same PO let
     Service First resolve THIS line too (a vendor prints the same physical
     part as separate serialized units - SF only tracks it as one part, so
     confirming one unit's description can now resolve another's Nav Item No
-    too - see service_api._apply_hsn_map's sibling fallback): rebuilds
-    Reservation Entry rows from `data` (empty for a SERVICE invoice, which
-    never has any), re-syncs the Service-First-sourced Purchase Line
-    columns (_SF_SOURCED_LINE_COLUMNS - description/PDF-sourced columns are
-    never touched here), and updates the tracker's StatusID / IsActive via
-    usp_ReplaceReservation, exactly like a Buyer Order No / NAV vendor code
-    correction does.
-    Sample: revalidate_header_after_description_fix(7378, data, {"status": "READY TO LOAD", "is_active": True}, 7)"""
+    too - see service_api._apply_hsn_map's sibling fallback): re-syncs every
+    Service-First-/Template-sourced Purchase Header and Purchase Line
+    column (_sync_resolved_fields - "Description" itself is deliberately
+    never touched, see _LINE_SYNC_EXCLUDED_COLUMNS), rebuilds Reservation
+    Entry rows from `data` (empty for a SERVICE invoice, which never has
+    any), and updates the tracker's StatusID / IsActive via
+    usp_ReplaceReservation, exactly like a Buyer Order No correction does.
+    Sample: revalidate_header_after_description_fix(7378, data, {"status": "READY TO LOAD", "is_active": True}, 7, "PART")"""
     import excel_export
+    _sync_resolved_fields(header_id, data, invoice_type=invoice_type)
+
     grouped = excel_export.build_rows_grouped([data])
-    group = grouped["groups"][0] if grouped["groups"] else {"reservations": [], "lines": []}
+    group = grouped["groups"][0] if grouped["groups"] else {"reservations": []}
     re_cols = grouped["columns"]["Reservation Entry"]
     conn = get_connection()
     try:
         cur = conn.cursor()
-
-        new_lines = group.get("lines") or []
-        if new_lines:
-            cur.execute(
-                "SELECT Id FROM dbo.tbl_Purchase_Line WHERE Purchase_Header_ID = ? "
-                "ORDER BY [Line No.]", header_id)
-            existing_ids = [r[0] for r in cur.fetchall()]
-            cols = [c for c in _SF_SOURCED_LINE_COLUMNS if c in (new_lines[0] or {})]
-            if cols:
-                set_clause = ", ".join(f"[{c}] = ?" for c in cols)
-                for line_id, line in zip(existing_ids, new_lines):
-                    cur.execute(
-                        f"UPDATE dbo.tbl_Purchase_Line SET {set_clause} WHERE Id = ?",
-                        *[line.get(c, "") for c in cols], line_id,
-                    )
-
         cur.execute(
             "EXEC dbo.usp_ReplaceReservation ?, ?, ?, ?, ?, ?",
             header_id, json.dumps(re_cols), json.dumps(group["reservations"]),
@@ -2462,6 +2787,81 @@ def _existing_cols(cur, table, wanted):
     cur.execute("SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(?)", f"dbo.{table}")
     have = {r[0].lower() for r in cur.fetchall()}
     return [c for c in wanted if c.lower() in have]
+
+
+def get_invoice_details(header_id):
+    """Every Purchase Header / Purchase Line / Reservation Entry column
+    that's actually configured (excel_export.sheet_columns - mandatory
+    AND optional alike, not just the mandatory-only subset
+    get_invoice_field_check shows) and its current stored value, for
+    Invoice Search's own "Details" view. PART only - SERVICE never calls
+    Service First at all, so most of these columns (especially
+    Reservation Entry, which only exists at all because of an SF
+    reservation) would just be empty/absent for it; raises ValueError if
+    this header is SERVICE. Deliberately carries no who/when - that's
+    what History (get_audit) already shows.
+    Sample: get_invoice_details(29)"""
+    import excel_export
+
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT it.InvoiceTypeName FROM dbo.tbl_Purchase_Tracker pt "
+            "JOIN dbo.tbl_InvoiceType it ON it.InvoiceTypeId = pt.InvoiceTypeID "
+            "WHERE pt.Purchase_Header_ID = ?", header_id,
+        )
+        type_row = cur.fetchone()
+        invoice_type = ((type_row[0] if type_row else "") or "").strip().upper()
+        if invoice_type == "SERVICE":
+            raise ValueError("Details are only available for PART invoices.")
+
+        columns = excel_export.sheet_columns()
+
+        header_cols = _existing_cols(cur, "tbl_Purchase_Header", columns.get("Purchase Header", []))
+        header = {}
+        if header_cols:
+            cur.execute(
+                f"SELECT {', '.join(_q(c) for c in header_cols)} "
+                "FROM dbo.tbl_Purchase_Header WITH (NOLOCK) WHERE Id = ?",
+                header_id)
+            row = cur.fetchone()
+            if row:
+                header = {c: ("" if v is None else str(v)) for c, v in zip(header_cols, row)}
+
+        line_cols = _existing_cols(cur, "tbl_Purchase_Line", columns.get("Purchase Line", []))
+        lines = []
+        if line_cols:
+            order_by = "TRY_CAST([Line No.] AS FLOAT)" if "Line No." in line_cols else _q(line_cols[0])
+            cur.execute(
+                f"SELECT {', '.join(_q(c) for c in line_cols)} "
+                "FROM dbo.tbl_Purchase_Line WITH (NOLOCK) WHERE Purchase_Header_ID = ? "
+                f"ORDER BY {order_by}",
+                header_id)
+            for row in cur.fetchall():
+                lines.append({c: ("" if v is None else str(v)) for c, v in zip(line_cols, row)})
+
+        res_cols = _existing_cols(cur, "tbl_Reservation_Entry", columns.get("Reservation Entry", []))
+        reservations = []
+        if res_cols:
+            order_by = "TRY_CAST([Source Ref. No.] AS FLOAT)" if "Source Ref. No." in res_cols else _q(res_cols[0])
+            cur.execute(
+                f"SELECT {', '.join(_q(c) for c in res_cols)} "
+                "FROM dbo.tbl_Reservation_Entry WITH (NOLOCK) WHERE Purchase_Header_ID = ? "
+                f"ORDER BY {order_by}",
+                header_id)
+            for row in cur.fetchall():
+                reservations.append({c: ("" if v is None else str(v)) for c, v in zip(res_cols, row)})
+
+        return {
+            "header_columns": header_cols, "header": header,
+            "line_columns": line_cols, "lines": lines,
+            "reservation_columns": res_cols, "reservations": reservations,
+        }
+    finally:
+        conn.close()
 
 
 def get_invoice_field_check(header_id):
@@ -2788,14 +3188,13 @@ def get_invoice_field_check(header_id):
             # this specific, expected case.
             "optional": is_service and buyer_order_missing,
         }
-        # Vendor Code (Nav_VendorCode / "Buy-from Vendor No.") — mirrors
-        # Buyer Order No above but with the two invoice types swapped: for
-        # PART it's an ordinary Service-First-sourced field, so a blank one
-        # is nothing new to flag here; for SERVICE, which never calls SF at
-        # all, it's the one field hand-written onto the scanned PDF and
-        # required before Load (see processor.py's NAV VENDOR CODE DOESN'T
-        # EXIST status and the Vendor Code Entry menu) - a blank one there
-        # is a genuine, actionable "Missing", not "Optional".
+        # Vendor Code (Nav_VendorCode / "Buy-from Vendor No.") — required for
+        # every invoice type, never "Optional": PART gets it from Service
+        # First; SERVICE never calls SF at all, so it's instead hand-written
+        # onto the scanned PDF (see anchor_extract.py's "Vendor Code" label).
+        # Either way a blank one is a genuine, actionable "Missing" (see
+        # excel_export.missing_required_fields's own unconditional check,
+        # which now routes either type's blank Vendor Code to DATA MISMATCH).
         vendor_code = ""
         if _hdr_col(cur, "Buy-from Vendor No."):
             cur.execute(
@@ -2813,7 +3212,7 @@ def get_invoice_field_check(header_id):
             # PDF (see anchor_extract.py's "Vendor Code" label / invoice_
             # schema.py's vendor_code) - the popup should say so honestly.
             "source": "PDF" if is_service else "Service First",
-            "optional": (not is_service) and vendor_code_missing,
+            "optional": False,
         }
 
         # Shown right before InvoiceNo (REQUIRED_HEADER_FIELDS' own last
@@ -2863,6 +3262,86 @@ def get_invoice_field_check(header_id):
                 for i, rs in enumerate(res_rows)
             ],
         }
+    finally:
+        conn.close()
+
+
+# A Purchase Line column never touched by _sync_resolved_fields even when
+# field_source() would call it Service-First/Template-sourced for some
+# vendor's own mapping - "Description" is the one column a user can
+# directly confirm/correct themselves (Part Description Mapping), and this
+# sync is ALSO what runs right after such a correction (see
+# revalidate_header_after_description_fix) - overwriting it back from a
+# generic resolved value the same instant would silently discard the very
+# fix the user just made.
+_LINE_SYNC_EXCLUDED_COLUMNS = {"Description"}
+
+
+def _sync_resolved_fields(header_id, data, invoice_type=None, mapping=None):
+    """Write every Purchase Header / Purchase Line column whose value is
+    Service-First- or Template-sourced (field_source(...) in ("Service
+    First", "Template")) from `data`'s freshly resolved mapping output
+    (build_rows_grouped) back into the database - run this after anything
+    that can change what SF/the Template now supplies for an
+    ALREADY-SAVED invoice (a Buyer's Order No. keyed in on Buyer Order
+    Entry, a Part Description confirmed on Part Description Mapping), so
+    the stored row reflects today's resolution instead of staying frozen
+    at whatever was first saved. A column that resolves blank this time is
+    left untouched rather than overwritten - most often that just means
+    THIS particular call got no row back from SF (e.g. a transient API
+    timeout), not that a previously confirmed value has genuinely gone
+    away. Purchase Line rows are matched to data["items"] positionally in
+    [Line No.] order - the same stable join fix_purchase_line_descriptions
+    already relies on. Reservation Entry isn't handled here: every caller
+    already fully rebuilds it via usp_ReplaceReservation instead of
+    patching it column by column.
+    Sample: _sync_resolved_fields(42, data, invoice_type="PART")"""
+    import excel_export
+    mapping = mapping if mapping is not None else excel_export.load_mapping()
+    grouped = excel_export.build_rows_grouped([data])
+    group = grouped["groups"][0] if grouped["groups"] else {"header": {}, "lines": []}
+
+    def _syncable(sheet, col, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return False
+        return excel_export.field_source(sheet, col, mapping, invoice_type) in ("Service First", "Template")
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+
+        sets, params = [], []
+        for col, value in (group.get("header") or {}).items():
+            if _syncable("Purchase Header", col, value) and _hdr_col(cur, col):
+                sets.append(f"{_q(col)} = ?")
+                params.append(value)
+        if sets:
+            params.append(header_id)
+            cur.execute(f"UPDATE dbo.tbl_Purchase_Header SET {', '.join(sets)} WHERE Id = ?", *params)
+
+        new_lines = group.get("lines") or []
+        if new_lines:
+            cur.execute(
+                "SELECT Id FROM dbo.tbl_Purchase_Line WHERE Purchase_Header_ID = ? "
+                "ORDER BY [Line No.]", header_id)
+            existing_ids = [r[0] for r in cur.fetchall()]
+            line_cols = sorted({
+                c for line in new_lines for c in line
+                if c not in ("_pdf_hsn",) and c not in _LINE_SYNC_EXCLUDED_COLUMNS
+                and _line_col(cur, c)
+            })
+            for line_id, line in zip(existing_ids, new_lines):
+                sets, params = [], []
+                for c in line_cols:
+                    value = line.get(c)
+                    if _syncable("Purchase Line", c, value):
+                        sets.append(f"{_q(c)} = ?")
+                        params.append(value)
+                if sets:
+                    params.append(line_id)
+                    cur.execute(f"UPDATE dbo.tbl_Purchase_Line SET {', '.join(sets)} WHERE Id = ?", *params)
+
+        conn.commit()
     finally:
         conn.close()
 
@@ -3910,6 +4389,38 @@ _MENU_PROC_DDL = [
         SELECT 1 AS Deleted;
     END
     """,
+    # ---- Template reactivate (undo of the soft-delete above) -------------
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_ActivateTemplate
+        @TemplateKey NVARCHAR(500),
+        @UserId      INT = NULL
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_ActivateTemplate @TemplateKey='SPR\Bosch', @UserId=7
+        DECLARE @TemplateId INT;
+        SELECT @TemplateId = Id FROM dbo.tbl_Template
+         WHERE TemplateKey = @TemplateKey AND IsActive = 0;
+
+        IF @TemplateId IS NULL
+        BEGIN
+            SELECT 0 AS Activated;
+            RETURN;
+        END
+
+        UPDATE dbo.tbl_Template
+           SET IsActive = 1, ModifiedById = @UserId, ModifiedDatetime = GETDATE()
+         WHERE Id = @TemplateId;
+        -- Restores every static value the template had at the moment it was
+        -- deactivated (usp_DeleteTemplate turns the whole set off together) -
+        -- not a per-field undo, just the mirror image of that same delete.
+        UPDATE dbo.tbl_TemplateStaticValue
+           SET IsActive = 1, ModifiedById = @UserId, ModifiedDatetime = GETDATE()
+         WHERE TemplateId = @TemplateId AND IsActive = 0;
+
+        SELECT 1 AS Activated;
+    END
+    """,
     # ---- Dashboard / invoice processing: bulk insert -------------------
     # All Header/Line/Reservation rows for a batch arrive as JSON and are
     # inserted set-based (no row-by-row loop). Because the target tables
@@ -4540,13 +5051,17 @@ _MENU_PROC_DDL = [
     BEGIN
         SET NOCOUNT ON;
         -- Sample: EXEC dbo.usp_GetTemplates
-        SELECT Id, TemplateKey, PONumberFormat
-        FROM dbo.tbl_Template WITH (NOLOCK)
-        WHERE IsActive = 1;
+        -- Both active AND inactive templates - the Template screen now
+        -- shows/toggles both instead of a one-way delete; anything that
+        -- must only ever see ACTIVE templates (invoice processing itself)
+        -- filters IsActive on the Python side, never relies on this
+        -- proc excluding inactive rows.
+        SELECT Id, TemplateKey, PONumberFormat, IsActive
+        FROM dbo.tbl_Template WITH (NOLOCK);
 
         SELECT sv.TemplateId, sv.SheetName, sv.ColumnName, sv.StaticValue
         FROM dbo.tbl_TemplateStaticValue sv WITH (NOLOCK)
-        JOIN dbo.tbl_Template t WITH (NOLOCK) ON t.Id = sv.TemplateId AND t.IsActive = 1
+        JOIN dbo.tbl_Template t WITH (NOLOCK) ON t.Id = sv.TemplateId
         WHERE sv.IsActive = 1;
     END
     """,
@@ -4790,6 +5305,86 @@ _MENU_PROC_DDL = [
         END
 
         -- Reservation
+        IF OBJECT_ID('dbo.tbl_Reservation_Entry') IS NULL
+            SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+        ELSE
+        BEGIN
+            SELECT @cols = STRING_AGG(QUOTENAME(c.name), N', ')
+            FROM OPENJSON(@ResCols) j
+            JOIN sys.columns c ON c.object_id = OBJECT_ID('dbo.tbl_Reservation_Entry')
+                               AND c.name = j.value;
+            IF @cols IS NULL
+                SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+            ELSE
+            BEGIN
+                SET @sql = N'SELECT ' + @cols +
+                    N' FROM dbo.tbl_Reservation_Entry WHERE Purchase_Header_ID IN ' + @idset +
+                    N' ORDER BY Purchase_Header_ID, Id';
+                EXEC sp_executesql @sql, N'@b NVARCHAR(200)', @b = @BatchName;
+            END
+        END
+    END
+    """,
+    # ---- Read: a saved batch's rows, EVERY header, no numbering ----------
+    # Same shape/mechanism as usp_FetchBatch, but for database.
+    # fetch_batch_readonly's pure read-only export (Dashboard's Super-Admin
+    # download-icon button) - no IsActive/IsExcluded/status filtering at
+    # all, so every header ever tied to this batch comes back exactly as
+    # currently persisted, whatever stage it's at.
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_FetchBatchAll
+        @BatchName  NVARCHAR(200),
+        @HeaderCols NVARCHAR(MAX),
+        @LineCols   NVARCHAR(MAX),
+        @ResCols    NVARCHAR(MAX)
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_FetchBatchAll @BatchName='PIIPS_Batch_20260722_101500', @HeaderCols='["InvoiceNo"]', @LineCols='["Description"]', @ResCols='["Serial No."]'
+        DECLARE @sql NVARCHAR(MAX), @cols NVARCHAR(MAX);
+
+        DECLARE @idset NVARCHAR(600) =
+            N'(SELECT pt.Purchase_Header_ID FROM dbo.tbl_Purchase_Tracker pt '
+          + N'WHERE pt.BatchName = @b)';
+
+        IF OBJECT_ID('dbo.tbl_Purchase_Header') IS NULL
+            SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+        ELSE
+        BEGIN
+            SELECT @cols = STRING_AGG(QUOTENAME(c.name), N', ')
+            FROM OPENJSON(@HeaderCols) j
+            JOIN sys.columns c ON c.object_id = OBJECT_ID('dbo.tbl_Purchase_Header')
+                               AND c.name = j.value;
+            IF @cols IS NULL
+                SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+            ELSE
+            BEGIN
+                SET @sql = N'SELECT ' + @cols +
+                           N' FROM dbo.tbl_Purchase_Header WHERE Id IN ' + @idset +
+                           N' ORDER BY Id';
+                EXEC sp_executesql @sql, N'@b NVARCHAR(200)', @b = @BatchName;
+            END
+        END
+
+        IF OBJECT_ID('dbo.tbl_Purchase_Line') IS NULL
+            SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+        ELSE
+        BEGIN
+            SELECT @cols = STRING_AGG(QUOTENAME(c.name), N', ')
+            FROM OPENJSON(@LineCols) j
+            JOIN sys.columns c ON c.object_id = OBJECT_ID('dbo.tbl_Purchase_Line')
+                               AND c.name = j.value;
+            IF @cols IS NULL
+                SELECT TOP 0 CAST(NULL AS INT) AS _empty;
+            ELSE
+            BEGIN
+                SET @sql = N'SELECT ' + @cols +
+                    N' FROM dbo.tbl_Purchase_Line WHERE Purchase_Header_ID IN ' + @idset +
+                    N' ORDER BY Purchase_Header_ID, Id';
+                EXEC sp_executesql @sql, N'@b NVARCHAR(200)', @b = @BatchName;
+            END
+        END
+
         IF OBJECT_ID('dbo.tbl_Reservation_Entry') IS NULL
             SELECT TOP 0 CAST(NULL AS INT) AS _empty;
         ELSE
@@ -5054,8 +5649,12 @@ def save_field_mapping(mapping, user_id=None):
 # ---- Template (header + normalized static values) -------------------------
 
 def get_templates_data():
-    """{key: {"PO_Number_Format": ..., sheet: {col: value}}} for active
-    templates — the shape the Template menu and the processor expect.
+    """{key: {"PO_Number_Format": ..., "IsActive": bool, sheet: {col: value}}}
+    for EVERY template, active and inactive alike - the Template screen
+    shows/toggles both. Any caller that must only ever act on an active
+    template (invoice processing itself) is responsible for checking
+    "IsActive" on the entry it looks up - this function no longer filters
+    that for them (see template_store.static_for_path).
     Sample: get_templates_data()"""
     ensure_menu_schema()
     conn = get_connection()
@@ -5064,8 +5663,8 @@ def get_templates_data():
         cur.execute("EXEC dbo.usp_GetTemplates")
 
         temps, id_to_key = {}, {}
-        for tid, key, po in cur.fetchall():
-            temps[key] = {"PO_Number_Format": po or ""}
+        for tid, key, po, is_active in cur.fetchall():
+            temps[key] = {"PO_Number_Format": po or "", "IsActive": bool(is_active)}
             id_to_key[tid] = key
 
         if cur.nextset():
@@ -5074,6 +5673,184 @@ def get_templates_data():
                 if key is not None:
                     temps[key].setdefault(sheet, {})[col] = val if val is not None else ""
         return temps
+    finally:
+        conn.close()
+
+
+def activate_template(template_key, user_id=None):
+    """Reactivate a soft-deleted template (header + the static values it
+    had at the moment it was deactivated). Returns True if one was found.
+    Sample: activate_template('SPR\\Bosch', 7)"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("EXEC dbo.usp_ActivateTemplate ?, ?", template_key, user_id)
+        row = cur.fetchone()
+        conn.commit()
+        ok = bool(row and row[0])
+        if ok:
+            log_event("TEMPLATE_ACTIVATED", entity="TEMPLATE", invoice_no=template_key,
+                      user_id=user_id, detail=f"Template activated: {template_key}")
+        return ok
+    finally:
+        conn.close()
+
+
+def get_template_history(template_key, limit=200):
+    """Who/when activated or deactivated this template, newest first -
+    the Template screen's own History (mirrors get_audit's invoice-level
+    version, but for Entity='TEMPLATE' events, matched on the template
+    key stored in the audit row's InvoiceNo column - repurposed here to
+    hold the template key rather than an actual invoice number).
+    Sample: get_template_history('PT\\PART\\Chennai')"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT a.Id, a.EventDatetime, a.Action, a.Detail, u.UserName "
+            "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+            "WHERE a.Entity = 'TEMPLATE' AND a.InvoiceNo = ? "
+            "ORDER BY a.EventDatetime DESC", template_key)
+        cols = ["Id", "EventDatetime", "Action", "Detail", "UserName"]
+        out = [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
+        for row in out:
+            row["EventDatetime"] = row["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if row["EventDatetime"] else ""
+        return out
+    finally:
+        conn.close()
+
+
+def get_config_history(kind=None, limit=200):
+    """Who/when changed Folder/API/Database Configuration, newest first -
+    each config screen's own History (Entity='CONFIG'; `kind` optionally
+    narrows to one action - 'FOLDER_CONFIG_CHANGED', 'API_CONFIG_CHANGED',
+    or 'DB_CONFIG_CHANGED' - matched on the audit row's own Action column).
+    Sample: get_config_history('DB_CONFIG_CHANGED')"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        if kind:
+            cur.execute(
+                "SELECT a.Id, a.EventDatetime, a.Action, a.Detail, u.UserName "
+                "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+                "WHERE a.Entity = 'CONFIG' AND a.Action = ? "
+                "ORDER BY a.EventDatetime DESC", kind)
+        else:
+            cur.execute(
+                "SELECT a.Id, a.EventDatetime, a.Action, a.Detail, u.UserName "
+                "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
+                "WHERE a.Entity = 'CONFIG' "
+                "ORDER BY a.EventDatetime DESC")
+        cols = ["Id", "EventDatetime", "Action", "Detail", "UserName"]
+        out = [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
+        for row in out:
+            row["EventDatetime"] = row["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if row["EventDatetime"] else ""
+        return out
+    finally:
+        conn.close()
+
+
+def _template_batch_name_pattern(entity, invoice_type, name):
+    """SQL LIKE pattern matching any tbl_Purchase_Tracker.BatchName
+    produced from this template - BatchName is built as
+    f"{run_batch_name}_{suffix}" where suffix is this same sanitization
+    of the template key (see processor.py's _batch_name_for). This is
+    the reliable signal: a tracker row always exists once "Start" has
+    processed a file, regardless of how that file arrived in Input (the
+    File Explorer's own upload, a network copy, a script) - unlike
+    tbl_InputFile_Log, which is only ever written by the upload endpoint
+    itself (see usp_LogInputFiles's own comment) and stays completely
+    empty for a file placed any other way.
+    Sample: _template_batch_name_pattern('PT', 'PART', 'Chennai')"""
+    key = f"{entity}\\{invoice_type}\\{name}"
+    suffix = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_")
+    if not suffix:
+        return None
+    escaped = suffix.replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
+    return "%_" + escaped
+
+
+def _template_pending_input_files(entity, invoice_type, name):
+    """Filenames still sitting, unprocessed, in this template's own Input
+    folder on disk right now - not from tbl_InputFile_Log (see
+    _template_batch_name_pattern's own note on why that table can't be
+    trusted to have a row for every file), but a direct listing of the
+    actual folder, which is unaffected by how a file got there.
+    Sample: _template_pending_input_files('PT', 'PART', 'Chennai')"""
+    folders = config_store.folders(create=False)
+    base = folders.get("input", "") if folders else ""
+    if not base:
+        return []
+    parts = [p for p in name.replace("\\", "/").split("/") if p]
+    folder = os.path.join(base, entity, invoice_type, *parts)
+    if not os.path.isdir(folder):
+        return []
+    try:
+        return sorted(f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f)))
+    except OSError:
+        return []
+
+
+def template_folder_has_batches(entity, invoice_type, name):
+    """True if this template has at least one real batch behind it
+    (matched via tbl_Purchase_Tracker.BatchName - see
+    _template_batch_name_pattern) or any file still sitting unprocessed
+    in its Input folder. Used to block renaming a template that already
+    has batches (see template_store.save_template) - a rename leaves any
+    of those batches' already-written Output JSON under the OLD folder
+    name, so a later resync/Buyer's Order fix for one of them re-derives
+    its static values from a template key that no longer exists and
+    silently gets nothing (see _freight_line_override / static_for_path).
+    Sample: template_folder_has_batches('PT', 'PART', 'Chennai')"""
+    if _template_pending_input_files(entity, invoice_type, name):
+        return True
+    pattern = _template_batch_name_pattern(entity, invoice_type, name)
+    if not pattern:
+        return False
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TOP 1 1 FROM dbo.tbl_Purchase_Tracker WHERE BatchName LIKE ?",
+            pattern)
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def template_incomplete_batches(entity, invoice_type, name):
+    """Every batch this template has ever produced whose status isn't
+    COMPLETED yet, as [{"batch": name, "status": status}] - same
+    per-batch status list_batches/the Dashboard shows (see
+    _current_batch_status) - plus any file still sitting unprocessed in
+    its Input folder (see _template_pending_input_files). Used to block
+    deactivating a template until every PDF it's ever received has
+    actually reached Completed first.
+    Sample: template_incomplete_batches('PT', 'PART', 'Chennai')"""
+    ensure_menu_schema()
+    incomplete = []
+    for file_name in _template_pending_input_files(entity, invoice_type, name):
+        incomplete.append({"batch": f"{file_name} (in Input, not yet processed)",
+                            "status": "NOT PROCESSED"})
+
+    pattern = _template_batch_name_pattern(entity, invoice_type, name)
+    if not pattern:
+        return incomplete
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT BatchName FROM dbo.tbl_Purchase_Tracker WHERE BatchName LIKE ?",
+            pattern)
+        for (batch_name,) in cur.fetchall():
+            status = _current_batch_status(cur, batch_name)
+            if status != "COMPLETED":
+                incomplete.append({"batch": batch_name, "status": status})
+        return incomplete
     finally:
         conn.close()
 
@@ -5116,7 +5893,11 @@ def delete_template(template_key, user_id=None):
         cur.execute("EXEC dbo.usp_DeleteTemplate ?, ?", template_key, user_id)
         row = cur.fetchone()
         conn.commit()
-        return bool(row and row[0])
+        ok = bool(row and row[0])
+        if ok:
+            log_event("TEMPLATE_DEACTIVATED", entity="TEMPLATE", invoice_no=template_key,
+                      user_id=user_id, detail=f"Template deactivated: {template_key}")
+        return ok
     finally:
         conn.close()
 
@@ -6149,7 +6930,9 @@ def ensure_audit_table():
         for col, ddl in TRACKER_AUDIT_COLUMNS:
             cur.execute("IF COL_LENGTH('dbo.tbl_Purchase_Tracker', ?) IS NULL "
                         "EXEC('ALTER TABLE dbo.tbl_Purchase_Tracker ADD [' + ? + '] ' + ?)", col, col, ddl)
-        for col, ddl in (("LastDownloadedByID", "INT NULL"),):
+        for col, ddl in (("LastDownloadedByID", "INT NULL"),
+                         ("LastDocNo", "NVARCHAR(100) NULL"),
+                         ("LastEntryNo", "NVARCHAR(100) NULL")):
             cur.execute("IF OBJECT_ID('dbo.tbl_BatchDownload') IS NOT NULL AND "
                         "COL_LENGTH('dbo.tbl_BatchDownload', ?) IS NULL "
                         "EXEC('ALTER TABLE dbo.tbl_BatchDownload ADD [' + ? + '] ' + ?)", col, col, ddl)
@@ -6392,6 +7175,28 @@ def audit_filter_options():
         users = [r[0] for r in cur.fetchall()]
         cur.execute("SELECT DISTINCT Action FROM dbo.tbl_Audit_Event ORDER BY 1")
         return {"users": users, "actions": [r[0] for r in cur.fetchall()]}
+    finally:
+        conn.close()
+
+
+def get_user_login_history(user_id, limit=200):
+    """One user's own LOGIN/LOGOUT history, newest first - User Management's
+    History button (Super Admin only). Entity='USER' audit rows are only
+    ever LOGIN/LOGOUT (see login/logout/the idle-session auto-logout, all
+    of which log_event with entity='USER'), so no Action filter is needed.
+    Sample: get_user_login_history(11)"""
+    ensure_audit_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TOP (?) Id, EventDatetime, Action, Detail FROM dbo.tbl_Audit_Event "
+            "WHERE Entity = 'USER' AND UserId = ? "
+            "ORDER BY EventDatetime DESC, Id DESC",
+            int(limit), int(user_id))
+        rows = cur.fetchall()
+        return [{"Id": r[0], "EventDatetime": r[1].strftime("%d-%m-%Y %H:%M:%S") if r[1] else "",
+                 "Action": r[2], "Detail": r[3]} for r in rows]
     finally:
         conn.close()
 

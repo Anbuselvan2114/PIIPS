@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
-import { getTemplates, saveTemplate, deleteTemplate } from "./api";
-import { DataTable, confirmDialog } from "./components";
+import { getTemplates, saveTemplate, deleteTemplate, activateTemplate, getTemplateHistory } from "./api";
+import { DataTable, confirmDialog, Modal } from "./components";
 
 export default function Template({ user }) {
   const [data, setData] = useState(null);
   const [view, setView] = useState("list");
   const [editKey, setEditKey] = useState(null);
   const [error, setError] = useState(null);
+  const [actionError, setActionError] = useState(null);
+  const [history, setHistory] = useState(null);   // {key, events} | null
+  const [historyLoading, setHistoryLoading] = useState(null);   // template key currently loading
 
   const refresh = () => getTemplates().then(setData).catch((e) => setError(e.message));
   useEffect(() => { refresh(); }, []);
@@ -22,10 +25,32 @@ export default function Template({ user }) {
   const templates = data.templates || {};
   const keys = Object.keys(templates);
 
-  const onDelete = async (key, e) => {
+  const onToggleActive = async (key, isActive, e) => {
     e.stopPropagation();
-    if (!(await confirmDialog(`Delete template "${key}"?`, { confirmLabel: "Delete", danger: true }))) return;
-    await deleteTemplate(key, user?.user_id); refresh();
+    setActionError(null);
+    const action = isActive ? "Deactivate" : "Activate";
+    if (!(await confirmDialog(`${action} template "${key}"?`,
+          { confirmLabel: action, danger: isActive }))) return;
+    try {
+      if (isActive) await deleteTemplate(key, user?.user_id);
+      else await activateTemplate(key, user?.user_id);
+      refresh();
+    } catch (e2) {
+      setActionError(e2.message);
+    }
+  };
+
+  const openHistory = async (key) => {
+    setHistoryLoading(key);
+    setActionError(null);
+    try {
+      const r = await getTemplateHistory(key);
+      setHistory({ key, events: r.events || [] });
+    } catch (e2) {
+      setActionError(e2.message);
+    } finally {
+      setHistoryLoading(null);
+    }
   };
 
   return (
@@ -35,14 +60,16 @@ export default function Template({ user }) {
           <button className="btn btn-primary" onClick={() => { setEditKey(null); setView("edit"); }}>✚ New Template</button>
           <h3 style={{ margin: 0 }}>Templates</h3>
         </div>
+        {actionError && <div className="alert alert-danger" style={{ whiteSpace: "pre-line" }}>{actionError}</div>}
         <DataTable
           rows={keys.map((key) => {
             const t = templates[key];
             const count = ["Purchase Header", "Purchase Line", "Reservation Entry"]
               .reduce((n, s) => n + Object.keys(t[s] || {}).length, 0);
+            const isActive = t.IsActive !== false;
             return { _key: key, template: key, entity: key.split("\\")[0],
                      invoiceType: key.split("\\")[1],
-                     po: t.PO_Number_Format || "", statics: count };
+                     po: t.PO_Number_Format || "", statics: count, isActive };
           })}
           searchKeys={["template", "entity", "invoiceType", "po"]} empty="No templates yet."
           columns={[
@@ -53,10 +80,46 @@ export default function Template({ user }) {
             { key: "invoiceType", label: "Invoice Type" },
             { key: "po", label: "PO Number Format" },
             { key: "statics", label: "Static values" },
+            { key: "isActive", label: "Status",
+              render: (r) => <span style={{ fontWeight: 600, color: r.isActive ? "var(--success)" : "var(--danger)" }}>
+                                {r.isActive ? "Active" : "Inactive"}
+                              </span> },
             { key: "_action", label: "", sortable: false,
-              render: (r) => <button className="btn btn-danger btn-sm" onClick={(e) => onDelete(r.template, e)}>Delete</button> },
+              render: (r) => <button className={`btn btn-sm ${r.isActive ? "btn-danger" : "btn-primary"}`}
+                                     onClick={(e) => onToggleActive(r.template, r.isActive, e)}>
+                                {r.isActive ? "Deactivate" : "Activate"}
+                              </button> },
+            { key: "_history", label: "", sortable: false,
+              render: (r) => <button className="btn btn-subtle btn-sm" disabled={historyLoading === r.template}
+                                     onClick={(e) => { e.stopPropagation(); openHistory(r.template); }}>
+                                {historyLoading === r.template ? "Loading…" : "History"}
+                              </button> },
           ]} />
       </div>
+
+      {history && (
+        <Modal title={`History — ${history.key}`} onClose={() => setHistory(null)} width={600}>
+          {history.events.length === 0 ? (
+            <div className="empty">No activate/deactivate history recorded for this template yet.</div>
+          ) : (
+            <div className="timeline">
+              {history.events.map((ev) => (
+                <div key={ev.Id} className="timeline-item">
+                  <div className="timeline-dot" />
+                  <div className="timeline-content">
+                    <div className="timeline-header">
+                      <span className="timeline-action">{ev.Action || "Unknown"}</span>
+                      <span className="timeline-time">{ev.EventDatetime || "Unknown"}</span>
+                    </div>
+                    <div className="timeline-who">{ev.UserName || "Unknown"}</div>
+                    {ev.Detail && <div className="timeline-detail">{ev.Detail}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }
@@ -85,10 +148,20 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
   // key that no longer exists and creating a duplicate row.
   const [currentKey, setCurrentKey] = useState(editKey || null);
 
-  const unmapped = (sheet) => (columns[sheet] || []).filter((c) => !(mapping[sheet] && mapping[sheet][c]));
+  // Purchase Line "No." is globally mapped to Service First (PART's own
+  // Nav Item lookup), so the ordinary "already mapped -> not template-
+  // editable" rule below would hide it for SERVICE too - but SERVICE
+  // never calls Service First at all, so its own "No." is a template
+  // field instead (see excel_export._SERVICE_TEMPLATE_FIELDS / the
+  // backend override that actually uses this value at export time). This
+  // is the one deliberate carve-out; PART's own "No." stays exactly as
+  // hidden/Service-First-sourced as it always was.
+  const isServiceNo = (sheet, col) => invoiceType === "SERVICE" && sheet === "Purchase Line" && col === "No.";
+  const unmapped = (sheet) => (columns[sheet] || []).filter((c) =>
+    isServiceNo(sheet, c) || !(mapping[sheet] && mapping[sheet][c]));
   const setVal = (sheet, col, val) => setValues((v) => ({ ...v, [sheet]: { ...v[sheet], [col]: val } }));
   const sourceOf = (sheet, col) => {
-    const base = (sources[sheet] || {})[col] || "Template";
+    const base = isServiceNo(sheet, col) ? "Template" : ((sources[sheet] || {})[col] || "Template");
     const hasStatic = Boolean((values[sheet] || {})[col]);
     return base === "Template" && !hasStatic ? "None" : base;
   };
@@ -140,7 +213,6 @@ function TemplateEdit({ data, sources, editKey, user, onBack }) {
           <div className="field">
             <label className="label">Template name</label>
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Services_Chennai  or  trichy/service" />
-            {editKey && <div className="hint" style={{ marginTop: 4 }}>Changing this renames the template (and moves its Input folder) — its saved static values carry over.</div>}
           </div>
           <div className="field">
             <label className="label">PO Number Format</label>

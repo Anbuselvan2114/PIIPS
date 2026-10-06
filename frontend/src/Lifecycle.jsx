@@ -46,12 +46,25 @@ export default function Lifecycle({ user, stage }) {
     () => Array.from(new Set(rows.map((r) => r.batch).filter(Boolean))).sort(),
     [rows]);
 
-  // Load has no batch filter - it only ever shows invoices that already
-  // have a real Navision Document No. (minted at Excel-download time, see
-  // database._assign_document_numbers), so there's nothing un-downloaded
-  // to filter out by batch in the first place.
+  // Load has no batch filter - a plain Ready To Load row only ever has a
+  // real Navision Document No. once its batch has been downloaded (minted
+  // at Excel-download time, see database._assign_document_numbers), so
+  // there's nothing un-downloaded to filter out by batch in the first
+  // place. Rejected rows are shown regardless of Document No. - one can be
+  // NULL if it was cleared by an Exclude/re-Include cycle (see
+  // set_excluded) - and always surfaced first, since they need someone to
+  // fix and reload them and shouldn't get buried under Ready to Load rows.
   const visible = useMemo(() => {
-    if (stage === "load") return rows.filter((r) => r.navision_doc_no);
+    if (stage === "load") {
+      return rows
+        .filter((r) => r.navision_doc_no || r.status === "REJECTED BY ACCOUNTS")
+        .slice()
+        .sort((a, b) => {
+          const aRej = a.status === "REJECTED BY ACCOUNTS" ? 0 : 1;
+          const bRej = b.status === "REJECTED BY ACCOUNTS" ? 0 : 1;
+          return aRej - bRej;
+        });
+    }
     return batchFilter ? rows.filter((r) => r.batch === batchFilter) : rows;
   }, [rows, batchFilter, stage]);
 
@@ -153,7 +166,7 @@ export default function Lifecycle({ user, stage }) {
         </div>
         <p className="hint" style={{ marginTop: 0 }}>
           {stage === "load"
-            ? "Only invoices with a Navision Document No. (already downloaded) are shown. Select invoices and mark as loaded."
+            ? "Only invoices with a Navision Document No. (already downloaded) are shown. Select invoices and mark as loaded. Rejected rows are listed first."
             : `Select invoices and ${cfg.action.toLowerCase()}.`}
         </p>
 

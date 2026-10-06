@@ -174,30 +174,45 @@ def _cell_value(inv, item, sheet, smap, col):
 
 # A freight/courier/forwarding line has no Navision item master entry of
 # its own (see ocr_engine.py's "charge": True lines) - BC books it as a
-# fixed service line instead. Only applies to PART invoices; SERVICE
-# invoices have no per-line GST Group at all.
+# fixed service line instead.
 _FREIGHT_NO = "FRIEGHT IN"
 
 
 def _freight_line_override(sheet, col, inv, item):
-    """Forced Purchase Line values for a freight/charge item on a PART
-    invoice, or None if this row/column isn't one."""
-    if sheet != "Purchase Line" or not (item or {}).get("_charge"):
+    """Forced Purchase Line values for:
+      - a freight/charge item on a PART invoice (no Navision item master
+        entry of its own - forces No. to the fixed _FREIGHT_NO constant,
+        on top of GST Group Type/Code) - PART's own regular (non-charge)
+        lines are untouched by this function entirely, same as before,
+      - ANY line on a SERVICE invoice (a service invoice's own lines are
+        never goods, so GST Group Type/Code use the exact same
+        "Service ..." shape as a PART freight line; No. - which SERVICE
+        never gets from Service First, unlike PART - is now the
+        template's own static value instead of sitting blank forever).
+    Returns None if this row/column is neither."""
+    if sheet != "Purchase Line":
         return None
-    if (inv.get("_invoice_type") or "").strip().upper() != "PART":
+    invoice_type = (inv.get("_invoice_type") or "").strip().upper()
+    is_part_charge = invoice_type == "PART" and bool((item or {}).get("_charge"))
+    is_service_line = invoice_type == "SERVICE"
+    if not is_part_charge and not is_service_line:
         return None
 
     if col == "No.":
-        return _FREIGHT_NO
+        if is_part_charge:
+            return _FREIGHT_NO
+        if is_service_line:
+            return (inv.get("_static") or {}).get("Purchase Line", {}).get("No.", "")
+        return None
     if col == "GST Group Type":
         return "Service"
     if col == "GST Group Code":
         # `and rate` would treat a genuine 0% (falsy) as "no rate at all"
         # and collapse this back down to the bare "Service", losing the
-        # rate a freight line with no GST is legitimately supposed to
-        # show ("Service 0%", not just "Service") - only a rate that
-        # isn't a number at all (never actually resolved) falls back.
-        rate = item.get("TaxPercentage")
+        # rate a line with no GST is legitimately supposed to show
+        # ("Service 0%", not just "Service") - only a rate that isn't a
+        # number at all (never actually resolved) falls back.
+        rate = (item or {}).get("TaxPercentage")
         try:
             rate_n = float(rate) if rate not in (None, "") else None
         except (TypeError, ValueError):
@@ -498,6 +513,13 @@ _LINK_OVERRIDE_SOURCE = {
 # through as "Service First-sourced, so blank is fine").
 _SERVICE_SYSTEM_FIELDS = {("Purchase Line", "GST Group Code")}
 
+# Purchase Line "No." (Nav Item No.) for a SERVICE invoice specifically -
+# SERVICE never calls Service First, so unlike PART it has no lookup to
+# resolve this from at all; it's the template's own static value instead
+# (see _freight_line_override). PART's own "No." is untouched - still
+# Service First-sourced, via the ordinary field mapping.
+_SERVICE_TEMPLATE_FIELDS = {("Purchase Line", "No.")}
+
 
 def field_source(sheet, col, mapping=None, invoice_type=None):
     """'Service First' / 'Template' / 'PDF' / 'System' / 'None' — where a
@@ -518,8 +540,11 @@ def field_source(sheet, col, mapping=None, invoice_type=None):
     if col == "InvoiceNo":
         return "PDF"
 
-    if (invoice_type or "").strip().upper() == "SERVICE" and (sheet, col) in _SERVICE_SYSTEM_FIELDS:
-        return "System"
+    if (invoice_type or "").strip().upper() == "SERVICE":
+        if (sheet, col) in _SERVICE_SYSTEM_FIELDS:
+            return "System"
+        if (sheet, col) in _SERVICE_TEMPLATE_FIELDS:
+            return "Template"
 
     override_source = _LINK_OVERRIDE_SOURCE.get((sheet, col))
     if override_source:
@@ -623,6 +648,21 @@ def missing_required_fields(header, lines, reservations=None, mapping=None, invo
         if _is_blank(header.get(f)) and not _is_none_source("Purchase Header", f, mapping):
             found.append({"field": f, "sheet": "Purchase Header",
                           "source": field_source("Purchase Header", f, mapping, invoice_type)})
+    # "Pay-to Vendor No." (Vendor Code) is never optional for any invoice
+    # type - checked here directly, unconditionally, rather than via
+    # REQUIRED_HEADER_FIELDS' generic loop above (which it's deliberately
+    # left out of, since that loop's own SF-exemption two lines up would
+    # otherwise wave a blank one through for PART too). PART gets it from
+    # Service First (field_source's natural classification); SERVICE never
+    # calls SF at all, so it's instead hand-keyed on the Vendor Code Entry
+    # menu - either way, a blank one is a genuine, one-off data problem for
+    # THIS invoice, not a template defect, so "source" is left as "Service
+    # First" rather than "PDF" even for SERVICE: processor.py's completeness
+    # gate routes a missing PDF-sourced field to NEW TEMPLATE (a training
+    # gap), and this must land on DATA MISMATCH instead.
+    if _is_blank(header.get("Pay-to Vendor No.")):
+        found.append({"field": "Pay-to Vendor No.", "sheet": "Purchase Header",
+                      "source": "Service First"})
     for line in lines:
         for f in _line_missing_fields(line, mapping, invoice_type):
             found.append({"field": f, "sheet": "Purchase Line",

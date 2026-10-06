@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { getUsers, createUser, setUserActive, adminResetPassword, adminChangeUserType } from "./api";
-import { DataTable, confirmDialog, PasswordInput } from "./components";
+import { getUsers, createUser, setUserActive, adminResetPassword, adminChangeUserType,
+         getUserLoginHistory } from "./api";
+import { DataTable, confirmDialog, PasswordInput, Modal } from "./components";
 
 // Fields stacked vertically instead of the shared ".row"'s default
 // side-by-side layout — scoped here so other pages that reuse ".row"
@@ -13,11 +14,10 @@ export default function UserManagement({ user }) {
   const [form, setForm] = useState({ username: "", email: "", user_type_id: "", password: "" });
   const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [assignPw, setAssignPw] = useState({ target_user_id: "", next: "", confirm: "" });
-  const [assignPwMsg, setAssignPwMsg] = useState(null);
-  const [assignPwBusy, setAssignPwBusy] = useState(false);
   const [typeEdits, setTypeEdits] = useState({});   // user_id -> pending selected type id
   const [typeBusyId, setTypeBusyId] = useState(null);
+  const [history, setHistory] = useState(null);   // {username, events} | null
+  const [historyLoading, setHistoryLoading] = useState(null);   // user id currently loading
 
   const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
 
@@ -95,12 +95,6 @@ export default function UserManagement({ user }) {
     return u.UserId !== user?.user_id && role !== "admin" && role !== "super admin";
   };
 
-  const assignableUsers = useMemo(
-    // A Super Admin can set a password for ANY user (Sadmin's own is fixed).
-    () => users.filter((u) => (isSuperAdmin ? u.UserName !== "Sadmin" : u.IsActive) && canAssignFor(u)),
-    [users, isSuperAdmin, user]
-  );
-
   // Same rule as canAssignFor, applied to the role being ASSIGNED rather
   // than who it's assigned to: an Admin may only hand out the plain
   // User/Accounts role - never promote someone to Admin/Super Admin.
@@ -122,59 +116,19 @@ export default function UserManagement({ user }) {
     finally { setTypeBusyId(null); }
   };
 
-  const onAssignPw = async (e) => {
-    e.preventDefault();
-    setAssignPwMsg(null);
-    if (assignPw.next !== assignPw.confirm) { setAssignPwMsg({ ok: false, text: "New passwords do not match." }); return; }
-    const target = users.find((u) => String(u.UserId) === String(assignPw.target_user_id));
-    setAssignPwBusy(true);
+  const openHistory = async (u) => {
+    setHistoryLoading(u.UserId);
     try {
-      const r = await adminResetPassword(user?.user_id, Number(assignPw.target_user_id), assignPw.next);
-      setAssignPwMsg({ ok: true, text: `Password updated for "${target?.UserName}".${emailNote(r)}` });
-      setAssignPw({ target_user_id: "", next: "", confirm: "" });
-    } catch (e) { setAssignPwMsg({ ok: false, text: e.message }); }
-    finally { setAssignPwBusy(false); }
+      const r = await getUserLoginHistory(u.UserId, user?.user_id);
+      setHistory({ username: u.UserName, events: r.events || [] });
+    } catch (e) { setMessage({ ok: false, text: e.message }); }
+    finally { setHistoryLoading(null); }
   };
 
   if (loading) return <div className="page"><div className="card">Loading…</div></div>;
 
   return (
     <div className="page">
-      <div className="card">
-        <h3>Change Password</h3>
-        <p className="hint">
-          Assign a new password for another user — {isSuperAdmin
-            ? "as Super Admin you can select any user."
-            : "you can select any User/Accounts account (not yourself, another Admin, or a Super Admin)."}
-          {isSuperAdmin ? " Any password is accepted for any user; it is emailed to them (if they have an email) and they must set their own on next login (a Viewer keeps it)."
-            : " The new password is emailed to them and they must set their own on next login."}
-        </p>
-        <form className="row" style={stackStyle} onSubmit={onAssignPw}>
-          <div className="field">
-            <label className="label">User</label>
-            <select value={assignPw.target_user_id}
-                    onChange={(e) => setAssignPw({ ...assignPw, target_user_id: e.target.value })}>
-              <option value="">Select a user…</option>
-              {assignableUsers.map((u) => (
-                <option key={u.UserId} value={u.UserId}>{u.UserName} ({u.UserTypeName})</option>
-              ))}
-            </select>
-          </div>
-          <div className="field">
-            <label className="label">New password</label>
-            <PasswordInput value={assignPw.next} onChange={(e) => setAssignPw({ ...assignPw, next: e.target.value })} placeholder="New password" />
-          </div>
-          <div className="field">
-            <label className="label">Confirm new password</label>
-            <PasswordInput value={assignPw.confirm} onChange={(e) => setAssignPw({ ...assignPw, confirm: e.target.value })} placeholder="Confirm new password" />
-          </div>
-          <button type="submit" className="btn btn-primary" disabled={assignPwBusy || !assignPw.target_user_id || !assignPw.next} style={{ alignSelf: "flex-start" }}>
-            {assignPwBusy ? "Saving…" : "Change password"}
-          </button>
-        </form>
-        {assignPwMsg && <div className={`alert ${assignPwMsg.ok ? "alert-success" : "alert-danger"}`}>{assignPwMsg.text}</div>}
-      </div>
-
       <div className="card">
         <h3>Add user</h3>
         <p className="hint">
@@ -284,10 +238,39 @@ export default function UserManagement({ user }) {
                       Reset password
                     </button>
                   )}
+                  {isSuperAdmin && (
+                    <button className="btn btn-sm btn-subtle" disabled={historyLoading === r._u.UserId}
+                            onClick={() => openHistory(r._u)}>
+                      {historyLoading === r._u.UserId ? "Loading…" : "History"}
+                    </button>
+                  )}
                 </div>
               );} },
           ]} />
       </div>
+
+      {history && (
+        <Modal title={`Login History — ${history.username}`} onClose={() => setHistory(null)} width={560}>
+          {history.events.length === 0 ? (
+            <div className="empty">No login/logout history recorded for this user yet.</div>
+          ) : (
+            <div className="timeline">
+              {history.events.map((ev) => (
+                <div key={ev.Id} className="timeline-item">
+                  <div className="timeline-dot" />
+                  <div className="timeline-content">
+                    <div className="timeline-header">
+                      <span className="timeline-action">{ev.Action || "Unknown"}</span>
+                      <span className="timeline-time">{ev.EventDatetime || "Unknown"}</span>
+                    </div>
+                    {ev.Detail && <div className="timeline-detail">{ev.Detail}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }

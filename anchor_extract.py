@@ -202,7 +202,8 @@ LABEL_WORDS = [
     # dispatch / delivery labels — these are field captions, never values,
     # so a blank "Buyer's Order No." must not swallow the next label below it.
     "despatch", "dispatch", "despatched", "dispatched", "document no",
-    "delivery note", "supplier's ref", "supplier ref", "e-way", "eway",
+    "delivery note", "delivery",  # bare "Delivery" (e.g. "Delivery Challan No.") - without this a wrapped "Dated" label with nothing to its own right falls through to the NEXT row and this word gets taken as the date value instead of being recognized as a different field's own label
+    "supplier's ref", "supplier ref", "e-way", "eway",
     "other reference", "reference no",
     # GST e-Invoice QR-code block (IRN/Ack No./Ack Date caption) sits above
     # the seller's letterhead on this layout — without these, "IRN : <64-
@@ -944,6 +945,16 @@ def extract(header_rows, footer_rows, page_width):
                         rows, ri, anchor, offset,
                         reject=_is_bare_date if field == "Invoice No." else None,
                     )
+                    # A wrapped "Invoice Date/Time" label (split into
+                    # separate "Date" and "/Time" tokens) leaves "/Time" as
+                    # a leading fragment in the same-row value scan, glued
+                    # onto the front of the real date ("/Time 24/09/2026
+                    # 18:06:15") - prefer just the date-shaped substring
+                    # over the raw joined text whenever one is present.
+                    if field == "Dated" and val:
+                        m = DATE_RE.search(val)
+                        if m:
+                            val = m.group(0)
                     if val and not (field == "Invoice No." and _is_bare_date(val)):
                         fields[field] = val
                         right_field_rows.add(ri)
@@ -969,6 +980,20 @@ def extract(header_rows, footer_rows, page_width):
             m = re.match(r"^invoice\s+(\S.*)$", text, re.IGNORECASE)
             if m and not DATE_RE.fullmatch(m.group(1).strip()):
                 fields["Invoice No."] = _clean_value(m.group(1))
+                break
+
+    # Dated fallback for the same isolated Invoice Details column - the
+    # mirror image of the Invoice No. fallback just above. Here "Invoice"'s
+    # own row IS the bare date ("Invoice 23-09-2026" / "Date:" wrapped onto
+    # the next row alone, immediately followed by an unrelated "Delivery
+    # ..." row) - deliberately the DATE_RE.fullmatch case the Invoice No.
+    # fallback above rejects, since that's exactly what tells the two apart.
+    if "Dated" not in fields and three_col is not None:
+        for row in detail_rows:
+            text = _row_text(row)
+            m = re.match(r"^invoice\s+(\S.*)$", text, re.IGNORECASE)
+            if m and DATE_RE.fullmatch(m.group(1).strip()):
+                fields["Dated"] = _clean_value(m.group(1))
                 break
 
     # Dated fallback: some layouts print the document date right next to

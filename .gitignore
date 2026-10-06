@@ -32,3 +32,9 @@ Thumbs.db
 
 # Local Claude Code tooling (not part of the application)
 .claude/
+
+# Local scratch/diagnostic scripts and their sample test data - never commit
+clean_db.py
+check_all_vendor.py
+check_full_sample_input.py
+sample_input/

@@ -89,10 +89,10 @@ export const getVersion = () => request("/api/version");
 
 export const getConfig = () => request("/api/config");
 
-export const saveConfig = (folderPath) =>
+export const saveConfig = (folderPath, userId) =>
   request("/api/config", {
     method: "POST",
-    body: JSON.stringify({ folder_path: folderPath }),
+    body: JSON.stringify({ folder_path: folderPath, user_id: userId }),
   });
 
 export const setScannedPdfsEnabled = (enabled, invoiceType, user_id) =>
@@ -103,11 +103,14 @@ export const setScannedPdfsEnabled = (enabled, invoiceType, user_id) =>
 
 export const getApiConfig = () => request("/api/api-config");
 
-export const saveApiConfig = (sfApiUrl) =>
+export const saveApiConfig = (sfApiUrl, userId) =>
   request("/api/api-config", {
     method: "POST",
-    body: JSON.stringify({ sf_api_url: sfApiUrl }),
+    body: JSON.stringify({ sf_api_url: sfApiUrl, user_id: userId }),
   });
+
+export const getConfigHistory = (kind, userId) =>
+  request(`/api/config/history?kind=${encodeURIComponent(kind)}&user_id=${encodeURIComponent(userId)}`);
 
 export const getStatusCounts = () => request("/api/stats/status-counts");
 
@@ -120,8 +123,13 @@ export const getInvoicesByBatch = (batch) =>
 export const getInvoiceFieldCheck = (headerId) =>
   request(`/api/invoices/${encodeURIComponent(headerId)}/fields`);
 
+export const getInvoiceDetails = (headerId) =>
+  request(`/api/invoices/${encodeURIComponent(headerId)}/details`);
+
 export const searchInvoices = (q) =>
   request(`/api/invoices/search?q=${encodeURIComponent(q)}`);
+
+export const getCompletedInvoices = () => request("/api/invoices/completed");
 
 export const getInvoiceHistory = (headerId) =>
   request(`/api/invoices/${encodeURIComponent(headerId)}/history`);
@@ -262,6 +270,34 @@ export const downloadBatchFile = async (batch, docNo, entryNo) => {
   return { blob, filename: match ? match[1] : `${batch}.xlsx` };
 };
 
+// Super Admin only - who/when downloaded this batch, and the Document
+// No./Entry No. each download produced.
+export const getBatchHistory = (batch, userId) =>
+  request(`/api/batches/history?batch=${encodeURIComponent(batch)}&user_id=${encodeURIComponent(userId)}`);
+
+// Super Admin only - exports a batch's EXISTING data (no minting, no
+// locking, no marking downloaded - see app.py's export_batch).
+export const batchExportUrl = (batch, userId) =>
+  withToken(`${API_BASE}/api/batches/export?batch=${encodeURIComponent(batch)}&user_id=${encodeURIComponent(userId)}`);
+
+export const exportBatchFile = async (batch, userId) => {
+  let res;
+  try {
+    res = await fetch(batchExportUrl(batch, userId), { headers: authHeaders() });
+  } catch {
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
+  if (!res.ok) {
+    endSessionIfExpired(res, !!getToken());
+    throw new Error(await errorMessageFor(res));
+  }
+
+  const blob = await res.blob();
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  return { blob, filename: match ? match[1] : `${batch}_export.xlsx` };
+};
+
 export const getFormats = () => request("/api/formats");
 
 export const getMapping = () => request("/api/mapping");
@@ -294,6 +330,15 @@ export const deleteTemplate = (key, user_id) =>
     body: JSON.stringify({ key, user_id }),
   });
 
+export const activateTemplate = (key, user_id) =>
+  request("/api/templates/activate", {
+    method: "POST",
+    body: JSON.stringify({ key, user_id }),
+  });
+
+export const getTemplateHistory = (key) =>
+  request(`/api/templates/history?key=${encodeURIComponent(key)}`);
+
 export const login = async (username, password) => {
   const user = await request("/api/login", {
     method: "POST",
@@ -318,6 +363,9 @@ export const changePassword = (user_id, current_password, new_password) =>
   });
 
 export const getUsers = () => request("/api/users");
+
+export const getUserLoginHistory = (targetUserId, callerUserId) =>
+  request(`/api/users/${encodeURIComponent(targetUserId)}/login-history?user_id=${encodeURIComponent(callerUserId)}`);
 
 // Sign out on the server too (stamps the logout time, cancels the token).
 export const logoutSession = () => request("/api/logout", { method: "POST", body: "{}" });

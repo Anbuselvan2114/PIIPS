@@ -807,9 +807,21 @@ class JobManager:
                                 # code has no automatic source either — it's
                                 # hand-written onto the scanned PDF instead
                                 # (see anchor_extract.py's "Vendor Code"
-                                # field) and, like a missing Buyer Order No.
-                                # on a PART invoice, parks the invoice in its
-                                # own manual-entry workflow when absent.
+                                # field) and parks the invoice in its own
+                                # manual-entry workflow (Vendor Code Entry)
+                                # when absent, same idea as a missing Buyer
+                                # Order No. on a PART invoice - but folded
+                                # into the ordinary DATA MISMATCH status
+                                # (no separate "NAV VENDOR CODE DOESN'T
+                                # EXIST" status) so it's counted/listed
+                                # alongside every other DATA MISMATCH
+                                # invoice rather than its own bucket. The
+                                # Vendor Code Entry menu itself still finds
+                                # it the same as before — see
+                                # database.invoices_vendor_code_missing,
+                                # which now matches on the blank vendor code
+                                # column directly instead of this status
+                                # name.
                                 # A garbled handwritten reading (see
                                 # vendor_code.py) is filled in with its best
                                 # guess but flagged doubtful - park it in the
@@ -817,11 +829,11 @@ class JobManager:
                                 # code so a user can confirm it, same as a
                                 # doubtful SPRPUR PO does for PART.
                                 if not str(data.get("Nav_VendorCode") or "").strip():
-                                    verdict = {"status": "NAV VENDOR CODE DOESN'T EXIST",
+                                    verdict = {"status": "DATA MISMATCH",
                                                "is_active": False, "is_synced": False,
                                                "reason": "Nav vendor code is empty in pdf"}
                                 elif data.get("vendor_code_doubtful"):
-                                    verdict = {"status": "NAV VENDOR CODE DOESN'T EXIST",
+                                    verdict = {"status": "DATA MISMATCH",
                                                "is_active": False, "is_synced": False,
                                                "reason": "Nav vendor code format is doubtful — please verify"}
                                 else:
@@ -1299,12 +1311,18 @@ class JobManager:
             # BUYER ORDER NO DOESN'T EXIST (that one has its own manual-entry
             # workflow — Buyer Order Entry — and can't have real Reservation
             # Entry data without a PO to look up in SF in the first place),
-            # NAV VENDOR CODE DOESN'T EXIST (same idea for SERVICE — its own
-            # manual-entry workflow, Vendor Code Entry),
             # NEW TEMPLATE (unrecognized format — nothing to check until
             # it's trained), and DUPLICATE (already-processed invoice,
             # parked purely for visibility - its own data completeness is
-            # irrelevant, the real copy elsewhere is what matters):
+            # irrelevant, the real copy elsewhere is what matters).
+            # A SERVICE invoice with a missing/doubtful NAV vendor code is
+            # NOT excluded here (it's set to the ordinary DATA MISMATCH
+            # status above, not its own status) - it still DOES park
+            # correctly, because missing_required_fields() checks that
+            # field specifically for SERVICE and keeps it non-"READY TO
+            # LOAD" below; its manual-entry workflow is still Vendor Code
+            # Entry (database.invoices_vendor_code_missing), just found by
+            # the blank column now instead of a dedicated status name:
             #   - all mandatory Header/Line/Reservation fields filled ->
             #     READY TO LOAD, regardless of what Service First said
             #     (PENDING IN SF / DATA MISMATCH verdicts are provisional,
@@ -1332,8 +1350,7 @@ class JobManager:
             field_mapping = excel_export.load_mapping()
             for i, group in enumerate(grouped["groups"]):
                 if tracker["statuses"][i] in (
-                    "BUYER ORDER NO DOESN'T EXIST", "NAV VENDOR CODE DOESN'T EXIST",
-                    "NEW TEMPLATE", "DUPLICATE",
+                    "BUYER ORDER NO DOESN'T EXIST", "NEW TEMPLATE", "DUPLICATE",
                 ):
                     continue
                 # InvoiceNo is a mandatory column but lives outside the
