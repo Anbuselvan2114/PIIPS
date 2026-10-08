@@ -469,11 +469,14 @@ def update_config(payload: ConfigModel):
         updates["sf_api_url"] = payload.sf_api_url.strip()
     config = config_store.save_config(updates)
 
-    if folder_path != old_folder_path:
-        import database
-        database.log_event(
-            "FOLDER_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
-            detail=f"Folder Path: '{old_folder_path or '(none)'}' -> '{folder_path}'")
+    # Logged on every save, even one that re-enters the same value - a
+    # Super Admin re-confirming the current setting is itself worth a
+    # History entry, same as Database Configuration's own save (which has
+    # never guarded on "did it actually change" either).
+    import database
+    database.log_event(
+        "FOLDER_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
+        detail=f"Folder Path: '{old_folder_path or '(none)'}' -> '{folder_path}'")
 
     # Create Input / New_Format (and Trained_format) under the Folder Path.
     folders = config_store.folders(create=True)
@@ -522,11 +525,12 @@ def save_api_config(payload: ApiConfigModel):
     url = (payload.sf_api_url or "").strip()
     old_url = (config_store.load_config().get("sf_api_url") or "").strip()
     config_store.save_config({"sf_api_url": url})
-    if url != old_url:
-        import database
-        database.log_event(
-            "API_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
-            detail=f"Service First API URL: '{old_url or '(none)'}' -> '{url or '(none)'}'")
+    # Logged on every save, even one that re-enters the same value - same
+    # reasoning as Folder Configuration's own save just above.
+    import database
+    database.log_event(
+        "API_CONFIG_CHANGED", entity="CONFIG", user_id=payload.user_id,
+        detail=f"Service First API URL: '{old_url or '(none)'}' -> '{url or '(none)'}'")
     return {"sf_api_url": url}
 
 
@@ -1361,6 +1365,94 @@ def invoices_set_buyer_order(payload: BuyerOrderModel):
             "moved_to": moved}
 
 
+class MarkNewTemplateModel(BaseModel):
+    header_id: int
+    user_id: Optional[int] = None
+
+
+@app.post("/api/invoices/mark-new-template")
+def invoices_mark_new_template(payload: MarkNewTemplateModel):
+    """Super Admin only: for a row genuinely stuck at 'BUYER ORDER NO
+    DOESN'T EXIST' because the invoice's own format/layout is bad or
+    untrained (not just a missing PO) - move it to NEW TEMPLATE instead,
+    same as if the first processing run had failed to recognize its
+    format. Moves the PDF to the NEW TEMPLATE status folder AND copies it
+    into the New_Format training folder, so it's immediately available the
+    next time someone runs Model Training - see database.mark_as_new_
+    template / config_store.folders()['new_format']."""
+    import database
+    _require_developer(payload.user_id)
+    try:
+        res = database.mark_as_new_template(payload.header_id, payload.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not res:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    moved = ""
+    copied_for_training = False
+    if res.get("file_name"):
+        try:
+            moved = config_store.move_pdf_to_status(res["file_name"], res["new_status"])
+        except Exception:  # noqa: BLE001 - file move is best-effort
+            import traceback
+            traceback.print_exc()
+        if moved:
+            try:
+                import shutil
+                folders = config_store.folders()
+                if folders.get("new_format"):
+                    shutil.copy2(moved, folders["new_format"])
+                    copied_for_training = True
+            except Exception:  # noqa: BLE001 - training-copy is best-effort
+                import traceback
+                traceback.print_exc()
+    return {"ok": True, "new_status": res.get("new_status"),
+            "moved_to": moved, "copied_for_training": copied_for_training}
+
+
+class RevertNewTemplateModel(BaseModel):
+    header_id: int
+    user_id: Optional[int] = None
+
+
+@app.post("/api/invoices/revert-new-template")
+def invoices_revert_new_template(payload: RevertNewTemplateModel):
+    """Super Admin only: undo invoices_mark_new_template - moves the
+    invoice back to whatever status it was marked FROM (see database.
+    revert_new_template), relocates the PDF back to that status's folder,
+    and removes the copy that was placed in the New_Format training
+    folder (best-effort - if a future Training run already consumed/moved
+    it, there's nothing left to remove)."""
+    import database
+    _require_developer(payload.user_id)
+    try:
+        res = database.revert_new_template(payload.header_id, payload.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not res:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    moved = ""
+    if res.get("file_name") and res.get("new_status"):
+        try:
+            moved = config_store.move_pdf_to_status(res["file_name"], res["new_status"])
+        except Exception:  # noqa: BLE001 - file move is best-effort
+            import traceback
+            traceback.print_exc()
+        try:
+            folders = config_store.folders()
+            stray = os.path.join(folders.get("new_format", ""), os.path.basename(res["file_name"]))
+            if folders.get("new_format") and os.path.isfile(stray):
+                os.remove(stray)
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            import traceback
+            traceback.print_exc()
+    return {"ok": True, "new_status": res.get("new_status"), "moved_to": moved}
+
+
 class VendorCodeModel(BaseModel):
     header_id: int
     vendor_code: str
@@ -1785,12 +1877,14 @@ def batch_history(batch: str, user_id: Optional[int] = None):
 @app.get("/api/batches/export")
 def export_batch(batch: str, user_id: Optional[int] = None):
     """Super Admin only: export a batch's EXISTING data to Excel exactly as
-    currently persisted - every header regardless of status, and every
-    Document No./Entry No. exactly as already stored (blank if the batch
-    was never downloaded). Unlike /api/batches/download, this never mints a
-    number, never locks/unlocks anything, and never marks the batch
-    downloaded - a pure read, no write of any kind (see
-    database.fetch_batch_readonly)."""
+    currently persisted - every header regardless of status (Loaded/
+    Posted/Completed/Data Mismatch/Buyer Order No Doesn't Exist/...)
+    EXCEPT Excluded and New Template, which are left out entirely (see
+    database.fetch_batch_readonly) - and every Document No./Entry No.
+    exactly as already stored (blank if the batch was never downloaded).
+    Unlike /api/batches/download, this never mints a number, never locks/
+    unlocks anything, and never marks the batch downloaded - a pure read,
+    no write of any kind."""
     import database
     import excel_export
     import tempfile
@@ -1818,6 +1912,79 @@ def export_batch(batch: str, user_id: Optional[int] = None):
         filename=f"{safe}_export.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# ==========================================================================
+# Reports menu (Super Admin only) - each report is a parameterless stored
+# procedure (see database.REPORTS/run_report); this file never knows a
+# report's own columns, just runs whichever one was asked for and hands
+# back/exports its result generically.
+# ==========================================================================
+
+@app.get("/api/reports")
+def list_reports(user_id: Optional[int] = None):
+    """Super Admin only: the Reports menu's list screen - every registered
+    report's key/name/description, nothing else."""
+    _require_developer(user_id)
+    import database
+    return {"reports": database.list_reports()}
+
+
+def _run_report_or_404(key):
+    import database
+    try:
+        result = database.run_report(key)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Unknown report '{key}'")
+    return result
+
+
+@app.get("/api/reports/{key}/run")
+def run_report(key: str, user_id: Optional[int] = None):
+    """Super Admin only: one report's result, generically - {columns, rows}
+    straight off its stored procedure (see database.run_report)."""
+    _require_developer(user_id)
+    return _run_report_or_404(key)
+
+
+@app.get("/api/reports/{key}/export/excel")
+def export_report_excel(key: str, user_id: Optional[int] = None):
+    """Super Admin only: the same report result as /run, as an .xlsx."""
+    import database
+    import excel_export
+    import tempfile
+
+    _require_developer(user_id)
+    result = _run_report_or_404(key)
+    name = database.REPORTS[key]["name"]
+    safe = "".join(c for c in key if c.isalnum() or c in ("-", "_")) or "report"
+    out_path = os.path.join(tempfile.gettempdir(), f"{safe}.xlsx")
+    excel_export.write_report_rows_workbook(result["columns"], result["rows"], out_path, name)
+
+    return FileResponse(
+        out_path,
+        filename=f"{safe}.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.get("/api/reports/{key}/export/pdf")
+def export_report_pdf(key: str, user_id: Optional[int] = None):
+    """Super Admin only: the same report result as /run, as a .pdf."""
+    import database
+    import report_pdf
+    import tempfile
+
+    _require_developer(user_id)
+    result = _run_report_or_404(key)
+    name = database.REPORTS[key]["name"]
+    safe = "".join(c for c in key if c.isalnum() or c in ("-", "_")) or "report"
+    out_path = os.path.join(tempfile.gettempdir(), f"{safe}.pdf")
+    report_pdf.write_report_pdf(result["columns"], result["rows"], out_path, name)
+
+    return FileResponse(out_path, filename=f"{safe}.pdf", media_type="application/pdf")
 
 
 # ==========================================================================
