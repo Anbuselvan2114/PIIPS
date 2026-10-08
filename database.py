@@ -655,6 +655,61 @@ def status_counts():
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Reports menu (Super Admin only - see app.py's _require_developer gate on
+# every /api/reports endpoint). Each entry's "proc" is a stored procedure in
+# _MENU_PROC_DDL that takes no parameters and returns exactly one result
+# set - the report's shape is read generically off cursor.description at run
+# time (run_report), never hardcoded here, so a new report only ever needs a
+# new dict entry plus its own proc, nothing else in this module to touch.
+REPORTS = {
+    "batch_loaded_posted": {
+        "name": "Batch Loaded vs Posted Timing",
+        "description": "For every batch that has reached Loaded or further: "
+                        "when it was loaded, its first and last Posted "
+                        "invoice, and the day-spread between them.",
+        "proc": "usp_Report_BatchLoadedPosted",
+    },
+    "invoice_stage_sla": {
+        "name": "Invoice Stage-wise SLA",
+        "description": "One row per invoice (not per batch): the date it "
+                        "reached each lifecycle stage - Created, Loaded, "
+                        "Posted, Completed - and how many days it took to "
+                        "move from each stage to the next.",
+        "proc": "usp_Report_InvoiceStageSLA",
+    },
+}
+
+
+def list_reports():
+    """[{"key", "name", "description"}] for the Reports menu's list screen.
+    Sample: list_reports()"""
+    return [{"key": k, "name": v["name"], "description": v["description"]}
+            for k, v in REPORTS.items()]
+
+
+def run_report(key):
+    """Execute a registered report's stored procedure and return its result
+    generically: {"columns": [...], "rows": [[...], ...]} - column names and
+    row shape come straight off cursor.description/fetchall, never assumed
+    ahead of time, so this one function serves every report in REPORTS.
+    Returns None if `key` isn't a registered report (caller should 404).
+    Sample: run_report('batch_loaded_posted')"""
+    report = REPORTS.get(key)
+    if not report:
+        return None
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"EXEC dbo.{report['proc']}")
+        columns = [d[0] for d in cur.description]
+        rows = [list(r) for r in cur.fetchall()]
+        return {"columns": columns, "rows": rows}
+    finally:
+        conn.close()
+
+
 def log_input_files(files, initiated_by=None):
     """Record uploaded files (who copied them in File Explorer) with status
     'initiated'. `files` is a list of {"RelPath":.., "FileName":..}. Bulk
@@ -1054,7 +1109,11 @@ def list_batches():
     be downloaded at all; batches must download in order so a later
     batch's Document Nos. never get ahead of an earlier one still pending).
     Sample: list_batches()
-    Returns [{batch, created, headers, exportable, counts, batch_status, locked, blocked_by}]."""
+    Returns [{batch, created, headers, exportable, counts, batch_status, locked,
+    blocked_by, doc_no_first, doc_no_last, entry_no_first, entry_no_last}] - the
+    last four are the actual minted Document No./Entry No. range across the
+    batch's invoices (None if nothing's been minted yet, e.g. still at Ready
+    to Load)."""
     ensure_menu_schema()
     # tbl_BatchDownload's LastDocNo/LastEntryNo columns (below) are added by
     # this same migration that mark_batch_downloaded/get_batch_download_
@@ -1108,6 +1167,45 @@ def list_batches():
                 *order)
             reincluded = {r[0] for r in cur.fetchall()}
 
+        # First/last Document No. / Entry No. actually minted for each batch
+        # - shown on the Dashboard once a batch is past Ready to Load (no
+        # longer has its own editable override box, see Dashboard.jsx), so a
+        # Super Admin can see the real range without opening History. "No."
+        # only exists once the field mapping has produced it (same guard
+        # every other header-column query uses); Document No. sorts
+        # correctly as a plain string since every mint is the same fixed-
+        # width zero-padded prefix (see _assign_document_numbers) - MIN/MAX
+        # need no numeric parsing here, only the frontend's own display
+        # strips the prefix.
+        doc_no_range = {}
+        if order and _hdr_col(cur, "No."):
+            placeholders = ", ".join("?" for _ in order)
+            cur.execute(
+                f"SELECT pt.BatchName, MIN(h.[No.]), MAX(h.[No.]) "
+                f"FROM dbo.tbl_Purchase_Tracker pt "
+                f"JOIN dbo.tbl_Purchase_Header h ON h.Id = pt.Purchase_Header_ID "
+                f"WHERE pt.BatchName IN ({placeholders}) AND h.[No.] IS NOT NULL AND h.[No.] <> '' "
+                f"GROUP BY pt.BatchName",
+                *order)
+            doc_no_range = {bn: (first, last) for bn, first, last in cur.fetchall()}
+
+        # Entry No. is a plain integer (no prefix) minted onto every
+        # Reservation Entry row of the batch (see _mint_entry_numbers) - cast
+        # for a numeric MIN/MAX rather than a string one, which would sort
+        # "10" before "9".
+        entry_no_range = {}
+        if order and _table_exists(cur, "tbl_Reservation_Entry"):
+            placeholders = ", ".join("?" for _ in order)
+            cur.execute(
+                f"SELECT pt.BatchName, MIN(TRY_CAST(r.[Entry No.] AS INT)), "
+                f"       MAX(TRY_CAST(r.[Entry No.] AS INT)) "
+                f"FROM dbo.tbl_Purchase_Tracker pt "
+                f"JOIN dbo.tbl_Reservation_Entry r ON r.Purchase_Header_ID = pt.Purchase_Header_ID "
+                f"WHERE pt.BatchName IN ({placeholders}) AND r.[Entry No.] IS NOT NULL AND r.[Entry No.] <> '' "
+                f"GROUP BY pt.BatchName",
+                *order)
+            entry_no_range = {bn: (first, last) for bn, first, last in cur.fetchall()}
+
         for batch in order:
             row = by_batch[batch]
             row["batch_status"], row["locked"] = _batch_status_and_lock(
@@ -1115,6 +1213,8 @@ def list_batches():
             last_doc_no, last_entry_no = last_numbers.get(batch, (None, None))
             row["last_doc_no"] = last_doc_no
             row["last_entry_no"] = last_entry_no
+            row["doc_no_first"], row["doc_no_last"] = doc_no_range.get(batch, (None, None))
+            row["entry_no_first"], row["entry_no_last"] = entry_no_range.get(batch, (None, None))
 
         # `order` is BatchName DESC (newest first), so everything AFTER a
         # batch in this list was created BEFORE it - exactly the "earlier
@@ -1186,23 +1286,27 @@ def mark_batch_downloaded(batch_name, user_id=None, doc_no=None, entry_no=None):
 
 
 def get_batch_download_history(batch_name, limit=200):
-    """Who/when downloaded this batch's Excel, and what Document No./Entry
-    No. that download used - the Dashboard's per-batch History button
-    (Super Admin only). Reads tbl_Audit_Event WHERE Entity='BATCH' AND
-    Action='BATCH_DOWNLOADED' AND BatchName=batch_name - every download
-    already gets its own row there (see mark_batch_downloaded), so this
-    is a plain filtered read, no new table.
+    """Who/when created this batch (BATCH_PROCESSED, logged once per batch
+    by the processing run itself) and every subsequent download it's had
+    (BATCH_DOWNLOADED, with whatever Document No./Entry No. that download
+    used) - the Dashboard's per-batch History button (Super Admin only).
+    A batch that's never been downloaded still shows its own creation
+    event here instead of an empty list - BATCH_PROCESSED was always being
+    logged (see processor.py's batch-finish step), this just wasn't
+    reading it back. Reads tbl_Audit_Event WHERE Entity='BATCH' AND
+    BatchName=batch_name, newest first.
     Sample: get_batch_download_history('PIIPS_Batch_20260722_101500')"""
     ensure_audit_table()
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT a.Id, a.EventDatetime, a.Detail, u.UserName "
+            "SELECT a.Id, a.EventDatetime, a.Action, a.Detail, u.UserName "
             "FROM dbo.tbl_Audit_Event a LEFT JOIN dbo.tbl_User u ON u.UserId = a.UserId "
-            "WHERE a.Entity = 'BATCH' AND a.Action = 'BATCH_DOWNLOADED' AND a.BatchName = ? "
+            "WHERE a.Entity = 'BATCH' AND a.Action IN ('BATCH_PROCESSED', 'BATCH_DOWNLOADED') "
+            "AND a.BatchName = ? "
             "ORDER BY a.EventDatetime DESC", batch_name)
-        cols = ["Id", "EventDatetime", "Detail", "UserName"]
+        cols = ["Id", "EventDatetime", "Action", "Detail", "UserName"]
         out = [dict(zip(cols, r)) for r in cur.fetchall()][:limit]
         for row in out:
             row["EventDatetime"] = row["EventDatetime"].strftime("%d-%m-%Y %H:%M:%S") if row["EventDatetime"] else ""
@@ -1818,14 +1922,19 @@ def fetch_batch(batch_name, sheet_cols):
 def fetch_batch_readonly(batch_name, sheet_cols):
     """Read a batch's rows from the 3 tables, EXACTLY as currently persisted
     - a pure export, with none of fetch_batch()'s side effects: no [No.]/
-    [Entry No.] minting, no status/IsActive/IsExcluded filtering (every
-    header in the batch comes back, whatever its current stage), and no
-    write of any kind. Same {sheet: {columns, rows}} shape as fetch_batch,
-    ready for excel_export.build_workbook_from_sheets - for the Dashboard's
-    Super-Admin-only "just download the batch's existing data" button
-    (app.py's /api/batches/export), which is deliberately NOT the same
-    action as a real batch download (fetch_batch): nothing here ever mints
-    a number, locks anything, or marks the batch downloaded.
+    [Entry No.] minting, no status-progression/IsActive filtering (a
+    Loaded/Posted/Completed/Ready To Load/Data Mismatch/Buyer Order No
+    Doesn't Exist header all come back whatever its current stage), and no
+    write of any kind. EXCLUDED and NEW TEMPLATE headers are still left out
+    though (see usp_FetchBatchAll's own @idset) - an Excluded invoice is
+    deliberately not meant to be exported at all, and a New Template row
+    has nothing trustworthy extracted to export in the first place. Same
+    {sheet: {columns, rows}} shape as fetch_batch, ready for excel_export.
+    build_workbook_from_sheets - for the Dashboard's Super-Admin-only "just
+    download the batch's existing data" button (app.py's /api/batches/
+    export), which is deliberately NOT the same action as a real batch
+    download (fetch_batch): nothing here ever mints a number, locks
+    anything, or marks the batch downloaded.
     Sample: fetch_batch_readonly('PIIPS_Batch_20260722_101500', {'Purchase Header': ['InvoiceNo'], 'Purchase Line': ['Description'], 'Reservation Entry': ['Serial No.']})
     """
     ensure_menu_schema()
@@ -2232,15 +2341,16 @@ def invoices_vendor_code_missing():
 # a one-time seed, not read on every request, so a stale key here only
 # matters for a brand new deployment's first run.
 _ROLE_MENU_DEFAULTS = {
-    "admin": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate",
+    "admin": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "partdescupdate",
               "load", "post", "complete",
               "configuration", "apiconfig", "template", "createfield", "users"],
-    # NAV Vendor Code Entry is deliberately not listed for any role here -
-    # access removed menu-wide (still reachable by Super Admin/Developer,
-    # which always sees every menu regardless of this table).
-    "user": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load"],
-    "accounts": ["dashboard", "input", "manual", "invoicesearch", "completedinvoices", "post", "complete"],
-    "viewer": ["dashboard", "input", "invoicesearch", "completedinvoices", "buyerorder", "partdescupdate", "load", "post", "complete"],
+    # NAV Vendor Code Entry and Completed Invoices are deliberately not
+    # listed for any role here - access removed menu-wide (still reachable
+    # by Super Admin/Developer, which always sees every menu regardless of
+    # this table).
+    "user": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "partdescupdate", "load"],
+    "accounts": ["dashboard", "input", "manual", "invoicesearch", "post", "complete"],
+    "viewer": ["dashboard", "input", "invoicesearch", "buyerorder", "partdescupdate", "load", "post", "complete"],
 }
 
 
@@ -3863,6 +3973,134 @@ def set_excluded(header_id, exclude, user_id=None):
         conn.close()
 
 
+# Statuses this escape hatch is reachable from - one row-level button on
+# each of these two popups (Dashboard's status breakdown), nowhere else.
+# Both are early-pipeline, non-terminal, IsActive=0 statuses - see
+# mark_as_new_template's own docstring for why no batch-lock check is
+# needed either way.
+_NEW_TEMPLATE_ELIGIBLE_STATUSES = ("BUYER ORDER NO DOESN'T EXIST", "DATA MISMATCH")
+
+
+def mark_as_new_template(header_id, user_id=None):
+    """One-way escape hatch for a row parked at 'BUYER ORDER NO DOESN'T
+    EXIST' or 'DATA MISMATCH': sometimes the real problem isn't a missing
+    PO/field at all, it's that the invoice's own layout/format is bad or
+    was never trained - no amount of typing a PO or fixing one field fixes
+    that. This instead parks it at NEW TEMPLATE, same as if the very first
+    processing run had failed to recognize its format (see processor.py's
+    "new_format" verdict) - so it surfaces for retraining instead of
+    sitting stuck here forever. Returns {file_name, new_status} so the
+    caller can relocate the PDF (config_store.move_pdf_to_status) AND copy
+    it into the New_Format training folder, exactly as app.py's endpoint
+    for this does.
+
+    Deliberately only allowed FROM one of _NEW_TEMPLATE_ELIGIBLE_STATUSES,
+    AND only while this invoice's own batch is still CREATED (not yet
+    Downloaded/In Progress/Loaded/...) - this isn't a generic status
+    override, just the one row-level button on those two popups, offered
+    only early, before the batch has started moving. Remembers the status
+    it came from in NewTemplateFromStatusID, so revert_new_template can
+    undo this exact step later.
+    Sample: mark_as_new_template(42, 7)"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT pt.StatusID, pt.FileName, s.StatusName, pt.BatchName "
+            "FROM dbo.tbl_Purchase_Tracker pt "
+            "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+            "WHERE pt.Purchase_Header_ID = ?", header_id)
+        row = cur.fetchone()
+        if not row:
+            return None
+        own_status_id, file_name, own_status, batch_name = row[0], row[1], (row[2] or ""), row[3]
+        if own_status.upper() not in _NEW_TEMPLATE_ELIGIBLE_STATUSES:
+            raise ValueError(
+                f"This invoice is no longer at a status this applies to (now '{own_status}') "
+                "— refresh the list."
+            )
+        if batch_name and _current_batch_status(cur, batch_name) != "CREATED":
+            raise ValueError(
+                f"Can't mark this invoice as New Template — its batch '{batch_name}' "
+                "has already moved past Created."
+            )
+        cur.execute(
+            "UPDATE dbo.tbl_Purchase_Tracker "
+            "SET StatusID = (SELECT StatusId FROM dbo.tbl_status WHERE StatusName = 'NEW TEMPLATE'), "
+            "    NewTemplateFromStatusID = ?, "
+            "    LastModifiedById = ?, LastModifiedDatetime = GETDATE() "
+            "WHERE Purchase_Header_ID = ?", own_status_id, user_id, header_id)
+        conn.commit()
+        log_event("MARKED_NEW_TEMPLATE", header_id=header_id, user_id=user_id,
+                  from_status=own_status, to_status="NEW TEMPLATE",
+                  detail=f"Marked as New Template from {own_status.title()}")
+        return {"file_name": file_name, "new_status": "NEW TEMPLATE"}
+    finally:
+        conn.close()
+
+
+def revert_new_template(header_id, user_id=None):
+    """Super Admin undo for mark_as_new_template: moves an invoice back
+    from NEW TEMPLATE to whatever status it was marked FROM (currently
+    always 'BUYER ORDER NO DOESN'T EXIST' - see NewTemplateFromStatusID,
+    set only by mark_as_new_template). Returns {file_name, new_status} so
+    the caller can move the PDF back to that status's folder.
+
+    Refuses (ValueError) if the invoice isn't at NEW TEMPLATE any more, if
+    NewTemplateFromStatusID is NULL - the latter means this row reached
+    NEW TEMPLATE the ordinary way (an unrecognized format straight off
+    first processing, see processor.py's "new_format" verdict), never via
+    this button, so there's no 'previous stage' to revert to at all - or
+    if this invoice's own batch has moved past CREATED in the meantime
+    (some other invoice in the same batch could have advanced while this
+    one sat parked at New Template).
+    Sample: revert_new_template(42, 7)"""
+    ensure_menu_schema()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT pt.FileName, s.StatusName, pt.NewTemplateFromStatusID, ps.StatusName, pt.BatchName "
+            "FROM dbo.tbl_Purchase_Tracker pt "
+            "LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID "
+            "LEFT JOIN dbo.tbl_status ps ON ps.StatusId = pt.NewTemplateFromStatusID "
+            "WHERE pt.Purchase_Header_ID = ?", header_id)
+        row = cur.fetchone()
+        if not row:
+            return None
+        file_name, own_status, prior_status_id, prior_status, batch_name = row
+        own_status = own_status or ""
+        if own_status.upper() != "NEW TEMPLATE":
+            raise ValueError(
+                f"This invoice is no longer at 'New Template' (now '{own_status}') "
+                "— refresh the list."
+            )
+        if not prior_status_id:
+            raise ValueError(
+                "No previous status recorded for this invoice — it reached New "
+                "Template from unrecognized-format processing, not from a revert-"
+                "able 'Mark as New Template' action."
+            )
+        if batch_name and _current_batch_status(cur, batch_name) != "CREATED":
+            raise ValueError(
+                f"Can't revert this invoice — its batch '{batch_name}' has "
+                "already moved past Created."
+            )
+        cur.execute(
+            "UPDATE dbo.tbl_Purchase_Tracker "
+            "SET StatusID = NewTemplateFromStatusID, NewTemplateFromStatusID = NULL, "
+            "    LastModifiedById = ?, LastModifiedDatetime = GETDATE() "
+            "WHERE Purchase_Header_ID = ?", user_id, header_id)
+        conn.commit()
+        log_event("REVERTED_NEW_TEMPLATE", header_id=header_id, user_id=user_id,
+                  from_status="NEW TEMPLATE", to_status=prior_status,
+                  detail="Reverted from New Template back to its previous status")
+        return {"file_name": file_name, "new_status": prior_status}
+    finally:
+        conn.close()
+
+
 # ===========================================================================
 # Menu storage: Create Field, Field Mapping, Template
 # ---------------------------------------------------------------------------
@@ -4099,6 +4337,14 @@ _MENU_TABLE_DDL = [
     "ALTER TABLE dbo.tbl_Purchase_Tracker ADD ExcludedDatetime DATETIME NULL",
     "IF COL_LENGTH('dbo.tbl_Purchase_Tracker','PriorStatusID') IS NULL "
     "ALTER TABLE dbo.tbl_Purchase_Tracker ADD PriorStatusID INT NULL",
+    # Mark as New Template / Revert (see mark_as_new_template/
+    # revert_new_template) - deliberately a SEPARATE column from
+    # PriorStatusID above, which belongs to the unrelated Exclude/Include
+    # feature and can hold a stale value from an earlier exclude even
+    # while sitting at some entirely different status - reusing it here
+    # would risk reverting to the wrong status.
+    "IF COL_LENGTH('dbo.tbl_Purchase_Tracker','NewTemplateFromStatusID') IS NULL "
+    "ALTER TABLE dbo.tbl_Purchase_Tracker ADD NewTemplateFromStatusID INT NULL",
     # Accounts can reject a LOADED invoice back to REJECTED BY ACCOUNTS with
     # a required remark - see reject_invoice().
     "IF COL_LENGTH('dbo.tbl_Purchase_Tracker','RejectRemark') IS NULL "
@@ -5328,9 +5574,14 @@ _MENU_PROC_DDL = [
     # ---- Read: a saved batch's rows, EVERY header, no numbering ----------
     # Same shape/mechanism as usp_FetchBatch, but for database.
     # fetch_batch_readonly's pure read-only export (Dashboard's Super-Admin
-    # download-icon button) - no IsActive/IsExcluded/status filtering at
-    # all, so every header ever tied to this batch comes back exactly as
-    # currently persisted, whatever stage it's at.
+    # download-icon button) - no IsActive/status-progression filtering at
+    # all (a Loaded/Posted/Completed/Ready To Load/Data Mismatch/Buyer
+    # Order No Doesn't Exist header all come back exactly as currently
+    # persisted, whatever stage it's at). EXCLUDED and NEW TEMPLATE headers
+    # are the one deliberate exception - excluding them is the whole point
+    # of marking something Excluded in the first place, and a New Template
+    # row has nothing real extracted to export (no trustworthy fields,
+    # often not even an Invoice No.) so it would only pollute this dump.
     """
     CREATE OR ALTER PROCEDURE dbo.usp_FetchBatchAll
         @BatchName  NVARCHAR(200),
@@ -5345,7 +5596,9 @@ _MENU_PROC_DDL = [
 
         DECLARE @idset NVARCHAR(600) =
             N'(SELECT pt.Purchase_Header_ID FROM dbo.tbl_Purchase_Tracker pt '
-          + N'WHERE pt.BatchName = @b)';
+          + N'LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID '
+          + N'WHERE pt.BatchName = @b AND ISNULL(pt.IsExcluded, 0) = 0 '
+          + N'AND ISNULL(s.StatusName, '''') <> ''NEW TEMPLATE'')';
 
         IF OBJECT_ID('dbo.tbl_Purchase_Header') IS NULL
             SELECT TOP 0 CAST(NULL AS INT) AS _empty;
@@ -5403,6 +5656,167 @@ _MENU_PROC_DDL = [
                 EXEC sp_executesql @sql, N'@b NVARCHAR(200)', @b = @BatchName;
             END
         END
+    END
+    """,
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_Report_BatchLoadedPosted
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_Report_BatchLoadedPosted
+        -- Reports menu (Super Admin only, see REPORTS in database.py): one
+        -- row per batch that has actually reached LOADED or further (not
+        -- just Created/Downloaded - see the HAVING below), showing when it
+        -- was loaded and the spread between its first and last Posted
+        -- invoice. LoadedDatetime/PostedDatetime are stamped on the tracker
+        -- row by _stamp_tracker only when an invoice transitions through
+        -- that exact status via the Load/Post screens - an invoice
+        -- processed before that stamping existed can still be missing
+        -- LoadedDatetime even though it's genuinely Loaded (known gap, see
+        -- the Dashboard discussion this report came out of), so this is the
+        -- best available answer, not a guaranteed-exact one.
+        IF OBJECT_ID('dbo.tbl_Purchase_Tracker') IS NULL OR OBJECT_ID('dbo.tbl_status') IS NULL
+        BEGIN
+            SELECT TOP 0 CAST(NULL AS NVARCHAR(200)) AS BatchName,
+                         CAST(NULL AS DATE) AS BatchLoadedDate,
+                         CAST(NULL AS DATE) AS FirstInvoicePostedDate,
+                         CAST(NULL AS INT) AS DaysBetweenLoadedAndFirstPosted,
+                         CAST(NULL AS DATE) AS LastInvoicePostedDate,
+                         CAST(NULL AS INT) AS DaysBetweenFirstAndLastPosted,
+                         CAST(NULL AS DATE) AS FirstInvoiceCompletedDate,
+                         CAST(NULL AS DATE) AS LastInvoiceCompletedDate;
+            RETURN;
+        END
+
+        SELECT
+            pt.BatchName,
+            CAST(MIN(pt.LoadedDatetime) AS DATE)                          AS BatchLoadedDate,
+            CAST(MIN(pt.PostedDatetime) AS DATE)                          AS FirstInvoicePostedDate,
+            DATEDIFF(DAY, MIN(pt.LoadedDatetime), MIN(pt.PostedDatetime))  AS DaysBetweenLoadedAndFirstPosted,
+            CAST(MAX(pt.PostedDatetime) AS DATE)                          AS LastInvoicePostedDate,
+            DATEDIFF(DAY, MIN(pt.PostedDatetime), MAX(pt.PostedDatetime)) AS DaysBetweenFirstAndLastPosted,
+            CAST(MIN(pt.CompletedDatetime) AS DATE)                       AS FirstInvoiceCompletedDate,
+            CAST(MAX(pt.CompletedDatetime) AS DATE)                       AS LastInvoiceCompletedDate
+        FROM dbo.tbl_Purchase_Tracker pt
+        JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID
+        GROUP BY pt.BatchName
+        HAVING SUM(CASE WHEN s.StatusName IN ('LOADED', 'POSTED', 'COMPLETED', 'REJECTED BY ACCOUNTS')
+                        THEN 1 ELSE 0 END) > 0
+        ORDER BY MIN(pt.LoadedDatetime) DESC;
+    END
+    """,
+    """
+    CREATE OR ALTER PROCEDURE dbo.usp_Report_InvoiceStageSLA
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        -- Sample: EXEC dbo.usp_Report_InvoiceStageSLA
+        -- Reports menu (Super Admin only, see REPORTS in database.py):
+        -- INVOICE-wise (not batch-wise - one row per Purchase_Header_ID),
+        -- ONE COLUMN PER STAGE GROUP, not one column per field - each
+        -- column's own value is a multi-line "Label: value" block combining
+        -- everything for that group (Invoice Details / Created Details /
+        -- Buyer Order Updated Details / Part Description Updated Details /
+        -- Loaded Details / Posted Details / Completed Details), CHAR(13)+
+        -- CHAR(10) between lines so Excel/the PDF export both render it as
+        -- a wrapped multi-line cell instead of one huge flat row of
+        -- columns. A blank sub-value shows as "Label: " (ISNULL to ''),
+        -- never the literal word NULL. An invoice that hasn't reached a
+        -- later stage yet just shows blank datetimes/day-counts in that
+        -- group - not an error, just not there yet. Permanently-parked
+        -- Manually Updated invoices are excluded outright (see the WHERE
+        -- below) - they fell out of the normal Created->Completed pipeline
+        -- for good, so showing them here would only pollute the day-gap
+        -- figures with rows that can never actually finish it.
+        -- Same known caveat as the batch report: *Datetime/*ByID are only
+        -- stamped when an invoice transitioned through that exact status
+        -- via the Load/Post/Complete screens (see _stamp_tracker) - one
+        -- processed before that stamping existed can show a gap even
+        -- though it genuinely reached that stage (confirmed via
+        -- tbl_Audit_Event in such cases).
+        IF OBJECT_ID('dbo.tbl_Purchase_Tracker') IS NULL OR OBJECT_ID('dbo.tbl_status') IS NULL
+        BEGIN
+            SELECT TOP 0
+                CAST(NULL AS NVARCHAR(MAX)) AS InvoiceDetails,
+                CAST(NULL AS NVARCHAR(MAX)) AS CreatedDetails,
+                CAST(NULL AS NVARCHAR(MAX)) AS BuyerOrderUpdatedDetails,
+                CAST(NULL AS NVARCHAR(MAX)) AS PartDescriptionUpdatedDetails,
+                CAST(NULL AS NVARCHAR(MAX)) AS LoadedDetails,
+                CAST(NULL AS NVARCHAR(MAX)) AS PostedDetails,
+                CAST(NULL AS NVARCHAR(MAX)) AS CompletedDetails;
+            RETURN;
+        END
+
+        -- Deferred name resolution means this plain static query is safe to
+        -- CREATE even before tbl_Purchase_Header/tbl_Purchase_Line/tbl_User
+        -- exist on a fresh deploy - SQL Server only resolves it at EXECUTE
+        -- time, by which point the IF above has already returned early if
+        -- tbl_Purchase_Tracker/tbl_status (checked there) are still
+        -- missing - and those two never exist without the others already
+        -- existing too. Unlike "No." (a per-template mapped column, see
+        -- _hdr_col's use everywhere else in this file), InvoiceNo is a
+        -- fixed column the app always writes directly - once the table
+        -- exists, it exists. CONVERT(..., 120) gives a plain
+        -- 'YYYY-MM-DD HH:MI:SS' string, no locale ambiguity.
+        SELECT
+            'Invoice No: ' + ISNULL(h.InvoiceNo, '') + CHAR(13) + CHAR(10) +
+            'Batch Name: ' + ISNULL(pt.BatchName, '') + CHAR(13) + CHAR(10) +
+            'File Name: ' + ISNULL(pt.FileName, '') + CHAR(13) + CHAR(10) +
+            'Current Status: ' + ISNULL(s.StatusName, '')
+                AS InvoiceDetails,
+
+            'Created By: ' + ISNULL(uc.UserName, '') + CHAR(13) + CHAR(10) +
+            'Created Datetime: ' + ISNULL(CONVERT(VARCHAR(19), pt.CreatedDatetime, 120), '')
+                AS CreatedDetails,
+
+            'Buyer Order Updated By: ' + ISNULL(ub.UserName, '') + CHAR(13) + CHAR(10) +
+            'Buyer Order Updated Datetime: ' + ISNULL(CONVERT(VARCHAR(19), pt.BuyerOrderDatetime, 120), '') + CHAR(13) + CHAR(10) +
+            'Source: ' + ISNULL(pt.BuyerOrderSource, '')
+                AS BuyerOrderUpdatedDetails,
+
+            'Part Description Updated By: ' + ISNULL(upd.UserName, '') + CHAR(13) + CHAR(10) +
+            'Part Description Updated Datetime: ' + ISNULL(CONVERT(VARCHAR(19), pdu.UpdatedDatetime, 120), '')
+                AS PartDescriptionUpdatedDetails,
+
+            'Loaded By: ' + ISNULL(ul.UserName, '') + CHAR(13) + CHAR(10) +
+            'Loaded Datetime: ' + ISNULL(CONVERT(VARCHAR(19), pt.LoadedDatetime, 120), '') + CHAR(13) + CHAR(10) +
+            'Days Created to Loaded: ' + ISNULL(CAST(DATEDIFF(DAY, pt.CreatedDatetime, pt.LoadedDatetime) AS VARCHAR(10)), '')
+                AS LoadedDetails,
+
+            'Posted By: ' + ISNULL(up.UserName, '') + CHAR(13) + CHAR(10) +
+            'Posted Datetime: ' + ISNULL(CONVERT(VARCHAR(19), pt.PostedDatetime, 120), '') + CHAR(13) + CHAR(10) +
+            'Days Loaded to Posted: ' + ISNULL(CAST(DATEDIFF(DAY, pt.LoadedDatetime, pt.PostedDatetime) AS VARCHAR(10)), '')
+                AS PostedDetails,
+
+            'Completed By: ' + ISNULL(ue.UserName, '') + CHAR(13) + CHAR(10) +
+            'Completed Datetime: ' + ISNULL(CONVERT(VARCHAR(19), pt.CompletedDatetime, 120), '') + CHAR(13) + CHAR(10) +
+            'Days Posted to Completed: ' + ISNULL(CAST(DATEDIFF(DAY, pt.PostedDatetime, pt.CompletedDatetime) AS VARCHAR(10)), '') + CHAR(13) + CHAR(10) +
+            'Days Created to Completed: ' + ISNULL(CAST(DATEDIFF(DAY, pt.CreatedDatetime, pt.CompletedDatetime) AS VARCHAR(10)), '')
+                AS CompletedDetails
+        FROM dbo.tbl_Purchase_Tracker pt
+        JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID
+        LEFT JOIN dbo.tbl_Purchase_Header h ON h.Id = pt.Purchase_Header_ID
+        LEFT JOIN dbo.tbl_User uc ON uc.UserId = pt.CreatedById
+        LEFT JOIN dbo.tbl_User ub ON ub.UserId = pt.BuyerOrderByID
+        LEFT JOIN dbo.tbl_User ul ON ul.UserId = pt.LoadedByID
+        LEFT JOIN dbo.tbl_User up ON up.UserId = pt.PostedByID
+        LEFT JOIN dbo.tbl_User ue ON ue.UserId = pt.CompletedByID
+        -- A Part Description correction is keyed per Purchase LINE (a
+        -- single invoice can have several, each possibly updated at a
+        -- different time/by a different person - see
+        -- database.record_part_description_update) - the most recent one
+        -- for this invoice is what's shown here, not an arbitrary line.
+        OUTER APPLY (
+            SELECT TOP 1 pl.PartDescriptionUpdatedByID AS UpdatedByID,
+                         pl.PartDescriptionUpdatedDatetime AS UpdatedDatetime
+            FROM dbo.tbl_Purchase_Line pl
+            WHERE pl.Purchase_Header_ID = pt.Purchase_Header_ID
+              AND pl.PartDescriptionUpdatedDatetime IS NOT NULL
+            ORDER BY pl.PartDescriptionUpdatedDatetime DESC
+        ) pdu
+        LEFT JOIN dbo.tbl_User upd ON upd.UserId = pdu.UpdatedByID
+        WHERE s.StatusName <> 'MANUALLY UPDATED'
+        ORDER BY pt.CreatedDatetime DESC;
     END
     """,
 ]

@@ -155,6 +155,18 @@ export const setBuyerOrder = (header_id, buyer_order_no, user_id) =>
     body: JSON.stringify({ header_id, buyer_order_no, user_id }),
   });
 
+export const markAsNewTemplate = (header_id, user_id) =>
+  request("/api/invoices/mark-new-template", {
+    method: "POST",
+    body: JSON.stringify({ header_id, user_id }),
+  });
+
+export const revertNewTemplate = (header_id, user_id) =>
+  request("/api/invoices/revert-new-template", {
+    method: "POST",
+    body: JSON.stringify({ header_id, user_id }),
+  });
+
 export const getVendorCodeMissing = () =>
   request("/api/invoices/vendor-code-missing");
 
@@ -297,6 +309,38 @@ export const exportBatchFile = async (batch, userId) => {
   const match = disposition.match(/filename="?([^"]+)"?/);
   return { blob, filename: match ? match[1] : `${batch}_export.xlsx` };
 };
+
+// Super Admin only - the Reports menu. Each report runs a parameterless
+// stored procedure server-side (see database.REPORTS/run_report); this
+// file never knows a report's own columns, just passes its key through.
+export const getReports = (userId) =>
+  request(`/api/reports?user_id=${encodeURIComponent(userId)}`);
+
+export const runReport = (key, userId) =>
+  request(`/api/reports/${encodeURIComponent(key)}/run?user_id=${encodeURIComponent(userId)}`);
+
+const _reportExportFile = async (key, format, userId, fallbackExt) => {
+  const url = withToken(
+    `${API_BASE}/api/reports/${encodeURIComponent(key)}/export/${format}` +
+    `?user_id=${encodeURIComponent(userId)}`);
+  let res;
+  try {
+    res = await fetch(url, { headers: authHeaders() });
+  } catch {
+    throw new Error("Could not reach the server. Check your connection and try again.");
+  }
+  if (!res.ok) {
+    endSessionIfExpired(res, !!getToken());
+    throw new Error(await errorMessageFor(res));
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  return { blob, filename: match ? match[1] : `${key}.${fallbackExt}` };
+};
+
+export const exportReportExcel = (key, userId) => _reportExportFile(key, "excel", userId, "xlsx");
+export const exportReportPdf = (key, userId) => _reportExportFile(key, "pdf", userId, "pdf");
 
 export const getFormats = () => request("/api/formats");
 

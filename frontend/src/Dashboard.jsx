@@ -3,7 +3,7 @@ import {
   startProcessing, getStatus, getResult, getActiveJob,
   getBatches, downloadBatchFile, exportBatchFile, getBatchHistory, getStatusCounts,
   getInvoicesByStatus, getInvoicesByBatch, setInvoiceExcluded,
-  getInvoiceFieldCheck,
+  getInvoiceFieldCheck, markAsNewTemplate, revertNewTemplate,
 } from "./api";
 import { DataTable, Modal, PdfModal, RunBar, runPercent, isPreparing } from "./components";
 
@@ -15,6 +15,24 @@ const STATUS_COLORS = [
   "#199e70", "#d95926", "#9085e9", "#e66767",
   "#8a8f98", "#4aa3c7", "#b07acc", "#c2b21a",
 ];
+
+// Document No. is the full minted string (e.g. "PIIPSPO-2627-000001") -
+// only its trailing digit run is ever shown/edited (leading zeros
+// stripped), same convention as the Document No. override box itself.
+// A non-numeric string (no digit run) falls back to blank.
+function docNoSeq(s) {
+  const m = /(\d+)\s*$/.exec(s || "");
+  return m ? String(parseInt(m[1], 10)) : "";
+}
+
+// "210" (one invoice) or "210-220" (several) - null/blank inputs collapse
+// to "—", same as every other not-yet-available Dashboard cell.
+function numberRange(first, last) {
+  if (first == null && last == null) return "—";
+  if (first === last || last == null) return String(first);
+  if (first == null) return String(last);
+  return `${first}-${last}`;
+}
 
 function _polar(cx, cy, r, a) {
   return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
@@ -112,6 +130,11 @@ export default function Dashboard({ user }) {
   const [downloadingBatch, setDownloadingBatch] = useState(null);
   const [exportingBatch, setExportingBatch] = useState(null);
   const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
+  // A row's own batch_status, from the Batches table already loaded for
+  // the Dashboard - a missing/unlisted batch defaults to "CREATED" (same
+  // default used at the Batch Status column itself, see batchColumns).
+  const batchStatusFor = (batchName) =>
+    batches.find((b) => b.batch === batchName)?.batch_status || "CREATED";
   const [statusCounts, setStatusCounts] = useState([]);
   const [modal, setModal] = useState(null);
   const [fieldModal, setFieldModal] = useState(null);
@@ -136,10 +159,6 @@ export default function Dashboard({ user }) {
       // blank in a number input, so its trailing digit run is pulled out
       // and leading zeros stripped (empty digit run - e.g. a custom/
       // template-less Document No. - falls back to blank, same as before).
-      const docNoSeq = (s) => {
-        const m = /(\d+)\s*$/.exec(s || "");
-        return m ? String(parseInt(m[1], 10)) : "";
-      };
       setBatchInputs((prev) => {
         const next = { ...prev };
         for (const b of list) {
@@ -211,13 +230,20 @@ export default function Dashboard({ user }) {
     catch (e) { setError(e.message); }
   };
 
+  // "Invoices — DATA MISMATCH (18)" -> "Invoices — DATA MISMATCH (17)" -
+  // keeps the popup's own title count in sync after Mark as New Template/
+  // Revert drops a row out of it (see markNewTemplate/revertFromNewTemplate
+  // below). Title unchanged if it has no "(N)" count to begin with.
+  const dropRowFromModalTitle = (title) =>
+    (title || "").replace(/\((\d+)\)\s*$/, (_, n) => `(${Math.max(0, Number(n) - 1)})`);
+
   const openStatusModal = async (slice) => {
-    setModal({ kind: "status", title: `Invoices — ${slice.status}`, rows: [], loading: true });
+    setModal({ kind: "status", title: `Invoices — ${slice.status}`, rows: [], loading: true, status: slice.status });
     try {
       const r = await getInvoicesByStatus(slice.status_id);
       setModal({ kind: "status", title: `Invoices — ${slice.status} (${(r.invoices || []).length})`,
-                 rows: r.invoices || [], loading: false });
-    } catch (e) { setModal({ kind: "status", title: "Invoices", rows: [], loading: false, error: e.message }); }
+                 rows: r.invoices || [], loading: false, status: slice.status });
+    } catch (e) { setModal({ kind: "status", title: "Invoices", rows: [], loading: false, error: e.message, status: slice.status }); }
   };
 
   const openBatchModal = async (batch, status, statusLabel) => {
@@ -265,6 +291,62 @@ export default function Dashboard({ user }) {
       // not on the outer page's error banner, which sits behind the
       // modal overlay and would go unnoticed.
       setModal((m) => m && ({ ...m, error: e.message }));
+    }
+  };
+
+  // Statuses the "Mark as New Template" escape hatch is offered from - kept
+  // in sync by hand with database.py's _NEW_TEMPLATE_ELIGIBLE_STATUSES.
+  const NEW_TEMPLATE_ELIGIBLE_STATUSES = ["BUYER ORDER NO DOESN'T EXIST", "DATA MISMATCH"];
+
+  const [markingNewTemplate, setMarkingNewTemplate] = useState(null);  // header_id being marked
+  const markNewTemplate = async (row) => {
+    if (!window.confirm(
+      `Mark "${row.invoice_no || row.file_name}" as New Template?\n\n` +
+      `This moves it out of ${row.status || "its current status"} for good - its ` +
+      "PDF goes to the New Template folder and a copy to New_Format for " +
+      "training. Use Revert (on the New Template popup) to undo this."
+    )) return;
+    setMarkingNewTemplate(row.header_id);
+    try {
+      await markAsNewTemplate(row.header_id, user?.user_id);
+      // This popup is scoped to ONE status - once marked, the row no
+      // longer belongs on it at all (it's now New Template), so drop it
+      // from the list rather than just relabeling its status in place.
+      setModal((m) => m && ({
+        ...m, error: null,
+        title: dropRowFromModalTitle(m.title),
+        rows: m.rows.filter((x) => x.header_id !== row.header_id),
+      }));
+      loadStatusCounts(); loadBatches();
+    } catch (e) {
+      setModal((m) => m && ({ ...m, error: e.message }));
+    } finally {
+      setMarkingNewTemplate(null);
+    }
+  };
+
+  const [revertingNewTemplate, setRevertingNewTemplate] = useState(null);  // header_id being reverted
+  const revertFromNewTemplate = async (row) => {
+    if (!window.confirm(
+      `Revert "${row.invoice_no || row.file_name}" from New Template back to its ` +
+      "previous status?"
+    )) return;
+    setRevertingNewTemplate(row.header_id);
+    try {
+      await revertNewTemplate(row.header_id, user?.user_id);
+      // This popup is scoped to New Template - once reverted, the row no
+      // longer belongs on it at all, so drop it from the list rather than
+      // just relabeling its status in place.
+      setModal((m) => m && ({
+        ...m, error: null,
+        title: dropRowFromModalTitle(m.title),
+        rows: m.rows.filter((x) => x.header_id !== row.header_id),
+      }));
+      loadStatusCounts(); loadBatches();
+    } catch (e) {
+      setModal((m) => m && ({ ...m, error: e.message }));
+    } finally {
+      setRevertingNewTemplate(null);
     }
   };
 
@@ -359,13 +441,48 @@ export default function Dashboard({ user }) {
           Fields
         </button>
       ) : null },
+    // Super Admin only, and only on the "Buyer Order No. Doesn't Exist" /
+    // "Data Mismatch" status popups - a one-way escape hatch for a row
+    // whose real problem is a bad/untrained format, not just a missing PO
+    // or field (see database.mark_as_new_template). Not offered on the
+    // batch-scoped modal (batchModalColumns below), just these status-wide
+    // ones. Also only while the row's own batch is still CREATED - once a
+    // batch starts moving (Downloaded/In Progress/...) this is no longer
+    // offered, matching the server-side check in database.
+    // mark_as_new_template/revert_new_template.
+    ...(isSuperAdmin && modal?.kind === "status" && NEW_TEMPLATE_ELIGIBLE_STATUSES.includes(modal?.status) ? [
+      { key: "_new_template", label: "", sortable: false,
+        render: (row) => (row.header_id && batchStatusFor(row.batch) === "CREATED") ? (
+          <button className="btn btn-subtle btn-sm" disabled={markingNewTemplate === row.header_id}
+                  title="Move this invoice to New Template status - its PDF goes to the New_Format training folder"
+                  onClick={() => markNewTemplate(row)}>
+            {markingNewTemplate === row.header_id ? "Marking…" : "Mark as New Template"}
+          </button>
+        ) : null },
+    ] : []),
+    // Super Admin only, and only on the "New Template" status popup - undo
+    // for the button above (see database.revert_new_template). A row that
+    // reached New Template the ordinary way (unrecognized format at first
+    // processing, never marked via this button) simply has no previous
+    // status to go back to - clicking Revert on one shows that as an error
+    // rather than the button being hidden/disabled (no cheap way to know
+    // in advance without a dedicated column in this list). Same
+    // CREATED-only restriction as Mark as New Template above.
+    ...(isSuperAdmin && modal?.kind === "status" && modal?.status === "NEW TEMPLATE" ? [
+      { key: "_revert_new_template", label: "", sortable: false,
+        render: (row) => (row.header_id && batchStatusFor(row.batch) === "CREATED") ? (
+          <button className="btn btn-subtle btn-sm" disabled={revertingNewTemplate === row.header_id}
+                  title="Revert this invoice from New Template back to its previous status"
+                  onClick={() => revertFromNewTemplate(row)}>
+            {revertingNewTemplate === row.header_id ? "Reverting…" : "Revert"}
+          </button>
+        ) : null },
+    ] : []),
   ];
   // Include/Exclude only makes sense once an invoice is actually staged
   // for export (READY TO LOAD), or to undo a previous exclude (EXCLUDED) —
   // for every other status it's not shown at all, rather than offered and
-  // doing something confusing. (A dedicated Exclude action for Buyer Order
-  // No. Doesn't Exist rows lives directly on the Buyer Order Entry screen
-  // instead - see BuyerOrderEntry.jsx.)
+  // doing something confusing.
   const batchModalColumns = [
     ...invoiceColumns.filter((c) => c.key !== "batch"),
     ...(["READY TO LOAD", "EXCLUDED"].includes(modal?.status) ? [
@@ -534,7 +651,14 @@ export default function Dashboard({ user }) {
                onChange={(e) => setBatchInputs((s) => ({
                  ...s, [row.batch]: { ...s[row.batch], docNo: e.target.value },
                }))} />
-      ) : <span className="muted">—</span>) },
+      ) : (
+        <span className="muted" title={row.doc_no_first ? `${row.doc_no_first} – ${row.doc_no_last}` : undefined}>
+          {numberRange(
+            row.doc_no_first != null ? docNoSeq(row.doc_no_first) : null,
+            row.doc_no_last != null ? docNoSeq(row.doc_no_last) : null,
+          )}
+        </span>
+      )) },
     { key: "_entryno", label: "Entry No", sortable: false,
       render: (row) => (canDownload(row) ? (
         <input type="number" placeholder="e.g. 7"
@@ -543,7 +667,7 @@ export default function Dashboard({ user }) {
                onChange={(e) => setBatchInputs((s) => ({
                  ...s, [row.batch]: { ...s[row.batch], entryNo: e.target.value },
                }))} />
-      ) : <span className="muted">—</span>) },
+      ) : <span className="muted">{numberRange(row.entry_no_first, row.entry_no_last)}</span>) },
     { key: "_dl", label: "", sortable: false,
       render: (row) => (canDownload(row) ? (
         <button className="btn btn-primary btn-sm" disabled={downloadingBatch === row.batch}
