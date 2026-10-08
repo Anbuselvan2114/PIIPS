@@ -130,6 +130,13 @@ export default function Dashboard({ user }) {
   const [downloadingBatch, setDownloadingBatch] = useState(null);
   const [exportingBatch, setExportingBatch] = useState(null);
   const isSuperAdmin = ["super admin", "developer"].includes((user?.user_type || "").toLowerCase());
+  // Batch History is also offered to Viewer - a read-only role that's
+  // otherwise locked out of every Super-Admin-only action on this page
+  // (Export, Mark as New Template, Revert, ...), but History is itself
+  // read-only too, so there's nothing for Viewer's own restrictions to
+  // guard against here (see app.py's /api/batches/history, updated the
+  // same way).
+  const isViewer = (user?.user_type || "").toLowerCase() === "viewer";
   // A row's own batch_status, from the Batches table already loaded for
   // the Dashboard - a missing/unlisted batch defaults to "CREATED" (same
   // default used at the Batch Status column itself, see batchColumns).
@@ -686,7 +693,7 @@ export default function Dashboard({ user }) {
                 ? "Kindly resolve the Data Mismatch invoice(s) in this batch before downloading."
                 : "No active / included invoices to export, or every invoice in this batch has already moved past Ready to Load"}>—</span>
       )) },
-    ...(isSuperAdmin ? [{
+    ...(isSuperAdmin || isViewer ? [{
       key: "_history", label: "", sortable: false,
       render: (row) => (
         <button className="btn btn-subtle btn-sm" disabled={batchHistoryLoading === row.batch}

@@ -35,16 +35,15 @@ export const MENU = [
 // regardless of tbl_RoleMenu's contents), so offering rows for those would
 // be meaningless. "rolemenus" itself is excluded too: it must never be
 // grantable to a lower-privileged role, since it controls who can reach
-// every other screen (including itself). "reports" is Super Admin only by
-// the same rule, same reasoning as rolemenus - a report can run an
-// arbitrary stored procedure against live data, not something to offer a
-// lower-privileged role even optionally. "vendorcode" (NAV Vendor Code
-// Entry) was already never granted to any configurable role by default
-// (see DEFAULT_ROLE_MENUS in App.jsx) - excluded here too so a Super Admin
-// can no longer even opt a role into it from this matrix. "completedinvoices"
-// was previously granted to every configurable role by default - now
-// restricted to Super Admin only too (see DEFAULT_ROLE_MENUS/
-// _ROLE_MENU_DEFAULTS, both updated to drop it for every role).
+// every other screen (including itself). "reports"/"vendorcode"/
+// "completedinvoices" are excluded from the MATRIX specifically - a Super
+// Admin can't opt admin/user/accounts into them from this screen - but
+// Viewer is granted all three directly via DEFAULT_ROLE_MENUS/
+// _ROLE_MENU_DEFAULTS instead (every one of those three screens is itself
+// just a list/report to look at, nothing Viewer's own read-only
+// restriction doesn't already cover server-side). "vendorcode" (NAV Vendor
+// Code Entry) also stays invisible for every role regardless, Viewer
+// included - see HIDDEN_MENU_KEYS below.
 export const ROLE_MENU_EXCLUDED_KEYS = ["rolemenus", "reports", "vendorcode", "completedinvoices"];
 
 // Menu keys hidden from the sidebar via CSS (App.jsx applies "nav-item-

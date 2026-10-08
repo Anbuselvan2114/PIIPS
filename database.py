@@ -2345,12 +2345,18 @@ _ROLE_MENU_DEFAULTS = {
               "load", "post", "complete",
               "configuration", "apiconfig", "template", "createfield", "users"],
     # NAV Vendor Code Entry and Completed Invoices are deliberately not
-    # listed for any role here - access removed menu-wide (still reachable
-    # by Super Admin/Developer, which always sees every menu regardless of
-    # this table).
+    # listed for any role here EXCEPT viewer (see its own entry below) -
+    # access removed menu-wide otherwise (still reachable by Super Admin/
+    # Developer, which always sees every menu regardless of this table).
     "user": ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "partdescupdate", "load"],
     "accounts": ["dashboard", "input", "manual", "invoicesearch", "post", "complete"],
-    "viewer": ["dashboard", "input", "invoicesearch", "buyerorder", "partdescupdate", "load", "post", "complete"],
+    # The whole "Super Admin" sidebar group (vendorcode/completedinvoices/
+    # reports) is granted to viewer too - each is just a list/report to look
+    # at, nothing viewer's own read-only restriction (_require_not_viewer)
+    # doesn't already cover, and their endpoints were updated alongside this
+    # to allow Viewer too (see app.py's _require_developer_or_viewer).
+    "viewer": ["dashboard", "input", "invoicesearch", "buyerorder", "partdescupdate", "load", "post", "complete",
+               "vendorcode", "completedinvoices", "reports"],
 }
 
 
@@ -5924,6 +5930,16 @@ def ensure_menu_schema(force=False):
                     "IF NOT EXISTS (SELECT 1 FROM dbo.tbl_RoleMenu WHERE RoleName = ? AND MenuKey = ?) "
                     "INSERT INTO dbo.tbl_RoleMenu (RoleName, MenuKey) VALUES (?, ?)",
                     role, "invoicesearch", role, "invoicesearch")
+            # Same backfill for the "Super Admin" sidebar group now also
+            # granted to viewer (vendorcode/completedinvoices/reports) - an
+            # existing deployment's tbl_RoleMenu predates this and would
+            # otherwise never pick it up without a Super Admin re-saving
+            # Screen Access.
+            for key in ("vendorcode", "completedinvoices", "reports"):
+                cur.execute(
+                    "IF NOT EXISTS (SELECT 1 FROM dbo.tbl_RoleMenu WHERE RoleName = ? AND MenuKey = ?) "
+                    "INSERT INTO dbo.tbl_RoleMenu (RoleName, MenuKey) VALUES (?, ?)",
+                    "viewer", key, "viewer", key)
             conn.commit()
 
         # Normalise legacy table/column names BEFORE (re)creating the

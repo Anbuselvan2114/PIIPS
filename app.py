@@ -565,6 +565,21 @@ def _require_developer(user_id):
         raise HTTPException(status_code=403, detail="Super Admin access required.")
 
 
+def _require_developer_or_viewer(user_id):
+    """Raise 403 unless user_id is an active Super Admin OR Viewer. For a
+    handful of endpoints that are otherwise Super Admin only (batch History)
+    but are themselves purely read-only, so Viewer's own read-only role is
+    exactly what's needed to use them - no different from any other screen
+    Viewer can already see."""
+    import database
+    try:
+        info = database.get_user_role(user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    if not info or not info["active"] or (info["role"] or "").lower() not in ("super admin", "viewer"):
+        raise HTTPException(status_code=403, detail="Super Admin or Viewer access required.")
+
+
 def _require_not_viewer(user_id):
     """Raise 403 if user_id is the read-only 'Viewer' role - it can see
     every page but never change anything. A missing/unknown user_id is NOT
@@ -1864,9 +1879,9 @@ def download_batch(request: Request, batch: str, doc_no: Optional[str] = None, e
 
 @app.get("/api/batches/history")
 def batch_history(batch: str, user_id: Optional[int] = None):
-    """Super Admin only: who/when downloaded this batch's Excel, and the
-    Document No./Entry No. each download produced."""
-    _require_developer(user_id)
+    """Super Admin or Viewer: who/when downloaded this batch's Excel, and
+    the Document No./Entry No. each download produced."""
+    _require_developer_or_viewer(user_id)
     import database
     try:
         return {"events": database.get_batch_download_history(batch)}
@@ -1923,9 +1938,9 @@ def export_batch(batch: str, user_id: Optional[int] = None):
 
 @app.get("/api/reports")
 def list_reports(user_id: Optional[int] = None):
-    """Super Admin only: the Reports menu's list screen - every registered
-    report's key/name/description, nothing else."""
-    _require_developer(user_id)
+    """Super Admin or Viewer: the Reports menu's list screen - every
+    registered report's key/name/description, nothing else."""
+    _require_developer_or_viewer(user_id)
     import database
     return {"reports": database.list_reports()}
 
@@ -1943,20 +1958,20 @@ def _run_report_or_404(key):
 
 @app.get("/api/reports/{key}/run")
 def run_report(key: str, user_id: Optional[int] = None):
-    """Super Admin only: one report's result, generically - {columns, rows}
-    straight off its stored procedure (see database.run_report)."""
-    _require_developer(user_id)
+    """Super Admin or Viewer: one report's result, generically - {columns,
+    rows} straight off its stored procedure (see database.run_report)."""
+    _require_developer_or_viewer(user_id)
     return _run_report_or_404(key)
 
 
 @app.get("/api/reports/{key}/export/excel")
 def export_report_excel(key: str, user_id: Optional[int] = None):
-    """Super Admin only: the same report result as /run, as an .xlsx."""
+    """Super Admin or Viewer: the same report result as /run, as an .xlsx."""
     import database
     import excel_export
     import tempfile
 
-    _require_developer(user_id)
+    _require_developer_or_viewer(user_id)
     result = _run_report_or_404(key)
     name = database.REPORTS[key]["name"]
     safe = "".join(c for c in key if c.isalnum() or c in ("-", "_")) or "report"
@@ -1972,12 +1987,12 @@ def export_report_excel(key: str, user_id: Optional[int] = None):
 
 @app.get("/api/reports/{key}/export/pdf")
 def export_report_pdf(key: str, user_id: Optional[int] = None):
-    """Super Admin only: the same report result as /run, as a .pdf."""
+    """Super Admin or Viewer: the same report result as /run, as a .pdf."""
     import database
     import report_pdf
     import tempfile
 
-    _require_developer(user_id)
+    _require_developer_or_viewer(user_id)
     result = _run_report_or_404(key)
     name = database.REPORTS[key]["name"]
     safe = "".join(c for c in key if c.isalnum() or c in ("-", "_")) or "report"
