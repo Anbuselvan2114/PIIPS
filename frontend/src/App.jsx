@@ -40,17 +40,27 @@ const DEFAULT_ROLE_MENUS = {
           "configuration", "apiconfig", "template", "createfield", "users"],
   // Users process invoices, fix Buyer Order Nos, and Load them. NAV Vendor
   // Code Entry and Completed Invoices are deliberately not listed for any
-  // configurable role below - access removed menu-wide (still reachable by
-  // Super Admin/Developer, which always sees every menu regardless of this
-  // table - see the comment above DEFAULT_ROLE_MENUS).
+  // configurable role below EXCEPT Viewer (see that entry's own comment) -
+  // access removed menu-wide otherwise (still reachable by Super Admin/
+  // Developer, which always sees every menu regardless of this table - see
+  // the comment above DEFAULT_ROLE_MENUS).
   user: ["dashboard", "input", "manual", "invoicesearch", "buyerorder", "partdescupdate", "load"],
   // Accounts run the downstream Post / Complete steps.
   accounts: ["dashboard", "input", "manual", "invoicesearch", "post", "complete"],
   // Viewer sees invoice-processing data read-only (every mutating action is
   // blocked server-side too, app.py's _require_not_viewer) but not the
   // Setup/Mapping/Admin screens - those configure the app itself rather
-  // than show data, and aren't meant for this role.
-  viewer: ["dashboard", "input", "invoicesearch", "buyerorder", "partdescupdate", "load", "post", "complete"],
+  // than show data, and aren't meant for this role. The whole "Super Admin"
+  // sidebar group (Vendor Code Entry, Completed Invoices, Reports) IS
+  // granted to Viewer though - every one of those screens is itself just a
+  // list/report to look at, nothing Viewer's own read-only restriction
+  // doesn't already handle, and their backend endpoints were updated
+  // alongside this to allow Viewer too (see app.py's
+  // _require_developer_or_viewer). Vendor Code Entry stays invisible
+  // regardless, for every role including Super Admin - see HIDDEN_MENU_KEYS
+  // in menuConfig.js.
+  viewer: ["dashboard", "input", "invoicesearch", "buyerorder", "partdescupdate", "load", "post", "complete",
+           "vendorcode", "completedinvoices", "reports"],
 };
 
 // Load / Post / Complete are one component parameterised by stage.
