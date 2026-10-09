@@ -87,13 +87,18 @@ def _normalize_date(value):
     # just tolerant of different characters - an informal invoice
     # sometimes glues them with no gap at all, e.g. "14July.26")
     match = re.match(
-        r"(\d{1,2})[-/. ]*([A-Za-z]{3,})[-/. ]+(\d{2,4})",
+        r"(\d{1,2})[-/. ]*([A-Za-z0]{3,})[-/. ]+(\d{2,4})",
         value
     )
 
     if match:
         day, mon, year = match.groups()
-        mon = MONTHS.get(mon[:3].lower())
+        mon_key = mon[:3].lower()
+        # OCR commonly misreads the capital "O" in "Oct" as a digit zero
+        # ("3-0ct-26") - try that one well-known substitution before giving
+        # up, rather than widening month matching generally (which could
+        # start accepting genuinely unreadable text as a real month).
+        mon = MONTHS.get(mon_key) or MONTHS.get(mon_key.replace("0", "o"))
         # An unreadable day ("0-Jul-20" from a poor scan) or an unknown
         # month word is left blank so it surfaces as a missing Invoice Date
         # instead of a made-up "00-07-2020" / January.

@@ -2073,7 +2073,16 @@ class OCREngine:
         # dedicated charge-line handling further down.
         CHARGE_KW = ("freight", "frieght", "courier", "forwarding",
                      "shipping", "packing", "handling", "cartage",
-                     "loading", "insurance")
+                     "loading", "insurance",
+                     # "deliver charge" (not bare "deliver"/"delivery") so
+                     # this only catches an actual "Deliver(y) Charges" line
+                     # item - a bare "deliver" also matched an unrelated
+                     # invoice terms line ("Delivery Ex-Premises.") and
+                     # wrongly promoted it into its own phantom charge item
+                     # with no values at all. "deliver charge" is a prefix
+                     # of both "Deliver Charges" and "Delivery Charges", so
+                     # one entry still covers both spellings.
+                     "deliver charge")
 
         # "continued"/"contd" is a multi-page invoice's own page-footer
         # marker ("continued ...", printed below the table on every page
@@ -2320,7 +2329,26 @@ class OCREngine:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
                     if col in ("GST", "IGST"):
                         continue
-                    if is_number(t) and col in ("Quantity", "Rate", "Amount"):
+                    # A value that OCR glued to its own unit ("20.00 Nos",
+                    # "398.31Nos") is still a leaked Quantity/Rate/Amount
+                    # figure, not description text - is_number(t) alone
+                    # misses it since the combined token never parses as a
+                    # bare number (see the "Godown : Main Location" row
+                    # duplicating its own Quantity cell onto the next line -
+                    # Laptronics' own layout prints the qty twice).
+                    # "Total" is the same kind of pure-money column as
+                    # Quantity/Rate/Amount (see row_has_values/the Amount-
+                    # recovery branch below, which already treat it as an
+                    # equally valid place for a line's own Amount to live) -
+                    # just missing from this particular check, so a vendor
+                    # whose own layout has a separate Taxable Value/IGST %/
+                    # IGST Amount/Total breakdown (e.g. Gujarat Info
+                    # System's own invoices) leaked its line's own Total
+                    # figure into the Description instead of dropping it.
+                    if (
+                        col in ("Quantity", "Rate", "Amount", "Total")
+                        and (is_number(t) or number_with_unit(t) is not None)
+                    ):
                         continue
                 out.append((w, t))
             if not out:
@@ -2800,6 +2828,19 @@ class OCREngine:
                 # doesn't also match "tota" buried inside an unrelated real
                 # word (e.g. "Toyota").
                 and not re.search(r"\btota\b", lower)
+                # A bare "Tax 0/-" footer row (a vendor whose own tax line
+                # has no "Amount"/"Rate" word for EXCLUDE_KW's "tax amount"/
+                # "tax rate" to match - just the label and a value) is the
+                # same shape as this gate exists to reject: label + value,
+                # no real product name. Only when "tax" is the row's own
+                # sole word (nothing else alphabetic survives once it's
+                # removed) - a genuine multi-word continuation that happens
+                # to mention tax ("Service Tax Audit Report") must still
+                # pass through untouched.
+                and not (
+                    re.search(r"\btax\b", lower)
+                    and not re.search(r"[A-Za-z]{3,}", re.sub(r"\btax\b", "", lower))
+                )
                 and (
                     any(
                         _hsn_token_value(t.replace(",", "")) is not None
@@ -3274,6 +3315,22 @@ class OCREngine:
                                     current_item["TaxRatePercent"] = v
                             continue
 
+                        # "Total" (a line's own incl-tax grand total, e.g. a
+                        # vendor's own "Taxable Value | IGST % | IGST Amount
+                        # | Total" breakdown) is never tracked separately
+                        # from the pre-tax Amount this schema already saves -
+                        # discarded the same unconditional way a GST/IGST
+                        # cell is, rather than falling through to "free text
+                        # becomes description" below purely because its own
+                        # value doesn't even parse as a clean number (a
+                        # comma OCR'd as a stray period glues two decimal
+                        # points together, e.g. "2.360.00"). The
+                        # is_gst3_breakdown remap above already turns a
+                        # genuine Total-as-Amount case into "Amount" before
+                        # reaching here, so this never discards that one.
+                        if col == "Total":
+                            continue
+
                         # Numbers under other columns (e.g. discount) are
                         # ignored; free text becomes description.
                         if not is_number(txt):
@@ -3485,7 +3542,11 @@ class OCREngine:
                 if (current_item and has_text and not footer_started
                         and not any(k in lower for k in EXCLUDE_KW)
                         and not any(k in lower for k in CHARGE_KW)
-                        and not re.search(r"\btota\b", lower)):
+                        and not re.search(r"\btota\b", lower)
+                        and not (
+                            re.search(r"\btax\b", lower)
+                            and not re.search(r"[A-Za-z]{3,}", re.sub(r"\btax\b", "", lower))
+                        )):
                     # A scanned/garbled image can split one logical item
                     # row across several OCR rows, with the Quantity/Rate/
                     # Amount figures landing on a row that has no
@@ -3610,6 +3671,50 @@ class OCREngine:
                 ).strip()
                 continue
             folded.append(item)
+
+        # The mirror case: an item with NO Description at all (its own row
+        # had no serial and fell through the "orphan value row" fallback -
+        # e.g. a degraded scan where the real item's Rate/Amount cells OCR'd
+        # onto their own separate line, a line with no product name of its
+        # own to show) is never a genuine standalone line - it is leftover
+        # data belonging to whichever real item follows it. Merge its
+        # Quantity/HSN/Rate/Amount into the NEXT item's still-blank fields
+        # (never overwriting a value that item already has from its own
+        # row) and drop it, rather than leaving a phantom extra line with
+        # a blank Description that would only fail mandatory-field
+        # validation anyway. Only when a next item actually exists -
+        # otherwise there is nothing to merge into, so it is left alone
+        # rather than silently discarding data.
+        merged = []
+        for idx, item in enumerate(folded):
+            is_blank_desc = not (item.get("Description") or "").strip()
+            has_next = idx + 1 < len(folded)
+            if is_blank_desc and not item.get("charge") and has_next and not folded[idx + 1].get("charge"):
+                nxt = folded[idx + 1]
+                for key in ("HSN", "Quantity", "Rate", "Amount"):
+                    if nxt.get(key) is None and item.get(key) is not None:
+                        nxt[key] = item[key]
+                # This orphan row has no HSN/Quantity/Rate of its own either
+                # (nothing else to identify it except a bare money figure) -
+                # on a table too garbled to separate "Rate (Incl. of Tax)"
+                # from "Amount" into two distinct detected columns, the
+                # next item's own "Amount" is really just whichever value
+                # landed nearest the one detected money column, which can
+                # easily be the wrong one of the two. This orphan value,
+                # printed on its own stray line, is the more reliable of
+                # the two - take it over the next item's own guess rather
+                # than only filling a gap.
+                if (
+                    item.get("Amount") is not None
+                    and item.get("HSN") is None
+                    and item.get("Quantity") is None
+                    and item.get("Rate") is None
+                    and nxt.get("Amount") != item.get("Amount")
+                ):
+                    nxt["Amount"] = item["Amount"]
+                continue
+            merged.append(item)
+        folded = merged
         items = folded
 
         # Cleanup
