@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import Counter
 
 # The born-digital fast path yields real Unicode text (e.g. 'ī', curly quotes)
 # that a Windows cp1252 console can't print — a bare print() would raise
@@ -188,6 +189,48 @@ def _invoice_no_differs(a, b):
     Sample: _invoice_no_differs('SW26-27804780', 'SW26-27B04780') -> False
     Sample: _invoice_no_differs('D/2026-27/541', 'D/2026-27/542') -> True"""
     return a.upper().translate(_INVOICE_NO_CANON) != b.upper().translate(_INVOICE_NO_CANON)
+
+
+def _resolve_consensus_value(votes):
+    """Pick a single-value field's own displayed text (Invoice No., Vendor
+    Code, Seller/Buyer/Consignee Name, ...) from every page's own reading
+    of it, not just whichever page happened to open the group first - a
+    multi-page invoice reprints these identically on every page, but a
+    poor scan can OCR any one page's copy slightly differently (a single
+    misread character, not necessarily one of the specific pairs
+    _INVOICE_NO_CANON already tolerates for the page-GROUPING decision -
+    this is a separate, more general correction of the stored VALUE
+    itself). Letting whichever page merely came first win would keep a
+    misread even when every other page agrees on the correct spelling.
+
+    Votes the correct spelling CHARACTER BY CHARACTER rather than treating
+    each page's whole reading as one atomic choice - two pages can each
+    have their OWN single-character slip in a DIFFERENT position, in which
+    case no single page's full text is "most common" on its own, but the
+    correct spelling can still be reconstructed position by position.
+    Only votes sharing the most common LENGTH take part (a reading with a
+    genuinely different length reflects more than a one-character slip,
+    not something a position-by-position vote could meaningfully align) -
+    falls back to the single most common whole reading when that leaves
+    nothing to vote with.
+    With only 2 conflicting same-length readings (no 3rd page to break the
+    tie), falls back to the first one - no worse than every field already
+    defaulted to before this existed.
+    Sample: _resolve_consensus_value(['SW26-27804780', 'SW26-27B04780', 'SW26-27B04780']) -> 'SW26-27B04780'"""
+    votes = [v for v in votes if v]
+    if not votes:
+        return ""
+    if len(set(votes)) == 1:
+        return votes[0]
+    length_counts = Counter(len(v) for v in votes)
+    winning_length = length_counts.most_common(1)[0][0]
+    aligned = [v for v in votes if len(v) == winning_length]
+    if len(aligned) < 2:
+        return Counter(votes).most_common(1)[0][0]
+    return "".join(
+        Counter(v[i] for v in aligned).most_common(1)[0][0]
+        for i in range(winning_length)
+    )
 
 
 def _is_near_duplicate(value, already):
@@ -1336,7 +1379,7 @@ class OCREngine:
 
         def _new_group():
             return {"text": [], "fields": [], "items": [], "tax": [], "invoice_no": "",
-                     "page_start": None, "page_end": None}
+                     "invoice_no_votes": [], "page_start": None, "page_end": None}
 
         for page_no, (boxes, image) in enumerate(
             page_inputs,
@@ -1420,8 +1463,16 @@ class OCREngine:
             if is_eway_bill_page:
                 continue
 
-            if page_invoice_no and not group["invoice_no"]:
-                group["invoice_no"] = page_invoice_no
+            if page_invoice_no:
+                # Kept immediately for the SYNCHRONOUS "does this NEXT page
+                # open a new group" comparison just above, which needs
+                # some representative value before every page is even
+                # seen yet - the group's own FINAL invoice_no is resolved
+                # from every page's vote (see _resolve_consensus_value)
+                # once the whole file has been read, below.
+                if not group["invoice_no"]:
+                    group["invoice_no"] = page_invoice_no
+                group["invoice_no_votes"].append(page_invoice_no)
 
 
             # -------------------------------------
@@ -1483,6 +1534,9 @@ class OCREngine:
         if not groups:
             groups.append(_new_group())
 
+        for g in groups:
+            g["invoice_no"] = _resolve_consensus_value(g["invoice_no_votes"])
+
         if progress:
             progress(0.97)
 
@@ -1535,19 +1589,29 @@ class OCREngine:
         }
 
         merged_fields = {}
+        # Every page's own reading of a single-value field is kept as a
+        # vote, not just the first page's - see _resolve_consensus_value's
+        # own note (the same character-by-character reconstruction
+        # _invoice_no_votes above already relies on, just applied to these
+        # fields too).
+        single_value_votes = {}
         for fields in group["fields"]:
             for key, value in fields.items():
                 if not value:
                     continue
+                if key in _SINGLE_VALUE_FIELDS:
+                    single_value_votes.setdefault(key, []).append(value)
+                    continue
                 if key not in merged_fields:
                     merged_fields[key] = value
-                elif key in _SINGLE_VALUE_FIELDS:
-                    continue
                 elif value not in merged_fields[key] and not _is_near_duplicate(
                     value, merged_fields[key]
                 ):
                     # Append multiline values
                     merged_fields[key] += "\n" + value
+
+        for key, votes in single_value_votes.items():
+            merged_fields[key] = _resolve_consensus_value(votes)
 
         # Seller GSTIN fallback: the per-page anchor pass only sees the
         # header/footer bands, so a seller GSTIN printed inside the item-table
