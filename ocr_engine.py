@@ -559,12 +559,47 @@ class OCREngine:
         except Exception:  # noqa: BLE001 - progress must never break extraction
             pass
 
+    def _zoom_crop_reread(self, image, box):
+        """Crop one box's own region out of the full-resolution page image,
+        upscale it, and re-OCR only that small crop - the shared mechanics
+        both _retry_low_confidence_boxes (triggered by low confidence) and
+        _zoom_retry_single_value_fields (triggered by field identity,
+        regardless of confidence) build on. Returns the single resulting
+        box dict ({"text", "confidence"}), or None when the crop's own
+        padding picked up more than one token (ambiguous to use safely) or
+        nothing at all - never raises."""
+        h, w = image.shape[:2]
+        pad = max(4, int(round(box.get("height", 20) * 0.3)))
+        top = max(0, int(box["top"]) - pad)
+        bottom = min(h, int(box["bottom"]) + pad)
+        left = max(0, int(box["left"]) - pad)
+        right = min(w, int(box["right"]) + pad)
+        if bottom <= top or right <= left:
+            return None
+        crop = image[top:bottom, left:right]
+        scale = 3
+        crop = cv2.resize(
+            crop, (crop.shape[1] * scale, crop.shape[0] * scale),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        try:
+            with OCREngine._ocr_lock:
+                OCREngine.initialize()
+                # cls=False - measured at ~85% of this call's own cost
+                # (0.294s -> 0.045s) and needless here: the crop comes
+                # from a page already oriented correctly by the main OCR
+                # pass above, not a fresh, possibly-rotated photo.
+                retry_result = OCREngine._ocr.ocr(crop, det=True, rec=True, cls=False)
+        except Exception:  # noqa: BLE001 - the retry is a nice-to-have, never fatal
+            return None
+        retry_boxes = self.normalize_result(retry_result)
+        return retry_boxes[0] if len(retry_boxes) == 1 else None
+
     def _retry_low_confidence_boxes(self, image, boxes):
         """A second, closer look at the few boxes PaddleOCR itself flagged
-        as unclear (confidence below _LOW_CONFIDENCE_RETRY_THRESHOLD) -
-        crop just that one box's own region out of the full-resolution
-        page image, upscale it, and re-OCR only that small crop. See the
-        threshold/cap/accept constants' own calibration notes above for
+        as unclear (confidence below _LOW_CONFIDENCE_RETRY_THRESHOLD) - see
+        _zoom_crop_reread for the shared crop/upscale/re-OCR mechanics, and
+        the threshold/cap/accept constants' own calibration notes above for
         why this stays cheap (capped, rare) and conservative (never
         accepts a merely-less-bad re-read). Returns `boxes` with any
         accepted re-reads applied in place; always safe to call with an
@@ -579,45 +614,93 @@ class OCREngine:
         if not candidates:
             return boxes
         candidates.sort(key=lambda b: b["confidence"])
-        h, w = image.shape[:2]
         for b in candidates[:_LOW_CONFIDENCE_RETRY_MAX_BOXES]:
-            pad = max(4, int(round(b.get("height", 20) * 0.3)))
-            top = max(0, int(b["top"]) - pad)
-            bottom = min(h, int(b["bottom"]) + pad)
-            left = max(0, int(b["left"]) - pad)
-            right = min(w, int(b["right"]) + pad)
-            if bottom <= top or right <= left:
-                continue
-            crop = image[top:bottom, left:right]
-            scale = 3
-            crop = cv2.resize(
-                crop, (crop.shape[1] * scale, crop.shape[0] * scale),
-                interpolation=cv2.INTER_CUBIC,
-            )
-            try:
-                with OCREngine._ocr_lock:
-                    OCREngine.initialize()
-                    # cls=False - measured at ~85% of this call's own cost
-                    # (0.294s -> 0.045s) and needless here: the crop comes
-                    # from a page already oriented correctly by the main
-                    # OCR pass above, not a fresh, possibly-rotated photo.
-                    retry_result = OCREngine._ocr.ocr(crop, det=True, rec=True, cls=False)
-            except Exception:  # noqa: BLE001 - the retry is a nice-to-have, never fatal
-                continue
-            retry_boxes = self.normalize_result(retry_result)
-            # Only a clean, single-token re-read is trusted - more than one
-            # means the crop's own padding picked up a neighbouring word
-            # too (ambiguous to merge back safely), none means the retry
-            # found nothing there at all. Either way, leave the original
-            # reading in place rather than guess.
+            retry_box = self._zoom_crop_reread(image, b)
+            # A merely-less-bad re-read is never trusted, only a genuinely
+            # clean, more confident one - see the retry's own docstring.
             if (
-                len(retry_boxes) == 1
-                and retry_boxes[0]["confidence"] > b["confidence"]
-                and retry_boxes[0]["confidence"] >= _LOW_CONFIDENCE_RETRY_ACCEPT_MIN
+                retry_box is not None
+                and retry_box["confidence"] > b["confidence"]
+                and retry_box["confidence"] >= _LOW_CONFIDENCE_RETRY_ACCEPT_MIN
             ):
-                b["text"] = retry_boxes[0]["text"]
-                b["confidence"] = retry_boxes[0]["confidence"]
+                b["text"] = retry_box["text"]
+                b["confidence"] = retry_box["confidence"]
         return boxes
+
+    # Single-value fields reprinted identically across a multi-page
+    # invoice already get a correction chance from _resolve_consensus_value
+    # (another page's own reading outvotes a misread one) - but a
+    # SINGLE-page invoice has no second reading to vote against at all, so
+    # a confidently-WRONG character swap (e.g. "8" read in place of "B" at
+    # 0.957 confidence - well above the low-confidence retry's own 0.75
+    # floor, so that mechanism never even looks at it) sails through
+    # unexamined. These fields matter enough (they identify the invoice
+    # itself, or the vendor) to warrant a zoom-in second look UNCONDITIONALLY,
+    # not just when the model already doubts itself - confirmed effective
+    # directly: a forced zoom-in re-read of that exact Sureworks box, bypassing
+    # the confidence gate entirely, read "SW26-27B04780" at 0.9636 confidence,
+    # higher than the original misread's own 0.957.
+    _ZOOM_RETRY_FIELD_NAMES = (
+        "Invoice No.", "Seller Name", "Buyer Name", "Consignee Name",
+    )
+
+    def _zoom_retry_single_value_fields(self, image, boxes, fields):
+        """For each of _ZOOM_RETRY_FIELD_NAMES present in `fields`, find the
+        ONE page box whose own text exactly equals that field's extracted
+        value (multi-word fields spread across several boxes are skipped -
+        safely ambiguous to recombine, not worth the risk) and re-read it
+        unconditionally (see this class's own comment above for why
+        confidence alone isn't a reliable enough gate for these specific
+        fields). When the zoomed re-read disagrees with the original, the
+        SAME character-by-character consensus _resolve_consensus_value
+        already uses for cross-page votes decides the field's final value
+        between the two readings. Returns `fields` with any corrections
+        applied in place; a field with no exact single-box match, or whose
+        zoomed re-read doesn't actually differ, costs nothing beyond that
+        one lookup. A born-digital page has no `image` to crop from (its
+        text comes straight off the PDF's own text layer, not a rasterised
+        page) - and no reason to need this anyway, since that text is
+        already exact - so this is a no-op there."""
+        if image is None or not boxes:
+            return fields
+        by_text = {}
+        for b in boxes:
+            by_text.setdefault(b["text"], []).append(b)
+        for name in self._ZOOM_RETRY_FIELD_NAMES:
+            value = (fields.get(name) or "").strip()
+            if not value:
+                continue
+            matches = by_text.get(value)
+            if not matches or len(matches) != 1:
+                continue
+            original_box = matches[0]
+            retry_box = self._zoom_crop_reread(image, original_box)
+            # A straight confidence comparison, not _resolve_consensus_value's
+            # character-vote - that one only makes sense across several
+            # independent readings with no confidence to compare (the
+            # cross-page case), and would otherwise keep the ORIGINAL
+            # reading on an exact tie (e.g. one differing character, 1
+            # vote each) purely because it happened to be listed first -
+            # exactly backwards here, where the zoomed-in re-read (a
+            # deliberately closer look, not just another equal vote) is
+            # the one actually worth trusting when it disagrees.
+            #
+            # Length-preserving only: the real failure mode this guards
+            # against is a single CHARACTER SWAP (e.g. "8" misread for
+            # "B"), where a closer look at the same glyph is trustworthy.
+            # A re-read that instead drops or adds a character is a
+            # different, segmentation-level mistake a 3x-upscaled crop is
+            # prone to - and accepting one cost a real multi-page file its
+            # correct grouping (a dropped character broke the cross-page
+            # invoice-number match despite scoring higher confidence).
+            if (
+                retry_box is not None
+                and retry_box["text"] != value
+                and len(retry_box["text"]) == len(value)
+                and retry_box["confidence"] > original_box.get("confidence", 0)
+            ):
+                fields[name] = retry_box["text"]
+        return fields
 
     def process_page(
         self,
@@ -829,6 +912,9 @@ class OCREngine:
                 header_rows,
                 footer_rows,
                 page_width
+            )
+            header_fields = self._zoom_retry_single_value_fields(
+                image, boxes, header_fields
             )
             self._report(0.85)      # header fields read
 
