@@ -117,6 +117,35 @@ def _looks_like_blurry_page(image):
     return cv2.Laplacian(gray, cv2.CV_64F).var() < _BLUR_VARIANCE_MIN
 
 
+# Calibrated against a real survey of ~2,900 OCR'd text boxes across the
+# trained-format sample corpus: ~2.6% read below 0.80 confidence, ~1.1%
+# below 0.70. A genuinely garbled line found during testing ("Service
+# Desk- ion15TechncianLicns nntMangment", correct text badly corrupted)
+# sat at 0.71 - this threshold sits just above that, so it catches real
+# garbling without re-triggering on the vast majority of merely-imperfect
+# but still-correct text. NOT a fix for a CONFIDENTLY wrong single-
+# character misread ("8" read instead of "B" at 0.957 confidence,
+# "SapphireIMS" read as "SapphirelMS" at 0.95) - those look fine to the
+# model and need the separate _INVOICE_NO_CANON-style tolerance instead;
+# this only ever helps the rarer case where the model itself flags a
+# region as unclear.
+_LOW_CONFIDENCE_RETRY_THRESHOLD = 0.75
+
+# A hard cap, not just a soft expectation - even a worst-case page with
+# many low-confidence boxes (e.g. a genuinely illegible scan already
+# otherwise headed for UNSUPPORTED/DATA MISMATCH) only ever pays for this
+# many extra small crop re-reads, never a second full-page OCR pass. The
+# common case (every box already confident) costs nothing at all, same
+# reasoning the "don't slow down processing" requirement asked for.
+_LOW_CONFIDENCE_RETRY_MAX_BOXES = 5
+
+# The crop is re-read only accepted when it is BOTH more confident than
+# the original AND clears this absolute floor on its own - "better but
+# still bad" (e.g. 0.71 -> 0.74) is not trusted just for being an
+# improvement, only a genuinely clean re-read is.
+_LOW_CONFIDENCE_RETRY_ACCEPT_MIN = 0.85
+
+
 # "|" is a vertical-stroke glyph OCR genuinely confuses for "I" (read as
 # "I" on one page's scan of the SAME invoice, correctly as "|" on
 # another) - canonicalized away before comparing two pages' own "Invoice
@@ -126,14 +155,37 @@ def _looks_like_blurry_page(image):
 # numbers (e.g. sequential "...541" vs "...542") must still compare as
 # different, so only this exact narrow confusion is normalized, nothing
 # broader (extend the translate table if/when another such pair turns up).
-_INVOICE_NO_CANON = str.maketrans({"|": "I"})
+# "8" vs "B" is the same kind of confusion (Sureworks' own "SW26-27B04780"
+# read as "SW26-27804780" on one page of the same 3-page invoice, correctly
+# on the other two) - added here for the same reason.
+# "1" and "l" (lowercase L, already folded to "L" by the .upper() below)
+# are the same family of vertical-stroke confusion as "|"/"I" - added
+# proactively, not from a confirmed real failure like the other two, so
+# carries more regression risk (both are common characters) - verified
+# against the full multi-page sample corpus before being trusted.
+# "2"/"Z" and "6"/"G" are further well-known OCR confusion pairs, added
+# the same proactive way but kept to characters uncommon enough in real
+# invoice numbers to keep the collision risk low. "9"/"g" is NOT included
+# despite being an equally well-known pair - the comparison below is
+# case-insensitive (.upper() folds "g" to "G" first), so mapping "9" to
+# "G" would also wrongly equate "6" and "9" with each other, a confusion
+# that doesn't exist in the real world. "0"/"O" and "5"/"S" are also
+# deliberately NOT included - both characters are far too common in real
+# invoice numbers (every date, every sequence number) for a blanket merge
+# to be safe without a confirmed real failure forcing the issue, the same
+# bar "|"/"I" and "8"/"B" were each held to.
+_INVOICE_NO_CANON = str.maketrans({
+    "|": "I", "8": "B", "1": "I", "L": "I",
+    "2": "Z", "6": "G",
+})
 
 
 def _invoice_no_differs(a, b):
     """True when two pages' own "Invoice No." readings are different
-    invoices, not just a stray "|"/"I" OCR misread on the same one - see
-    _INVOICE_NO_CANON's own note.
+    invoices, not just a stray "|"/"I"/"1"/"l" or "8"/"B" OCR misread on
+    the same one - see _INVOICE_NO_CANON's own note.
     Sample: _invoice_no_differs('26|1TN1L2501832', '26I1TN1L2501832') -> False
+    Sample: _invoice_no_differs('SW26-27804780', 'SW26-27B04780') -> False
     Sample: _invoice_no_differs('D/2026-27/541', 'D/2026-27/542') -> True"""
     return a.upper().translate(_INVOICE_NO_CANON) != b.upper().translate(_INVOICE_NO_CANON)
 
@@ -464,6 +516,66 @@ class OCREngine:
         except Exception:  # noqa: BLE001 - progress must never break extraction
             pass
 
+    def _retry_low_confidence_boxes(self, image, boxes):
+        """A second, closer look at the few boxes PaddleOCR itself flagged
+        as unclear (confidence below _LOW_CONFIDENCE_RETRY_THRESHOLD) -
+        crop just that one box's own region out of the full-resolution
+        page image, upscale it, and re-OCR only that small crop. See the
+        threshold/cap/accept constants' own calibration notes above for
+        why this stays cheap (capped, rare) and conservative (never
+        accepts a merely-less-bad re-read). Returns `boxes` with any
+        accepted re-reads applied in place; always safe to call with an
+        empty or all-confident list (returns immediately, no OCR cost)."""
+        if not boxes:
+            return boxes
+        candidates = [
+            b for b in boxes
+            if b.get("confidence") is not None
+            and b["confidence"] < _LOW_CONFIDENCE_RETRY_THRESHOLD
+        ]
+        if not candidates:
+            return boxes
+        candidates.sort(key=lambda b: b["confidence"])
+        h, w = image.shape[:2]
+        for b in candidates[:_LOW_CONFIDENCE_RETRY_MAX_BOXES]:
+            pad = max(4, int(round(b.get("height", 20) * 0.3)))
+            top = max(0, int(b["top"]) - pad)
+            bottom = min(h, int(b["bottom"]) + pad)
+            left = max(0, int(b["left"]) - pad)
+            right = min(w, int(b["right"]) + pad)
+            if bottom <= top or right <= left:
+                continue
+            crop = image[top:bottom, left:right]
+            scale = 3
+            crop = cv2.resize(
+                crop, (crop.shape[1] * scale, crop.shape[0] * scale),
+                interpolation=cv2.INTER_CUBIC,
+            )
+            try:
+                with OCREngine._ocr_lock:
+                    OCREngine.initialize()
+                    # cls=False - measured at ~85% of this call's own cost
+                    # (0.294s -> 0.045s) and needless here: the crop comes
+                    # from a page already oriented correctly by the main
+                    # OCR pass above, not a fresh, possibly-rotated photo.
+                    retry_result = OCREngine._ocr.ocr(crop, det=True, rec=True, cls=False)
+            except Exception:  # noqa: BLE001 - the retry is a nice-to-have, never fatal
+                continue
+            retry_boxes = self.normalize_result(retry_result)
+            # Only a clean, single-token re-read is trusted - more than one
+            # means the crop's own padding picked up a neighbouring word
+            # too (ambiguous to merge back safely), none means the retry
+            # found nothing there at all. Either way, leave the original
+            # reading in place rather than guess.
+            if (
+                len(retry_boxes) == 1
+                and retry_boxes[0]["confidence"] > b["confidence"]
+                and retry_boxes[0]["confidence"] >= _LOW_CONFIDENCE_RETRY_ACCEPT_MIN
+            ):
+                b["text"] = retry_boxes[0]["text"]
+                b["confidence"] = retry_boxes[0]["confidence"]
+        return boxes
+
     def process_page(
         self,
         page_no,
@@ -513,6 +625,8 @@ class OCREngine:
                 boxes = self.normalize_result(
                     result
                 )
+
+                boxes = self._retry_low_confidence_boxes(image, boxes)
 
             self._report(0.55)      # text/OCR boxes in hand
 
