@@ -36,6 +36,7 @@ from invoice_schema import build_invoice_json, resolve_payment_terms, add_days_t
 from format_model import FormatModel
 import template_store
 import service_api
+import vendor_code
 
 # On a scanned/OCR'd page, a missing PDF-sourced field is normally left as
 # DATA MISMATCH (see _save_batch_to_db) - far more likely this one
@@ -828,6 +829,24 @@ class JobManager:
                                 # same review queue as a genuinely missing
                                 # code so a user can confirm it, same as a
                                 # doubtful SPRPUR PO does for PART.
+                                #
+                                # Newer upload convention for SERVICE only:
+                                # the code is typed as the last "_"-segment
+                                # of the PDF's own filename instead of
+                                # handwritten on the page (see
+                                # vendor_code.vendor_code_from_filename).
+                                # SERVICE-only and applied here (not in
+                                # build_invoice_json, which has no
+                                # invoice-type awareness) so PART — which
+                                # already gets its vendor code from Service
+                                # First and works fine — is untouched by it.
+                                # Typed, not OCR'd, so it's trusted outright
+                                # whenever the filename actually encodes one.
+                                filename_vendor_code = vendor_code.vendor_code_from_filename(filename)
+                                if filename_vendor_code:
+                                    data["Nav_VendorCode"] = filename_vendor_code
+                                    data["Pay_to_Vendor_No"] = filename_vendor_code
+                                    data["vendor_code_doubtful"] = False
                                 if not str(data.get("Nav_VendorCode") or "").strip():
                                     verdict = {"status": "DATA MISMATCH",
                                                "is_active": False, "is_synced": False,

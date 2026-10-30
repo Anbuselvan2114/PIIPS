@@ -262,6 +262,24 @@ def _is_near_duplicate(value, already):
 # monitor's screen size) - digits then a bare inch/feet mark, nothing else.
 _SIZE_SPEC_RE = re.compile(r'^\d+(\.\d+)?["\']$')
 
+# A model/part number with no letters at all (e.g. "# 516810-002",
+# "516810-002") has no alpha character for has_text's own isalpha() check to
+# catch, and it isn't a bare size spec either - but it is unmistakably a
+# product code, not a stray money/tax figure that leaked onto its own row:
+# a real monetary figure is only ever digits plus comma/period/currency
+# symbols (is_number already strips exactly those before matching), so the
+# "#" and/or the hyphen gluing two digit groups together here is never part
+# of a plain number. A mandatory "#" or a hyphen/slash actually joining two
+# digit groups is required - a bare digit run on its own (e.g. a leaked
+# phone number or amount with no punctuation) is already handled by the
+# existing number-exclusion logic and must NOT start matching here too, the
+# same regression a broader "any non-numeric token" rule caused earlier
+# (see has_text's own comment above). Deliberately excludes a plain
+# DD-MM-YYYY/DD/MM/YYYY date (same "digit groups joined by one separator"
+# shape) so a stray date sitting near the table isn't mistaken for one.
+_PART_NO_RE = re.compile(r"^#\s*\d[\d\-/]*\d$|^\d+(?:[\-/]\d+)+$")
+_DATE_LIKE_RE = re.compile(r"^\d{1,4}[/-]\d{1,2}[/-]\d{1,4}$")
+
 
 def _norm_gstin(value):
     """Uppercase, alphanumerics only — for comparing GSTIN values."""
@@ -2917,20 +2935,22 @@ class OCREngine:
                 glued = re.match(r"^(\d{1,3})[.)]?\s*([A-Za-z].*)$", first)
                 # Same measurement/warranty-period guard as split_serial_
                 # description's own two checks (a size like "8GB ..." or a
-                # validity period like "45 Days ...") - this token is real
-                # description content, not a serial number starting a new
-                # item. Without this, a wrapped continuation line beginning
-                # this way (e.g. "45 DAYS WARRNATY", the tail of a multi-
-                # line description) gets misread as "item start, serial
-                # 45", then folded back into the current item's Description
-                # anyway once row_has_values() finds nothing else on the
-                # row - but by then the leading number itself is already
-                # gone (only GB/TB/MB/KB had their own narrow reattachment
-                # fix-up below; DAYS and the rest of the unit list never
-                # did, and the reattachment only helps `cont`'s exact
+                # validity period like "45 Days ..."/"1 Years ...") - this
+                # token is real description content, not a serial number
+                # starting a new item. Without this, a wrapped continuation
+                # line beginning this way (e.g. "45 DAYS WARRNATY", or
+                # "1 YEARS WARRANTY" sitting on its own line after "1TB HDD"
+                # / "SATA", the tail of a multi-line description) gets
+                # misread as "item start, serial 45/1", then folded back
+                # into the current item's Description anyway once
+                # row_has_values() finds nothing else on the row - but by
+                # then the leading number itself is already gone (only
+                # GB/TB/MB/KB had their own narrow reattachment fix-up
+                # below; DAYS/YEARS/MONTHS and the rest of the unit list
+                # never did, and the reattachment only helps `cont`'s exact
                 # prefix anyway, not text a caller further down builds).
                 if glued and re.match(
-                    r"^\d{1,3}[.)]?\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?)\b",
+                    r"^\d{1,3}[.)]?\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?|YEARS?|MONTHS?)\b",
                     first,
                     re.IGNORECASE,
                 ):
@@ -3725,6 +3745,11 @@ class OCREngine:
                 has_text = (
                     any(c.isalpha() for c in row_text)
                     or any(_SIZE_SPEC_RE.match(w["text"].strip()) for w in words)
+                    or any(
+                        _PART_NO_RE.match(w["text"].strip())
+                        and not _DATE_LIKE_RE.match(w["text"].strip())
+                        for w in words
+                    )
                 )
 
                 # "HSN/SAC-84733099" glued onto its own wrapped line (see
@@ -4437,7 +4462,7 @@ class OCREngine:
                 # Leave it intact so it is not mis-split into a fake serial +
                 # "GB"/"TB"/"Days".
                 if match and re.fullmatch(
-                    r"\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?)",
+                    r"\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?|YEARS?|MONTHS?)",
                     text,
                     re.IGNORECASE,
                 ):
@@ -4452,7 +4477,7 @@ class OCREngine:
                 # here either - only the immediately-following unit matters,
                 # not whether anything else follows it.
                 if match and re.match(
-                    r"^\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?)\b",
+                    r"^\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?|YEARS?|MONTHS?)\b",
                     text,
                     re.IGNORECASE,
                 ):

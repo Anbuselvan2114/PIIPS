@@ -765,6 +765,7 @@ export default function Dashboard({ user }) {
             )}
             <DataTable columns={batchColumns} rows={batchRows} searchKeys={["batch", "created"]}
                        defaultSortKey="batch" defaultSortDir="desc"
+                       pageSize={5} pageSizeOptions={[5, 10, 20, 30, "all"]}
                        empty="No batches yet. Run Start to create one." />
           </div>
 
