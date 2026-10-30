@@ -2,14 +2,22 @@
 NAV Vendor Code correction/validation for SERVICE invoices.
 
 Since SERVICE never calls Service First (see service_api.py), the vendor
-code has no automatic source - it's hand-written onto the scanned page as
-"NAV Vendor Code : <code>" before upload (see anchor_extract.py's "Vendor
-Code" label), as a letter block (either the vendor name's own first word in
-full, e.g. "ZACO0215" for "Zaco Computers...", or two 3-letter blocks, each
-the start of one of the name's own words, e.g. "SARTEC03" for "SARASWATHI
+code has no automatic source. The current upload convention is to type it
+as the LAST underscore-separated segment of the PDF's own filename (e.g.
+"sure_invoice_surinfo01.pdf" -> "SURINFO01") - see vendor_code_from_filename().
+Typed straight into the filename, not handwritten and not OCR'd, so it
+needs no confusion-correction; it's trusted as read.
+
+Older uploads (made before this convention, or missing the segment) may
+still carry the code hand-written onto the scanned page instead, as
+"NAV Vendor Code : <code>" (see anchor_extract.py's "Vendor Code" label),
+as a letter block (either the vendor name's own first word in full, e.g.
+"ZACO0215" for "Zaco Computers...", or two 3-letter blocks, each the start
+of one of the name's own words, e.g. "SARTEC03" for "SARASWATHI
 TECHNOLOGIES") followed by a run of digits. Not a single fixed shape -
 correct_vendor_code() tries every plausible letter-block candidate derived
-from the vendor's own name and keeps whichever fits best.
+from the vendor's own name and keeps whichever fits best. This path is kept
+as the fallback for exactly that case.
 
 Poor handwriting is frequently misread letter-for-letter by OCR (P<->9,
 U/O/D<->0, I/L<->1, S<->5, G<->6, B<->8, Z<->2, ...). Since the vendor's own
@@ -19,7 +27,37 @@ the OCR reading.
 """
 
 import difflib
+import os
 import re
+
+# A real vendor code is always a letter block followed by a run of digits
+# (see this module's own docstring/correct_vendor_code) - at least 2
+# letters and 1 digit, 4 characters overall (correct_vendor_code's own
+# minimum). An ordinary filename segment that ISN'T a vendor code (e.g.
+# "invoice", a date stamp "20261030") won't match this shape, so
+# vendor_code_from_filename() can tell "this filename really encodes a
+# code" apart from "this is an old-style filename with no code in it at
+# all" and let the caller fall back to the on-page reading instead of
+# mistaking a random filename word for the vendor code.
+_FILENAME_CODE_RE = re.compile(r"(?i)^[A-Z]{2,}[0-9]+$")
+
+
+def vendor_code_from_filename(pdf_path):
+    """The NAV vendor code encoded in a SERVICE PDF's own filename (its
+    last "_"-separated segment), or '' when the name doesn't actually
+    encode one.
+
+    Sample: vendor_code_from_filename("sure_invoice_surinfo01.pdf") -> "SURINFO01"
+    Sample: vendor_code_from_filename("_surinfo01.pdf") -> "SURINFO01" (split
+            gives ['', 'surinfo01'] - the LAST element is taken regardless
+            of an empty one earlier in the name)
+    Sample: vendor_code_from_filename("sure_invoice.pdf") -> "" (last
+            segment "invoice" doesn't look like a real code - old-style
+            filename, no code appended)
+    """
+    stem = os.path.splitext(os.path.basename(pdf_path or ""))[0]
+    last = stem.split("_")[-1].strip().upper()
+    return last if _FILENAME_CODE_RE.match(last) else ""
 
 
 # The "Code" part of the "NAV Vendor Code :" caption is itself frequently

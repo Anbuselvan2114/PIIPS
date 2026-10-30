@@ -1382,27 +1382,38 @@ def build_invoice_json(result, pdf_path=""):
     order_no = fields.get("Buyer's Order No.", "")
 
     # SERVICE invoices never call Service First (see service_api.py), so
-    # the NAV vendor code has no automatic source for them - the user
-    # instead writes "Nav Vendor Code : <code>" by hand on a paper, which
-    # is then scanned into the PDF alongside the invoice, read here like
-    # any other labelled field off that scan. For PART this is overwritten
-    # by the real SF value once enrich_invoice runs; harmless if a PART
-    # template happens to print the same label too.
+    # the NAV vendor code has no automatic source for them. For PART this
+    # is overwritten by the real SF value once enrich_invoice runs;
+    # harmless if a PART template happens to print the same label too.
     #
-    # Handwriting is often poorly OCR'd - the code's own fixed shape (see
-    # vendor_code.py) lets a garbled reading usually be corrected against
-    # the vendor's own (already-extracted) name rather than trusted as-is.
-    vendor_code_raw = fields.get("Vendor Code", "").strip()
-    # The "Code" half of the caption is itself frequently OCR-garbled
-    # beyond recognition ("Cxde", "cde", ...), which keeps the labelled-
-    # field anchor above (needs literal "code") from ever firing at all -
-    # same gap buyer_order.py's free-text PO scan fills for a garbled
-    # SPRPUR prefix. Only tried when the anchor came up empty.
-    if not vendor_code_raw:
-        vendor_code_raw = vendor_code_lib.find_vendor_code_line(result.get("Text", ""))
-    vendor_code, vendor_code_confidence = vendor_code_lib.correct_vendor_code(
-        vendor_code_raw, fields.get("Seller Name", "")
-    )
+    # Current upload convention: the code is typed as the last "_"-segment
+    # of the PDF's own filename (see vendor_code_lib.vendor_code_from_filename)
+    # - typed, not handwritten, so it's trusted as read, no confusion-
+    # correction needed.
+    #
+    # Fallback for an older-style upload whose filename doesn't encode a
+    # code: the user instead writes "Nav Vendor Code : <code>" by hand on a
+    # paper, which is then scanned into the PDF alongside the invoice, read
+    # here like any other labelled field off that scan. Handwriting is
+    # often poorly OCR'd - the code's own fixed shape (see vendor_code.py)
+    # lets a garbled reading usually be corrected against the vendor's own
+    # (already-extracted) name rather than trusted as-is.
+    vendor_code = vendor_code_lib.vendor_code_from_filename(pdf_path)
+    if vendor_code:
+        vendor_code_confidence = "confident"
+    else:
+        vendor_code_raw = fields.get("Vendor Code", "").strip()
+        # The "Code" half of the caption is itself frequently OCR-garbled
+        # beyond recognition ("Cxde", "cde", ...), which keeps the
+        # labelled-field anchor above (needs literal "code") from ever
+        # firing at all - same gap buyer_order.py's free-text PO scan
+        # fills for a garbled SPRPUR prefix. Only tried when the anchor
+        # came up empty.
+        if not vendor_code_raw:
+            vendor_code_raw = vendor_code_lib.find_vendor_code_line(result.get("Text", ""))
+        vendor_code, vendor_code_confidence = vendor_code_lib.correct_vendor_code(
+            vendor_code_raw, fields.get("Seller Name", "")
+        )
     vendor_code_doubtful = vendor_code_confidence == "doubtful"
 
     # Some vendors don't print the PO in a labelled field — it's written (often
