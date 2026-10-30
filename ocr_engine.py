@@ -37,6 +37,15 @@ _PDF_POINT_SCALE = _OCR_DPI / 72.0
 # thin/garbage scanner text layer still goes through OCR.
 _MIN_TEXT_WORDS = 12
 _MIN_TEXT_CHARS = 60
+# A custom/subset font with no real ToUnicode CMap decodes every glyph to
+# the wrong Unicode codepoint - the page LOOKS born-digital (plenty of
+# "words", well past the thresholds above) but the text is pure gibberish
+# (e.g. "ueE  EgdE eE EaYuDgYEa"-shaped runs of Latin-Extended/IPA
+# characters, never a real English word). A normal English-language
+# business invoice is overwhelmingly plain ASCII letters; falling well
+# short of that on a page that otherwise passed the word/char-count check
+# is the signal to distrust the text layer and OCR the page instead.
+_MIN_ASCII_LETTER_RATIO = 0.5
 
 # ---- Photographed-page detection ------------------------------------------
 # A flatbed/app scan is a clean, evenly-lit rectangle of paper: the border is
@@ -471,6 +480,17 @@ class OCREngine:
         text_len = sum(len((w[4] or "").strip()) for w in words)
         if len(words) < _MIN_TEXT_WORDS or text_len < _MIN_TEXT_CHARS:
             return []
+
+        # See _MIN_ASCII_LETTER_RATIO's own comment: a broken/custom font
+        # can pass the checks above with plenty of "words" that are pure
+        # gibberish. Caught here (treated the same as "no usable text
+        # layer") so the page falls back to OCR instead of extracting
+        # confident nonsense.
+        letters = [c for w in words for c in (w[4] or "") if c.isalpha()]
+        if letters:
+            ascii_ratio = sum(1 for c in letters if c.isascii()) / len(letters)
+            if ascii_ratio < _MIN_ASCII_LETTER_RATIO:
+                return []
 
         # Merge words into line segments (by block+line), splitting where the
         # horizontal gap between consecutive words is large — this reproduces

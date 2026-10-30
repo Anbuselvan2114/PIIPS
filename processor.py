@@ -911,8 +911,10 @@ class JobManager:
                 fmt_model.save()
 
                 # Archive the trained PDFs: move each file that was actually
-                # learned/merged (not the no-GSTIN failures) from New_Format
-                # to the Trained_format folder.
+                # learned/merged from New_Format to the Trained_format folder
+                # (format_model.learn() now always returns a format - even a
+                # layout-only one when no seller GSTIN/name is readable - so
+                # every file in a training run is archived, not just some).
                 if job.trained_folder:
                     for r in job.results:
                         if r.get("status") != "success" or not r.get("format"):
