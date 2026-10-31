@@ -2150,7 +2150,7 @@ def search_invoices_by_number(query, limit=200):
     return rows
 
 
-def completed_invoices(limit=500):
+def completed_invoices(limit=None):
     """Every invoice whose tracker status is COMPLETED AND whose archive
     copy actually exists in <Folder Path>/ALL_INVOICES - the "Completed
     Invoices" menu's own list, same display shape as
@@ -2277,7 +2277,7 @@ def completed_invoices(limit=500):
             "vendor_code": "",
         })
 
-    return rows[:limit]
+    return rows[:limit] if limit else rows
 
 
 def invoices_by_status(status_id):
