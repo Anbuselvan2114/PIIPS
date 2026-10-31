@@ -488,16 +488,25 @@ class OCREngine:
         )
         
     def _pdf_text_boxes(self, page):
-        """Word boxes for a born-digital PDF page, in the SAME schema as
-        normalize_result, scaled to the 300-dpi pixel space the pipeline
-        expects. Returns [] when the page has no usable text layer (so it
-        falls back to OCR)."""
+        """(boxes, is_broken_font) for a born-digital PDF page, boxes in the
+        SAME schema as normalize_result, scaled to the 300-dpi pixel space
+        the pipeline expects. boxes is [] when the page has no usable text
+        layer (so it falls back to OCR); is_broken_font is True only when
+        that's because of a bad ASCII ratio (plenty of real text, just a
+        broken font encoding) - a genuinely scanned/photographed page with
+        no text layer at all is never "broken font", since there's no text
+        there to have a bad encoding in the first place. The distinction
+        matters to read_pdf: a broken-font page is still an original,
+        born-digital PDF (OCR reads the same crisp rendered page a normal
+        viewer would see) - never a scan/photocopy, so it must never be
+        rejected or gated by the allow_scanned_pdfs_* toggle the way an
+        actually-scanned page is."""
         if fitz is None:
-            return []
+            return [], False
         words = page.get_text("words") or []   # (x0,y0,x1,y1,word,block,line,n)
         text_len = sum(len((w[4] or "").strip()) for w in words)
         if len(words) < _MIN_TEXT_WORDS or text_len < _MIN_TEXT_CHARS:
-            return []
+            return [], False
 
         # See _MIN_ASCII_LETTER_RATIO's own comment: a broken/custom font
         # can pass the checks above with plenty of "words" that are pure
@@ -508,7 +517,7 @@ class OCREngine:
         if letters:
             ascii_ratio = sum(1 for c in letters if c.isascii()) / len(letters)
             if ascii_ratio < _MIN_ASCII_LETTER_RATIO:
-                return []
+                return [], True
 
         # Merge words into line segments (by block+line), splitting where the
         # horizontal gap between consecutive words is large — this reproduces
@@ -536,7 +545,7 @@ class OCREngine:
                 seg.append(w)
             if seg:
                 boxes.append(self._seg_box(seg, s))
-        return boxes
+        return boxes, False
 
     @staticmethod
     def _seg_box(seg, s):
@@ -1366,9 +1375,13 @@ class OCREngine:
 
         return "\n".join(output)
     def _page_inputs(self, pdf_path):
-        """Per-page (boxes, image) inputs. For a born-digital PDF page the
-        text layer supplies boxes (image=None, no OCR); scanned pages and
-        image files return (None, image) and are OCR'd as before."""
+        """Per-page (boxes, image, is_broken_font) inputs. For a born-digital
+        PDF page the text layer supplies boxes (image=None, no OCR);
+        scanned pages and image files return (None, image, False) and are
+        OCR'd as before. A page whose text layer exists but is undecodable
+        gibberish (see _pdf_text_boxes) also returns (None, image, True) -
+        still OCR'd, but flagged so read_pdf never mistakes it for an
+        actual scan/photocopy."""
         ext = os.path.splitext(pdf_path)[1].lower()
 
         if ext == ".pdf" and fitz is not None:
@@ -1380,17 +1393,20 @@ class OCREngine:
             if doc is not None:
                 try:
                     for page in doc:
-                        boxes = self._pdf_text_boxes(page)
+                        boxes, is_broken_font = self._pdf_text_boxes(page)
                         if boxes:
-                            inputs.append((boxes, None))          # fast path
+                            inputs.append((boxes, None, False))   # fast path
                         else:
-                            inputs.append((None, self._render_pdf_page(pdf_path, page.number + 1)))
+                            inputs.append((
+                                None, self._render_pdf_page(pdf_path, page.number + 1),
+                                is_broken_font,
+                            ))
                 finally:
                     doc.close()
                 return inputs
 
         # Non-PDF image files (or fitz unavailable): OCR every rasterised page.
-        return [(None, img) for img in self.file_to_images(pdf_path)]
+        return [(None, img, False) for img in self.file_to_images(pdf_path)]
 
     def read_pdf(
         self,
@@ -1428,7 +1444,14 @@ class OCREngine:
         # handheld photo is still rejected either way - OCR quality on an
         # actual photo (as opposed to a flat scan/photocopy) is unreliable
         # regardless of this setting.
-        rasterised = [image for _boxes, image in page_inputs if image is not None]
+        #
+        # A broken-font page (real text layer, undecodable encoding - see
+        # _pdf_text_boxes) is excluded from every check below: it's an
+        # original born-digital PDF, never a scan/photocopy/photo, so none
+        # of these rejections (or the allow_scanned toggle) ever apply to
+        # it - it always falls through to OCR on its own rendered page.
+        rasterised = [image for _boxes, image, is_broken_font in page_inputs
+                      if image is not None and not is_broken_font]
         if rasterised:
             photo_count = sum(1 for image in rasterised if _looks_like_photo_page(image))
             if photo_count * 2 > len(rasterised):
@@ -1505,7 +1528,7 @@ class OCREngine:
             return {"text": [], "fields": [], "items": [], "tax": [], "invoice_no": "",
                      "invoice_no_votes": [], "page_start": None, "page_end": None}
 
-        for page_no, (boxes, image) in enumerate(
+        for page_no, (boxes, image, _is_broken_font) in enumerate(
             page_inputs,
             start=1
         ):
@@ -2375,7 +2398,7 @@ class OCREngine:
         # dedicated charge-line handling further down.
         CHARGE_KW = ("freight", "frieght", "courier", "forwarding",
                      "shipping", "packing", "handling", "cartage",
-                     "loading", "insurance",
+                     "loading", "insurance", "round off", "rounding off",
                      # "deliver charge" (not bare "deliver"/"delivery") so
                      # this only catches an actual "Deliver(y) Charges" line
                      # item - a bare "deliver" also matched an unrelated
