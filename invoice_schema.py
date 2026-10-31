@@ -85,15 +85,24 @@ def _normalize_date(value):
 
     # dd-Mon-yy  or  dd-Mon-yyyy (the day-month separator is optional, not
     # just tolerant of different characters - an informal invoice
-    # sometimes glues them with no gap at all, e.g. "14July.26")
+    # sometimes glues them with no gap at all, e.g. "14July.26"). Also
+    # tolerates en/em dashes (–/—) as separators - some invoice
+    # templates print dates as "8 – Oct - 2026" using real dash
+    # typography, not a plain hyphen, same as that template's addresses
+    # ("Chennai – 600002").
     match = re.match(
-        r"(\d{1,2})[-/. ]*([A-Za-z]{3,})[-/. ]+(\d{2,4})",
+        r"(\d{1,2})[-/.–— ]*([A-Za-z0]{3,})[-/.–— ]+(\d{2,4})",
         value
     )
 
     if match:
         day, mon, year = match.groups()
-        mon = MONTHS.get(mon[:3].lower())
+        mon_key = mon[:3].lower()
+        # OCR commonly misreads the capital "O" in "Oct" as a digit zero
+        # ("3-0ct-26") - try that one well-known substitution before giving
+        # up, rather than widening month matching generally (which could
+        # start accepting genuinely unreadable text as a real month).
+        mon = MONTHS.get(mon_key) or MONTHS.get(mon_key.replace("0", "o"))
         # An unreadable day ("0-Jul-20" from a poor scan) or an unknown
         # month word is left blank so it surfaces as a missing Invoice Date
         # instead of a made-up "00-07-2020" / January.
@@ -105,7 +114,7 @@ def _normalize_date(value):
 
     # dd-mm-yyyy / dd/mm/yy / dd.mm.yyyy
     match = re.match(
-        r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})",
+        r"(\d{1,2})[-/.–—](\d{1,2})[-/.–—](\d{2,4})",
         value
     )
 
@@ -124,7 +133,7 @@ def _normalize_date(value):
     # \d{1,2} group can never match a spelled-out month name, so it
     # correctly never misfires on this format either way.
     match = re.match(
-        r"([A-Za-z]{3,})[-/. ]+(\d{1,2})[,]?[-/. ]+(\d{2,4})",
+        r"([A-Za-z]{3,})[-/.–— ]+(\d{1,2})[,]?[-/.–— ]+(\d{2,4})",
         value
     )
 
@@ -1057,6 +1066,14 @@ def _tax_amount(tax_total):
     return total if found else None
 
 
+# A rounding adjustment (e.g. "ROUNDING OFF  0.40") is never itself a
+# taxable supply - unlike a genuine charge (freight/transport/packing/...),
+# it must never be taxed at whatever rate the invoice's real charges
+# reconcile to below, even when it's classified as a charge line for
+# Service-First-matching purposes (see ocr_engine.py's CHARGE_KW).
+_ROUND_OFF_RE = re.compile(r"round(?:ing)?\s*off", re.IGNORECASE)
+
+
 def _rate_near(text, keyword):
     """First plausible percentage on a line that mentions `keyword`."""
 
@@ -1384,6 +1401,15 @@ def build_invoice_json(result, pdf_path=""):
     # by the real SF value once enrich_invoice runs; harmless if a PART
     # template happens to print the same label too.
     #
+    # SERVICE also supports a newer upload convention - the code typed as
+    # the last "_"-segment of the PDF's own filename instead of handwritten
+    # on the page (see vendor_code_lib.vendor_code_from_filename) - but
+    # that's SERVICE-specific and this function has no invoice-type
+    # awareness of its own (same reason buyer_order_no below is forced
+    # blank for SERVICE in processor.py rather than here), so it's applied
+    # as a processor.py override on top of this OCR-based read, not here;
+    # PART invoices are unaffected and keep exactly this behavior.
+    #
     # Handwriting is often poorly OCR'd - the code's own fixed shape (see
     # vendor_code.py) lets a garbled reading usually be corrected against
     # the vendor's own (already-extracted) name rather than trusted as-is.
@@ -1645,7 +1671,8 @@ def build_invoice_json(result, pdf_path=""):
             _num(it2["Amount"]) or 0 for it2 in items if not it2["_charge"]
         )
         freight_total = sum(
-            _num(it2["Amount"]) or 0 for it2 in items if it2["_charge"]
+            _num(it2["Amount"]) or 0 for it2 in items
+            if it2["_charge"] and not _ROUND_OFF_RE.search(it2["Description"])
         )
         if freight_total:
             candidate_0 = round(goods_total * rate / 100, 2)
@@ -1668,7 +1695,7 @@ def build_invoice_json(result, pdf_path=""):
                 resolved_rate = rate if diff_full < diff_0 else 0
             if resolved_rate is not None:
                 for it2 in items:
-                    if it2["_charge"]:
+                    if it2["_charge"] and not _ROUND_OFF_RE.search(it2["Description"]):
                         it2["TaxPercentage"] = resolved_rate if resolved_rate else "0"
                         it2["HSN_Percentage_Description"] = (
                             f"Goods {resolved_rate:g}%" if resolved_rate else ""

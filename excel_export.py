@@ -16,6 +16,8 @@ import os
 import re
 
 import openpyxl
+from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
 
 from invoice_schema import build_invoice_json
 
@@ -798,3 +800,51 @@ def build_workbook_from_sheets(data, out_path):
     """Write a workbook from pre-built {sheet: {columns, rows}} (e.g. rows
     read back from the database for a batch)."""
     return _write_workbook(data, out_path)
+
+
+def _prettify_report_column(name):
+    """"InvoiceDetails" -> "Invoice Details" - same rule as Reports.jsx's
+    own prettifyColumn (and report_pdf.py's copy), kept in sync by hand
+    since each lives in a different language/module. Only the displayed
+    header text changes; the column KEY used by /run and the frontend's
+    DataTable is untouched."""
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(name))
+    return name.replace("_", " ").strip()
+
+
+def write_report_rows_workbook(columns, rows, out_path, sheet_name="Report"):
+    """Write a single-sheet workbook straight from a report's generic
+    {columns, rows} shape (see database.run_report - rows are plain value
+    lists, positionally matching `columns`, not column-keyed dicts the way
+    _write_workbook's rows are). Deliberately NOT built on _write_workbook/
+    build_workbook_from_sheets: those load the PIIPS invoice TEMPLATE_PATH
+    workbook and only ever write into ITS fixed Purchase Header/Line/
+    Reservation Entry sheet names - exactly wrong for an arbitrary report's
+    own sheet/columns. Always a fresh, templateless workbook instead.
+    Sample: write_report_rows_workbook(['A'], [[1], [2]], 'out.xlsx')"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet_name[:31] or "Report"  # Excel's own sheet-name length cap
+    # Composite report columns (e.g. the SLA report's "Invoice Details")
+    # pack several labeled sub-values into one cell with CHAR(13)+CHAR(10)
+    # between them (see database.py's usp_Report_InvoiceStageSLA) - Excel
+    # only honours a bare '\n' as an in-cell line break (with wrap_text
+    # on), not '\r\n', so normalize before writing.
+    wrap_alignment = Alignment(wrap_text=True, vertical="top")
+
+    def _normalize(value):
+        if isinstance(value, str) and "\r\n" in value:
+            return value.replace("\r\n", "\n")
+        return value
+
+    ws.append([_prettify_report_column(c) for c in columns])
+    for row in rows:
+        ws.append([_normalize(v) for v in row])
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=len(columns)):
+        for cell in row:
+            cell.alignment = wrap_alignment
+    for idx in range(1, len(columns) + 1):
+        ws.column_dimensions[get_column_letter(idx)].width = 40
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    wb.save(out_path)
+    return out_path

@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import Counter
 
 # The born-digital fast path yields real Unicode text (e.g. 'ī', curly quotes)
 # that a Windows cp1252 console can't print — a bare print() would raise
@@ -36,6 +37,15 @@ _PDF_POINT_SCALE = _OCR_DPI / 72.0
 # thin/garbage scanner text layer still goes through OCR.
 _MIN_TEXT_WORDS = 12
 _MIN_TEXT_CHARS = 60
+# A custom/subset font with no real ToUnicode CMap decodes every glyph to
+# the wrong Unicode codepoint - the page LOOKS born-digital (plenty of
+# "words", well past the thresholds above) but the text is pure gibberish
+# (e.g. "ueE  EgdE eE EaYuDgYEa"-shaped runs of Latin-Extended/IPA
+# characters, never a real English word). A normal English-language
+# business invoice is overwhelmingly plain ASCII letters; falling well
+# short of that on a page that otherwise passed the word/char-count check
+# is the signal to distrust the text layer and OCR the page instead.
+_MIN_ASCII_LETTER_RATIO = 0.5
 
 # ---- Photographed-page detection ------------------------------------------
 # A flatbed/app scan is a clean, evenly-lit rectangle of paper: the border is
@@ -117,6 +127,35 @@ def _looks_like_blurry_page(image):
     return cv2.Laplacian(gray, cv2.CV_64F).var() < _BLUR_VARIANCE_MIN
 
 
+# Calibrated against a real survey of ~2,900 OCR'd text boxes across the
+# trained-format sample corpus: ~2.6% read below 0.80 confidence, ~1.1%
+# below 0.70. A genuinely garbled line found during testing ("Service
+# Desk- ion15TechncianLicns nntMangment", correct text badly corrupted)
+# sat at 0.71 - this threshold sits just above that, so it catches real
+# garbling without re-triggering on the vast majority of merely-imperfect
+# but still-correct text. NOT a fix for a CONFIDENTLY wrong single-
+# character misread ("8" read instead of "B" at 0.957 confidence,
+# "SapphireIMS" read as "SapphirelMS" at 0.95) - those look fine to the
+# model and need the separate _INVOICE_NO_CANON-style tolerance instead;
+# this only ever helps the rarer case where the model itself flags a
+# region as unclear.
+_LOW_CONFIDENCE_RETRY_THRESHOLD = 0.75
+
+# A hard cap, not just a soft expectation - even a worst-case page with
+# many low-confidence boxes (e.g. a genuinely illegible scan already
+# otherwise headed for UNSUPPORTED/DATA MISMATCH) only ever pays for this
+# many extra small crop re-reads, never a second full-page OCR pass. The
+# common case (every box already confident) costs nothing at all, same
+# reasoning the "don't slow down processing" requirement asked for.
+_LOW_CONFIDENCE_RETRY_MAX_BOXES = 5
+
+# The crop is re-read only accepted when it is BOTH more confident than
+# the original AND clears this absolute floor on its own - "better but
+# still bad" (e.g. 0.71 -> 0.74) is not trusted just for being an
+# improvement, only a genuinely clean re-read is.
+_LOW_CONFIDENCE_RETRY_ACCEPT_MIN = 0.85
+
+
 # "|" is a vertical-stroke glyph OCR genuinely confuses for "I" (read as
 # "I" on one page's scan of the SAME invoice, correctly as "|" on
 # another) - canonicalized away before comparing two pages' own "Invoice
@@ -126,16 +165,81 @@ def _looks_like_blurry_page(image):
 # numbers (e.g. sequential "...541" vs "...542") must still compare as
 # different, so only this exact narrow confusion is normalized, nothing
 # broader (extend the translate table if/when another such pair turns up).
-_INVOICE_NO_CANON = str.maketrans({"|": "I"})
+# "8" vs "B" is the same kind of confusion (Sureworks' own "SW26-27B04780"
+# read as "SW26-27804780" on one page of the same 3-page invoice, correctly
+# on the other two) - added here for the same reason.
+# "1" and "l" (lowercase L, already folded to "L" by the .upper() below)
+# are the same family of vertical-stroke confusion as "|"/"I" - added
+# proactively, not from a confirmed real failure like the other two, so
+# carries more regression risk (both are common characters) - verified
+# against the full multi-page sample corpus before being trusted.
+# "2"/"Z" and "6"/"G" are further well-known OCR confusion pairs, added
+# the same proactive way but kept to characters uncommon enough in real
+# invoice numbers to keep the collision risk low. "9"/"g" is NOT included
+# despite being an equally well-known pair - the comparison below is
+# case-insensitive (.upper() folds "g" to "G" first), so mapping "9" to
+# "G" would also wrongly equate "6" and "9" with each other, a confusion
+# that doesn't exist in the real world. "0"/"O" and "5"/"S" are also
+# deliberately NOT included - both characters are far too common in real
+# invoice numbers (every date, every sequence number) for a blanket merge
+# to be safe without a confirmed real failure forcing the issue, the same
+# bar "|"/"I" and "8"/"B" were each held to.
+_INVOICE_NO_CANON = str.maketrans({
+    "|": "I", "8": "B", "1": "I", "L": "I",
+    "2": "Z", "6": "G",
+})
 
 
 def _invoice_no_differs(a, b):
     """True when two pages' own "Invoice No." readings are different
-    invoices, not just a stray "|"/"I" OCR misread on the same one - see
-    _INVOICE_NO_CANON's own note.
+    invoices, not just a stray "|"/"I"/"1"/"l" or "8"/"B" OCR misread on
+    the same one - see _INVOICE_NO_CANON's own note.
     Sample: _invoice_no_differs('26|1TN1L2501832', '26I1TN1L2501832') -> False
+    Sample: _invoice_no_differs('SW26-27804780', 'SW26-27B04780') -> False
     Sample: _invoice_no_differs('D/2026-27/541', 'D/2026-27/542') -> True"""
     return a.upper().translate(_INVOICE_NO_CANON) != b.upper().translate(_INVOICE_NO_CANON)
+
+
+def _resolve_consensus_value(votes):
+    """Pick a single-value field's own displayed text (Invoice No., Vendor
+    Code, Seller/Buyer/Consignee Name, ...) from every page's own reading
+    of it, not just whichever page happened to open the group first - a
+    multi-page invoice reprints these identically on every page, but a
+    poor scan can OCR any one page's copy slightly differently (a single
+    misread character, not necessarily one of the specific pairs
+    _INVOICE_NO_CANON already tolerates for the page-GROUPING decision -
+    this is a separate, more general correction of the stored VALUE
+    itself). Letting whichever page merely came first win would keep a
+    misread even when every other page agrees on the correct spelling.
+
+    Votes the correct spelling CHARACTER BY CHARACTER rather than treating
+    each page's whole reading as one atomic choice - two pages can each
+    have their OWN single-character slip in a DIFFERENT position, in which
+    case no single page's full text is "most common" on its own, but the
+    correct spelling can still be reconstructed position by position.
+    Only votes sharing the most common LENGTH take part (a reading with a
+    genuinely different length reflects more than a one-character slip,
+    not something a position-by-position vote could meaningfully align) -
+    falls back to the single most common whole reading when that leaves
+    nothing to vote with.
+    With only 2 conflicting same-length readings (no 3rd page to break the
+    tie), falls back to the first one - no worse than every field already
+    defaulted to before this existed.
+    Sample: _resolve_consensus_value(['SW26-27804780', 'SW26-27B04780', 'SW26-27B04780']) -> 'SW26-27B04780'"""
+    votes = [v for v in votes if v]
+    if not votes:
+        return ""
+    if len(set(votes)) == 1:
+        return votes[0]
+    length_counts = Counter(len(v) for v in votes)
+    winning_length = length_counts.most_common(1)[0][0]
+    aligned = [v for v in votes if len(v) == winning_length]
+    if len(aligned) < 2:
+        return Counter(votes).most_common(1)[0][0]
+    return "".join(
+        Counter(v[i] for v in aligned).most_common(1)[0][0]
+        for i in range(winning_length)
+    )
 
 
 def _is_near_duplicate(value, already):
@@ -157,6 +261,24 @@ def _is_near_duplicate(value, already):
 # A physical-dimension spec with no unit word of its own (e.g. `18.5"` for a
 # monitor's screen size) - digits then a bare inch/feet mark, nothing else.
 _SIZE_SPEC_RE = re.compile(r'^\d+(\.\d+)?["\']$')
+
+# A model/part number with no letters at all (e.g. "# 516810-002",
+# "516810-002") has no alpha character for has_text's own isalpha() check to
+# catch, and it isn't a bare size spec either - but it is unmistakably a
+# product code, not a stray money/tax figure that leaked onto its own row:
+# a real monetary figure is only ever digits plus comma/period/currency
+# symbols (is_number already strips exactly those before matching), so the
+# "#" and/or the hyphen gluing two digit groups together here is never part
+# of a plain number. A mandatory "#" or a hyphen/slash actually joining two
+# digit groups is required - a bare digit run on its own (e.g. a leaked
+# phone number or amount with no punctuation) is already handled by the
+# existing number-exclusion logic and must NOT start matching here too, the
+# same regression a broader "any non-numeric token" rule caused earlier
+# (see has_text's own comment above). Deliberately excludes a plain
+# DD-MM-YYYY/DD/MM/YYYY date (same "digit groups joined by one separator"
+# shape) so a stray date sitting near the table isn't mistaken for one.
+_PART_NO_RE = re.compile(r"^#\s*\d[\d\-/]*\d$|^\d+(?:[\-/]\d+)+$")
+_DATE_LIKE_RE = re.compile(r"^\d{1,4}[/-]\d{1,2}[/-]\d{1,4}$")
 
 
 def _norm_gstin(value):
@@ -366,16 +488,36 @@ class OCREngine:
         )
         
     def _pdf_text_boxes(self, page):
-        """Word boxes for a born-digital PDF page, in the SAME schema as
-        normalize_result, scaled to the 300-dpi pixel space the pipeline
-        expects. Returns [] when the page has no usable text layer (so it
-        falls back to OCR)."""
+        """(boxes, is_broken_font) for a born-digital PDF page, boxes in the
+        SAME schema as normalize_result, scaled to the 300-dpi pixel space
+        the pipeline expects. boxes is [] when the page has no usable text
+        layer (so it falls back to OCR); is_broken_font is True only when
+        that's because of a bad ASCII ratio (plenty of real text, just a
+        broken font encoding) - a genuinely scanned/photographed page with
+        no text layer at all is never "broken font", since there's no text
+        there to have a bad encoding in the first place. The distinction
+        matters to read_pdf: a broken-font page is still an original,
+        born-digital PDF (OCR reads the same crisp rendered page a normal
+        viewer would see) - never a scan/photocopy, so it must never be
+        rejected or gated by the allow_scanned_pdfs_* toggle the way an
+        actually-scanned page is."""
         if fitz is None:
-            return []
+            return [], False
         words = page.get_text("words") or []   # (x0,y0,x1,y1,word,block,line,n)
         text_len = sum(len((w[4] or "").strip()) for w in words)
         if len(words) < _MIN_TEXT_WORDS or text_len < _MIN_TEXT_CHARS:
-            return []
+            return [], False
+
+        # See _MIN_ASCII_LETTER_RATIO's own comment: a broken/custom font
+        # can pass the checks above with plenty of "words" that are pure
+        # gibberish. Caught here (treated the same as "no usable text
+        # layer") so the page falls back to OCR instead of extracting
+        # confident nonsense.
+        letters = [c for w in words for c in (w[4] or "") if c.isalpha()]
+        if letters:
+            ascii_ratio = sum(1 for c in letters if c.isascii()) / len(letters)
+            if ascii_ratio < _MIN_ASCII_LETTER_RATIO:
+                return [], True
 
         # Merge words into line segments (by block+line), splitting where the
         # horizontal gap between consecutive words is large — this reproduces
@@ -403,7 +545,7 @@ class OCREngine:
                 seg.append(w)
             if seg:
                 boxes.append(self._seg_box(seg, s))
-        return boxes
+        return boxes, False
 
     @staticmethod
     def _seg_box(seg, s):
@@ -464,6 +606,149 @@ class OCREngine:
         except Exception:  # noqa: BLE001 - progress must never break extraction
             pass
 
+    def _zoom_crop_reread(self, image, box):
+        """Crop one box's own region out of the full-resolution page image,
+        upscale it, and re-OCR only that small crop - the shared mechanics
+        both _retry_low_confidence_boxes (triggered by low confidence) and
+        _zoom_retry_single_value_fields (triggered by field identity,
+        regardless of confidence) build on. Returns the single resulting
+        box dict ({"text", "confidence"}), or None when the crop's own
+        padding picked up more than one token (ambiguous to use safely) or
+        nothing at all - never raises."""
+        h, w = image.shape[:2]
+        pad = max(4, int(round(box.get("height", 20) * 0.3)))
+        top = max(0, int(box["top"]) - pad)
+        bottom = min(h, int(box["bottom"]) + pad)
+        left = max(0, int(box["left"]) - pad)
+        right = min(w, int(box["right"]) + pad)
+        if bottom <= top or right <= left:
+            return None
+        crop = image[top:bottom, left:right]
+        scale = 3
+        crop = cv2.resize(
+            crop, (crop.shape[1] * scale, crop.shape[0] * scale),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        try:
+            with OCREngine._ocr_lock:
+                OCREngine.initialize()
+                # cls=False - measured at ~85% of this call's own cost
+                # (0.294s -> 0.045s) and needless here: the crop comes
+                # from a page already oriented correctly by the main OCR
+                # pass above, not a fresh, possibly-rotated photo.
+                retry_result = OCREngine._ocr.ocr(crop, det=True, rec=True, cls=False)
+        except Exception:  # noqa: BLE001 - the retry is a nice-to-have, never fatal
+            return None
+        retry_boxes = self.normalize_result(retry_result)
+        return retry_boxes[0] if len(retry_boxes) == 1 else None
+
+    def _retry_low_confidence_boxes(self, image, boxes):
+        """A second, closer look at the few boxes PaddleOCR itself flagged
+        as unclear (confidence below _LOW_CONFIDENCE_RETRY_THRESHOLD) - see
+        _zoom_crop_reread for the shared crop/upscale/re-OCR mechanics, and
+        the threshold/cap/accept constants' own calibration notes above for
+        why this stays cheap (capped, rare) and conservative (never
+        accepts a merely-less-bad re-read). Returns `boxes` with any
+        accepted re-reads applied in place; always safe to call with an
+        empty or all-confident list (returns immediately, no OCR cost)."""
+        if not boxes:
+            return boxes
+        candidates = [
+            b for b in boxes
+            if b.get("confidence") is not None
+            and b["confidence"] < _LOW_CONFIDENCE_RETRY_THRESHOLD
+        ]
+        if not candidates:
+            return boxes
+        candidates.sort(key=lambda b: b["confidence"])
+        for b in candidates[:_LOW_CONFIDENCE_RETRY_MAX_BOXES]:
+            retry_box = self._zoom_crop_reread(image, b)
+            # A merely-less-bad re-read is never trusted, only a genuinely
+            # clean, more confident one - see the retry's own docstring.
+            if (
+                retry_box is not None
+                and retry_box["confidence"] > b["confidence"]
+                and retry_box["confidence"] >= _LOW_CONFIDENCE_RETRY_ACCEPT_MIN
+            ):
+                b["text"] = retry_box["text"]
+                b["confidence"] = retry_box["confidence"]
+        return boxes
+
+    # Single-value fields reprinted identically across a multi-page
+    # invoice already get a correction chance from _resolve_consensus_value
+    # (another page's own reading outvotes a misread one) - but a
+    # SINGLE-page invoice has no second reading to vote against at all, so
+    # a confidently-WRONG character swap (e.g. "8" read in place of "B" at
+    # 0.957 confidence - well above the low-confidence retry's own 0.75
+    # floor, so that mechanism never even looks at it) sails through
+    # unexamined. These fields matter enough (they identify the invoice
+    # itself, or the vendor) to warrant a zoom-in second look UNCONDITIONALLY,
+    # not just when the model already doubts itself - confirmed effective
+    # directly: a forced zoom-in re-read of that exact Sureworks box, bypassing
+    # the confidence gate entirely, read "SW26-27B04780" at 0.9636 confidence,
+    # higher than the original misread's own 0.957.
+    _ZOOM_RETRY_FIELD_NAMES = (
+        "Invoice No.", "Seller Name", "Buyer Name", "Consignee Name",
+    )
+
+    def _zoom_retry_single_value_fields(self, image, boxes, fields):
+        """For each of _ZOOM_RETRY_FIELD_NAMES present in `fields`, find the
+        ONE page box whose own text exactly equals that field's extracted
+        value (multi-word fields spread across several boxes are skipped -
+        safely ambiguous to recombine, not worth the risk) and re-read it
+        unconditionally (see this class's own comment above for why
+        confidence alone isn't a reliable enough gate for these specific
+        fields). When the zoomed re-read disagrees with the original, the
+        SAME character-by-character consensus _resolve_consensus_value
+        already uses for cross-page votes decides the field's final value
+        between the two readings. Returns `fields` with any corrections
+        applied in place; a field with no exact single-box match, or whose
+        zoomed re-read doesn't actually differ, costs nothing beyond that
+        one lookup. A born-digital page has no `image` to crop from (its
+        text comes straight off the PDF's own text layer, not a rasterised
+        page) - and no reason to need this anyway, since that text is
+        already exact - so this is a no-op there."""
+        if image is None or not boxes:
+            return fields
+        by_text = {}
+        for b in boxes:
+            by_text.setdefault(b["text"], []).append(b)
+        for name in self._ZOOM_RETRY_FIELD_NAMES:
+            value = (fields.get(name) or "").strip()
+            if not value:
+                continue
+            matches = by_text.get(value)
+            if not matches or len(matches) != 1:
+                continue
+            original_box = matches[0]
+            retry_box = self._zoom_crop_reread(image, original_box)
+            # A straight confidence comparison, not _resolve_consensus_value's
+            # character-vote - that one only makes sense across several
+            # independent readings with no confidence to compare (the
+            # cross-page case), and would otherwise keep the ORIGINAL
+            # reading on an exact tie (e.g. one differing character, 1
+            # vote each) purely because it happened to be listed first -
+            # exactly backwards here, where the zoomed-in re-read (a
+            # deliberately closer look, not just another equal vote) is
+            # the one actually worth trusting when it disagrees.
+            #
+            # Length-preserving only: the real failure mode this guards
+            # against is a single CHARACTER SWAP (e.g. "8" misread for
+            # "B"), where a closer look at the same glyph is trustworthy.
+            # A re-read that instead drops or adds a character is a
+            # different, segmentation-level mistake a 3x-upscaled crop is
+            # prone to - and accepting one cost a real multi-page file its
+            # correct grouping (a dropped character broke the cross-page
+            # invoice-number match despite scoring higher confidence).
+            if (
+                retry_box is not None
+                and retry_box["text"] != value
+                and len(retry_box["text"]) == len(value)
+                and retry_box["confidence"] > original_box.get("confidence", 0)
+            ):
+                fields[name] = retry_box["text"]
+        return fields
+
     def process_page(
         self,
         page_no,
@@ -513,6 +798,8 @@ class OCREngine:
                 boxes = self.normalize_result(
                     result
                 )
+
+                boxes = self._retry_low_confidence_boxes(image, boxes)
 
             self._report(0.55)      # text/OCR boxes in hand
 
@@ -672,6 +959,9 @@ class OCREngine:
                 header_rows,
                 footer_rows,
                 page_width
+            )
+            header_fields = self._zoom_retry_single_value_fields(
+                image, boxes, header_fields
             )
             self._report(0.85)      # header fields read
 
@@ -1085,9 +1375,13 @@ class OCREngine:
 
         return "\n".join(output)
     def _page_inputs(self, pdf_path):
-        """Per-page (boxes, image) inputs. For a born-digital PDF page the
-        text layer supplies boxes (image=None, no OCR); scanned pages and
-        image files return (None, image) and are OCR'd as before."""
+        """Per-page (boxes, image, is_broken_font) inputs. For a born-digital
+        PDF page the text layer supplies boxes (image=None, no OCR);
+        scanned pages and image files return (None, image, False) and are
+        OCR'd as before. A page whose text layer exists but is undecodable
+        gibberish (see _pdf_text_boxes) also returns (None, image, True) -
+        still OCR'd, but flagged so read_pdf never mistakes it for an
+        actual scan/photocopy."""
         ext = os.path.splitext(pdf_path)[1].lower()
 
         if ext == ".pdf" and fitz is not None:
@@ -1099,17 +1393,20 @@ class OCREngine:
             if doc is not None:
                 try:
                     for page in doc:
-                        boxes = self._pdf_text_boxes(page)
+                        boxes, is_broken_font = self._pdf_text_boxes(page)
                         if boxes:
-                            inputs.append((boxes, None))          # fast path
+                            inputs.append((boxes, None, False))   # fast path
                         else:
-                            inputs.append((None, self._render_pdf_page(pdf_path, page.number + 1)))
+                            inputs.append((
+                                None, self._render_pdf_page(pdf_path, page.number + 1),
+                                is_broken_font,
+                            ))
                 finally:
                     doc.close()
                 return inputs
 
         # Non-PDF image files (or fitz unavailable): OCR every rasterised page.
-        return [(None, img) for img in self.file_to_images(pdf_path)]
+        return [(None, img, False) for img in self.file_to_images(pdf_path)]
 
     def read_pdf(
         self,
@@ -1147,7 +1444,14 @@ class OCREngine:
         # handheld photo is still rejected either way - OCR quality on an
         # actual photo (as opposed to a flat scan/photocopy) is unreliable
         # regardless of this setting.
-        rasterised = [image for _boxes, image in page_inputs if image is not None]
+        #
+        # A broken-font page (real text layer, undecodable encoding - see
+        # _pdf_text_boxes) is excluded from every check below: it's an
+        # original born-digital PDF, never a scan/photocopy/photo, so none
+        # of these rejections (or the allow_scanned toggle) ever apply to
+        # it - it always falls through to OCR on its own rendered page.
+        rasterised = [image for _boxes, image, is_broken_font in page_inputs
+                      if image is not None and not is_broken_font]
         if rasterised:
             photo_count = sum(1 for image in rasterised if _looks_like_photo_page(image))
             if photo_count * 2 > len(rasterised):
@@ -1222,9 +1526,9 @@ class OCREngine:
 
         def _new_group():
             return {"text": [], "fields": [], "items": [], "tax": [], "invoice_no": "",
-                     "page_start": None, "page_end": None}
+                     "invoice_no_votes": [], "page_start": None, "page_end": None}
 
-        for page_no, (boxes, image) in enumerate(
+        for page_no, (boxes, image, _is_broken_font) in enumerate(
             page_inputs,
             start=1
         ):
@@ -1306,8 +1610,16 @@ class OCREngine:
             if is_eway_bill_page:
                 continue
 
-            if page_invoice_no and not group["invoice_no"]:
-                group["invoice_no"] = page_invoice_no
+            if page_invoice_no:
+                # Kept immediately for the SYNCHRONOUS "does this NEXT page
+                # open a new group" comparison just above, which needs
+                # some representative value before every page is even
+                # seen yet - the group's own FINAL invoice_no is resolved
+                # from every page's vote (see _resolve_consensus_value)
+                # once the whole file has been read, below.
+                if not group["invoice_no"]:
+                    group["invoice_no"] = page_invoice_no
+                group["invoice_no_votes"].append(page_invoice_no)
 
 
             # -------------------------------------
@@ -1369,6 +1681,9 @@ class OCREngine:
         if not groups:
             groups.append(_new_group())
 
+        for g in groups:
+            g["invoice_no"] = _resolve_consensus_value(g["invoice_no_votes"])
+
         if progress:
             progress(0.97)
 
@@ -1421,19 +1736,29 @@ class OCREngine:
         }
 
         merged_fields = {}
+        # Every page's own reading of a single-value field is kept as a
+        # vote, not just the first page's - see _resolve_consensus_value's
+        # own note (the same character-by-character reconstruction
+        # _invoice_no_votes above already relies on, just applied to these
+        # fields too).
+        single_value_votes = {}
         for fields in group["fields"]:
             for key, value in fields.items():
                 if not value:
                     continue
+                if key in _SINGLE_VALUE_FIELDS:
+                    single_value_votes.setdefault(key, []).append(value)
+                    continue
                 if key not in merged_fields:
                     merged_fields[key] = value
-                elif key in _SINGLE_VALUE_FIELDS:
-                    continue
                 elif value not in merged_fields[key] and not _is_near_duplicate(
                     value, merged_fields[key]
                 ):
                     # Append multiline values
                     merged_fields[key] += "\n" + value
+
+        for key, votes in single_value_votes.items():
+            merged_fields[key] = _resolve_consensus_value(votes)
 
         # Seller GSTIN fallback: the per-page anchor pass only sees the
         # header/footer bands, so a seller GSTIN printed inside the item-table
@@ -2073,7 +2398,16 @@ class OCREngine:
         # dedicated charge-line handling further down.
         CHARGE_KW = ("freight", "frieght", "courier", "forwarding",
                      "shipping", "packing", "handling", "cartage",
-                     "loading", "insurance")
+                     "loading", "insurance", "round off", "rounding off",
+                     # "deliver charge" (not bare "deliver"/"delivery") so
+                     # this only catches an actual "Deliver(y) Charges" line
+                     # item - a bare "deliver" also matched an unrelated
+                     # invoice terms line ("Delivery Ex-Premises.") and
+                     # wrongly promoted it into its own phantom charge item
+                     # with no values at all. "deliver charge" is a prefix
+                     # of both "Deliver Charges" and "Delivery Charges", so
+                     # one entry still covers both spellings.
+                     "deliver charge")
 
         # "continued"/"contd" is a multi-page invoice's own page-footer
         # marker ("continued ...", printed below the table on every page
@@ -2320,7 +2654,26 @@ class OCREngine:
                     col = min(value_cols, key=lambda c: abs(w["x"] - value_cols[c]))
                     if col in ("GST", "IGST"):
                         continue
-                    if is_number(t) and col in ("Quantity", "Rate", "Amount"):
+                    # A value that OCR glued to its own unit ("20.00 Nos",
+                    # "398.31Nos") is still a leaked Quantity/Rate/Amount
+                    # figure, not description text - is_number(t) alone
+                    # misses it since the combined token never parses as a
+                    # bare number (see the "Godown : Main Location" row
+                    # duplicating its own Quantity cell onto the next line -
+                    # Laptronics' own layout prints the qty twice).
+                    # "Total" is the same kind of pure-money column as
+                    # Quantity/Rate/Amount (see row_has_values/the Amount-
+                    # recovery branch below, which already treat it as an
+                    # equally valid place for a line's own Amount to live) -
+                    # just missing from this particular check, so a vendor
+                    # whose own layout has a separate Taxable Value/IGST %/
+                    # IGST Amount/Total breakdown (e.g. Gujarat Info
+                    # System's own invoices) leaked its line's own Total
+                    # figure into the Description instead of dropping it.
+                    if (
+                        col in ("Quantity", "Rate", "Amount", "Total")
+                        and (is_number(t) or number_with_unit(t) is not None)
+                    ):
                         continue
                 out.append((w, t))
             if not out:
@@ -2605,20 +2958,22 @@ class OCREngine:
                 glued = re.match(r"^(\d{1,3})[.)]?\s*([A-Za-z].*)$", first)
                 # Same measurement/warranty-period guard as split_serial_
                 # description's own two checks (a size like "8GB ..." or a
-                # validity period like "45 Days ...") - this token is real
-                # description content, not a serial number starting a new
-                # item. Without this, a wrapped continuation line beginning
-                # this way (e.g. "45 DAYS WARRNATY", the tail of a multi-
-                # line description) gets misread as "item start, serial
-                # 45", then folded back into the current item's Description
-                # anyway once row_has_values() finds nothing else on the
-                # row - but by then the leading number itself is already
-                # gone (only GB/TB/MB/KB had their own narrow reattachment
-                # fix-up below; DAYS and the rest of the unit list never
-                # did, and the reattachment only helps `cont`'s exact
+                # validity period like "45 Days ..."/"1 Years ...") - this
+                # token is real description content, not a serial number
+                # starting a new item. Without this, a wrapped continuation
+                # line beginning this way (e.g. "45 DAYS WARRNATY", or
+                # "1 YEARS WARRANTY" sitting on its own line after "1TB HDD"
+                # / "SATA", the tail of a multi-line description) gets
+                # misread as "item start, serial 45/1", then folded back
+                # into the current item's Description anyway once
+                # row_has_values() finds nothing else on the row - but by
+                # then the leading number itself is already gone (only
+                # GB/TB/MB/KB had their own narrow reattachment fix-up
+                # below; DAYS/YEARS/MONTHS and the rest of the unit list
+                # never did, and the reattachment only helps `cont`'s exact
                 # prefix anyway, not text a caller further down builds).
                 if glued and re.match(
-                    r"^\d{1,3}[.)]?\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?)\b",
+                    r"^\d{1,3}[.)]?\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?|YEARS?|MONTHS?)\b",
                     first,
                     re.IGNORECASE,
                 ):
@@ -2800,6 +3155,19 @@ class OCREngine:
                 # doesn't also match "tota" buried inside an unrelated real
                 # word (e.g. "Toyota").
                 and not re.search(r"\btota\b", lower)
+                # A bare "Tax 0/-" footer row (a vendor whose own tax line
+                # has no "Amount"/"Rate" word for EXCLUDE_KW's "tax amount"/
+                # "tax rate" to match - just the label and a value) is the
+                # same shape as this gate exists to reject: label + value,
+                # no real product name. Only when "tax" is the row's own
+                # sole word (nothing else alphabetic survives once it's
+                # removed) - a genuine multi-word continuation that happens
+                # to mention tax ("Service Tax Audit Report") must still
+                # pass through untouched.
+                and not (
+                    re.search(r"\btax\b", lower)
+                    and not re.search(r"[A-Za-z]{3,}", re.sub(r"\btax\b", "", lower))
+                )
                 and (
                     any(
                         _hsn_token_value(t.replace(",", "")) is not None
@@ -3274,6 +3642,22 @@ class OCREngine:
                                     current_item["TaxRatePercent"] = v
                             continue
 
+                        # "Total" (a line's own incl-tax grand total, e.g. a
+                        # vendor's own "Taxable Value | IGST % | IGST Amount
+                        # | Total" breakdown) is never tracked separately
+                        # from the pre-tax Amount this schema already saves -
+                        # discarded the same unconditional way a GST/IGST
+                        # cell is, rather than falling through to "free text
+                        # becomes description" below purely because its own
+                        # value doesn't even parse as a clean number (a
+                        # comma OCR'd as a stray period glues two decimal
+                        # points together, e.g. "2.360.00"). The
+                        # is_gst3_breakdown remap above already turns a
+                        # genuine Total-as-Amount case into "Amount" before
+                        # reaching here, so this never discards that one.
+                        if col == "Total":
+                            continue
+
                         # Numbers under other columns (e.g. discount) are
                         # ignored; free text becomes description.
                         if not is_number(txt):
@@ -3384,6 +3768,11 @@ class OCREngine:
                 has_text = (
                     any(c.isalpha() for c in row_text)
                     or any(_SIZE_SPEC_RE.match(w["text"].strip()) for w in words)
+                    or any(
+                        _PART_NO_RE.match(w["text"].strip())
+                        and not _DATE_LIKE_RE.match(w["text"].strip())
+                        for w in words
+                    )
                 )
 
                 # "HSN/SAC-84733099" glued onto its own wrapped line (see
@@ -3485,7 +3874,11 @@ class OCREngine:
                 if (current_item and has_text and not footer_started
                         and not any(k in lower for k in EXCLUDE_KW)
                         and not any(k in lower for k in CHARGE_KW)
-                        and not re.search(r"\btota\b", lower)):
+                        and not re.search(r"\btota\b", lower)
+                        and not (
+                            re.search(r"\btax\b", lower)
+                            and not re.search(r"[A-Za-z]{3,}", re.sub(r"\btax\b", "", lower))
+                        )):
                     # A scanned/garbled image can split one logical item
                     # row across several OCR rows, with the Quantity/Rate/
                     # Amount figures landing on a row that has no
@@ -3610,6 +4003,50 @@ class OCREngine:
                 ).strip()
                 continue
             folded.append(item)
+
+        # The mirror case: an item with NO Description at all (its own row
+        # had no serial and fell through the "orphan value row" fallback -
+        # e.g. a degraded scan where the real item's Rate/Amount cells OCR'd
+        # onto their own separate line, a line with no product name of its
+        # own to show) is never a genuine standalone line - it is leftover
+        # data belonging to whichever real item follows it. Merge its
+        # Quantity/HSN/Rate/Amount into the NEXT item's still-blank fields
+        # (never overwriting a value that item already has from its own
+        # row) and drop it, rather than leaving a phantom extra line with
+        # a blank Description that would only fail mandatory-field
+        # validation anyway. Only when a next item actually exists -
+        # otherwise there is nothing to merge into, so it is left alone
+        # rather than silently discarding data.
+        merged = []
+        for idx, item in enumerate(folded):
+            is_blank_desc = not (item.get("Description") or "").strip()
+            has_next = idx + 1 < len(folded)
+            if is_blank_desc and not item.get("charge") and has_next and not folded[idx + 1].get("charge"):
+                nxt = folded[idx + 1]
+                for key in ("HSN", "Quantity", "Rate", "Amount"):
+                    if nxt.get(key) is None and item.get(key) is not None:
+                        nxt[key] = item[key]
+                # This orphan row has no HSN/Quantity/Rate of its own either
+                # (nothing else to identify it except a bare money figure) -
+                # on a table too garbled to separate "Rate (Incl. of Tax)"
+                # from "Amount" into two distinct detected columns, the
+                # next item's own "Amount" is really just whichever value
+                # landed nearest the one detected money column, which can
+                # easily be the wrong one of the two. This orphan value,
+                # printed on its own stray line, is the more reliable of
+                # the two - take it over the next item's own guess rather
+                # than only filling a gap.
+                if (
+                    item.get("Amount") is not None
+                    and item.get("HSN") is None
+                    and item.get("Quantity") is None
+                    and item.get("Rate") is None
+                    and nxt.get("Amount") != item.get("Amount")
+                ):
+                    nxt["Amount"] = item["Amount"]
+                continue
+            merged.append(item)
+        folded = merged
         items = folded
 
         # Cleanup
@@ -4048,7 +4485,7 @@ class OCREngine:
                 # Leave it intact so it is not mis-split into a fake serial +
                 # "GB"/"TB"/"Days".
                 if match and re.fullmatch(
-                    r"\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?)",
+                    r"\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?|YEARS?|MONTHS?)",
                     text,
                     re.IGNORECASE,
                 ):
@@ -4063,7 +4500,7 @@ class OCREngine:
                 # here either - only the immediately-following unit matters,
                 # not whether anything else follows it.
                 if match and re.match(
-                    r"^\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?)\b",
+                    r"^\d+\s*(GB|TB|MB|KB|GHZ|MHZ|HZ|MAH|WH|W|V|DAYS?|YEARS?|MONTHS?)\b",
                     text,
                     re.IGNORECASE,
                 ):

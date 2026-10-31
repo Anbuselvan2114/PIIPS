@@ -158,6 +158,11 @@ a { color: var(--primary); text-decoration: none; }
 }
 .nav-item:hover .ico { background: rgba(255, 255, 255, .14); }
 .nav-item.active .ico { background: rgba(255, 255, 255, .2); }
+/* Menu temporarily hidden from the sidebar - see menuConfig.js's
+   HIDDEN_MENU_KEYS. The menu/route/code are all untouched; this is purely
+   a CSS display toggle so it can be un-hidden later with a one-line
+   change there, nothing to restore here. */
+.nav-item-hidden { display: none; }
 
 .sidebar-footer { margin-top: auto; padding-top: 14px; border-top: 1px solid var(--sidebar-2); }
 .user-chip { display: flex; align-items: center; gap: 10px; padding: 6px 10px; }

@@ -1606,7 +1606,36 @@ def extract(header_rows, footer_rows, page_width):
                         if re.fullmatch(r"\d{1,2}[-/.]\S+[-/.]\d{2,4}", text.strip()):
                             continue
                     else:
-                        text = text[:start].rstrip(" ,;:-")
+                        before = text[:start].rstrip(" ,;:-")
+                        # A company's own stylised logo text, OCR'd as
+                        # garbled noise directly adjacent to the real name
+                        # with no punctuation of its own ("@icicI Bank
+                        # ICONIC IT" - the logo reads as "@icicI Bank",
+                        # literally containing the word "bank" by pure
+                        # coincidence, glued straight onto the real company
+                        # name "ICONIC IT" that follows it on the very same
+                        # line) can accidentally contain a LABEL_WORDS entry,
+                        # wrongly treating the real name that follows as a
+                        # stripped-away label caption instead of this row's
+                        # own substantial content. Only engaged while still
+                        # determining this section's own NAME (never a later
+                        # address line, where "keep what's before a trailing
+                        # label" is the genuinely correct call - e.g.
+                        # "...Maharashtra 421101, Phone: ...") and only when
+                        # nothing but a bare space separates the match from
+                        # what precedes it (a real "<value>, Phone: ..."
+                        # caption is punctuated) - a short, noisy leading
+                        # fragment next to substantially longer real text
+                        # right after the "label" is noise, not a value
+                        # worth keeping over the real name.
+                        after = text[end:].lstrip(" :,-.")
+                        if (not named[section] and start > 0
+                                and text[start - 1] == " "
+                                and len(before) <= 10
+                                and re.search(r"[A-Za-z]{3,}", after)):
+                            text = after
+                        else:
+                            text = before
                     if not text:
                         continue
                     low = text.lower()

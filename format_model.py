@@ -347,15 +347,24 @@ class FormatModel:
         Training helper. Keyed on the TRUSTED seller GSTIN, or the seller NAME
         when the GSTIN is unreadable. If the key matches a known format, MERGE
         this sample into it; otherwise register a new formatN.
-        Returns (name, status): 'merged', 'learned', or 'no_gstin'.
+
+        When NEITHER is readable at all (common on a badly-scanned PDF whose
+        seller block OCR can't make out), falls back to the same field-layout
+        similarity match() already uses to recognize an unkeyed format later
+        - so clicking Train always succeeds instead of leaving that file
+        stuck in New_Format forever with nothing to key it on. The tradeoff:
+        an unkeyed format has no seller identity, so a later invoice from a
+        different vendor with a similarly generic field layout (common on
+        plain tax invoices) could occasionally match it too - accepted as
+        better than training being a dead end for these files.
+
+        Returns (name, status): 'merged'/'learned' (keyed on a real seller
+        identity), or 'merged_by_layout'/'learned_by_layout' (no seller
+        GSTIN/name - keyed on field layout only).
         """
 
         gstin = self.trusted_gstin(ocr_result)
         name_key = self.seller_name_key(ocr_result)
-
-        # Nothing to key on at all (no trusted GSTIN and no seller name).
-        if not gstin and not name_key:
-            return None, "no_gstin"
 
         for fmt in self.formats:
             if gstin and fmt.get("seller_gstin") and fmt["seller_gstin"] == gstin:
@@ -366,7 +375,20 @@ class FormatModel:
                 self._merge_into(fmt, ocr_result, source, persist)
                 return fmt["name"], "merged"
 
-        return self.register(ocr_result, source, persist=persist), "learned"
+        if gstin or name_key:
+            return self.register(ocr_result, source, persist=persist), "learned"
+
+        pdf_fields = self.field_set(ocr_result)
+        best_fmt, best_score = None, 0.0
+        for fmt in self.formats:
+            score = self._similarity(pdf_fields, fmt.get("fields", []))
+            if score > best_score:
+                best_fmt, best_score = fmt, score
+        if best_fmt is not None and best_score >= MATCH_THRESHOLD:
+            self._merge_into(best_fmt, ocr_result, source, persist)
+            return best_fmt["name"], "merged_by_layout"
+
+        return self.register(ocr_result, source, persist=persist), "learned_by_layout"
 
     def names(self):
         return [f["name"] for f in self.formats]
