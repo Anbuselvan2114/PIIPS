@@ -487,12 +487,14 @@ export default function Dashboard({ user }) {
     ] : []),
   ];
   // Include/Exclude only makes sense once an invoice is actually staged
-  // for export (READY TO LOAD), or to undo a previous exclude (EXCLUDED) —
-  // for every other status it's not shown at all, rather than offered and
-  // doing something confusing.
+  // for export (READY TO LOAD), still waiting on Service First (PENDING IN
+  // SF - a user may want to pull it out of the batch before it's even
+  // resolved), or to undo a previous exclude (EXCLUDED) — for every other
+  // status it's not shown at all, rather than offered and doing something
+  // confusing.
   const batchModalColumns = [
     ...invoiceColumns.filter((c) => c.key !== "batch"),
-    ...(["READY TO LOAD", "EXCLUDED"].includes(modal?.status) ? [
+    ...(["READY TO LOAD", "PENDING IN SF", "EXCLUDED"].includes(modal?.status) ? [
       { key: "include", label: "Include / Exclude", sortable: false,
         render: (row) => (
           <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
