@@ -27,11 +27,25 @@ import re
 _PREFIX = r"[S5]PRPUR"
 
 # Strict, trustworthy PO: SPRPUR/YYYY/MM/DD-NNNNN (spaces around separators
-# tolerated; serial 4-6 digits to allow for the sample range).
+# tolerated; serial 4-6 digits to allow for the sample range). dd/serial
+# captured by name so a glued trailing date (see _GLUED_DATE_TAIL_RE below)
+# can be told apart from a genuinely longer serial.
 _STRICT_RE = re.compile(
-    _PREFIX + r"\s*/\s*\d{4}\s*/\s*\d{2}\s*/\s*\d{2}\s*-\s*\d{4,6}",
+    _PREFIX + r"\s*/\s*\d{4}\s*/\s*\d{2}\s*/\s*(?P<dd>\d{2})\s*-\s*(?P<serial>\d{4,6})",
     re.IGNORECASE,
 )
+
+# The PO's own "Dated" value, printed immediately after the serial with NO
+# separator at all (e.g. "...-8764928-Oct-26" is really PO "...-87649" plus
+# that same Buyer's Order row's own "28-Oct-26" Dated value, glued straight
+# on) - _STRICT_RE's greedy \d{4,6} has no way to know where the real
+# serial ends, so it silently steals the glued date's leading day digit(s).
+# Matched separately here (day digits optional - see the correction below,
+# which only trusts a day-digit split when it reconstructs a day equal to
+# the PO's own day-of-month, since a PO's "Dated" value is overwhelmingly
+# the same day the PO itself was raised) so those stolen digits can be
+# given back to the date instead of staying wrongly glued onto the serial.
+_GLUED_DATE_TAIL_RE = re.compile(r"^(\d{0,2})-[A-Za-z]{3}-\d{2}\b")
 
 # Loose PO: the same skeleton (prefix, three '/'-separated groups, a '-', a
 # trailing group) but each group is any run of letters/digits — so a mangled
@@ -143,7 +157,21 @@ def find_buyer_order_no(text):
     # Trustworthy match first.
     m = _STRICT_RE.search(text)
     if m:
-        return _normalise(m.group(0)), "confident"
+        token = _normalise(m.group(0))
+        serial = m.group("serial")
+        dm = _GLUED_DATE_TAIL_RE.match(text[m.end():])
+        if dm:
+            # How many digits still need to come from the END of `serial`
+            # (on top of whatever's already visible in the glued tail) to
+            # reconstruct a 2-digit day. required==0 means the tail alone
+            # already IS a full day - nothing was actually stolen.
+            leftover = dm.group(1)
+            required = 2 - len(leftover)
+            if 0 < required <= len(serial) - 4:
+                candidate_day = serial[-required:] + leftover
+                if candidate_day == m.group("dd"):
+                    token = token[:-required]
+        return token, "confident"
 
     # The strict/loose forms above both assume the serial sits right after
     # the hyphen with only whitespace between - a two-column page can
