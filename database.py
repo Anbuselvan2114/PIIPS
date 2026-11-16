@@ -999,14 +999,19 @@ _BATCH_LOCK_STATUSES = ("LOADED", "POSTED", "COMPLETED", "REJECTED BY ACCOUNTS")
 # header) or off on its own separate resolution path (New Template needs
 # retraining, Data Mismatch needs a data fix, Pending In SF needs Service
 # First to catch up, Manually Updated is permanently parked and will never
-# move again - see usp_ExpireStaleUnresolved) that shouldn't hold up this
-# batch's own status label, or any batch behind it, indefinitely - e.g. 9
-# real invoices Loaded plus 1 still Pending In SF must show the batch as
-# LOADED, not stuck looking unresolved forever waiting on a part SF may
-# take days to receive.
+# move again - see usp_ExpireStaleUnresolved, Unsupported needs either a
+# proper non-scanned copy of the file or allow_scanned_pdfs_* turned on)
+# that shouldn't hold up this batch's own status label, or any batch behind
+# it, indefinitely - e.g. 9 real invoices Loaded plus 1 still Pending In SF
+# must show the batch as LOADED, not stuck looking unresolved forever
+# waiting on a part SF may take days to receive. Same reasoning for
+# Unsupported: a batch with everything else Completed but one Unsupported
+# invoice sitting in it must still show COMPLETED, not stay IN PROGRESS
+# forever over a file nothing further can be done with until it's fixed and
+# re-uploaded as its own, separate, new invoice.
 _BATCH_IGNORED_STATUSES = (
     "EXCLUDED", "NEW TEMPLATE", "DUPLICATE", "DATA MISMATCH", "PENDING IN SF",
-    "MANUALLY UPDATED",
+    "MANUALLY UPDATED", "UNSUPPORTED",
 )
 
 

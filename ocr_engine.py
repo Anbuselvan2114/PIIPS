@@ -587,6 +587,118 @@ class OCREngine:
             arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
             return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
+    def _header_image_boxes(self, page, text_boxes):
+        """Extra word boxes OCR'd from a logo/letterhead picture embedded at
+        the very TOP of an otherwise born-digital page - some vendors paste
+        their printed letterhead in as an image (scanned paper, or just a
+        logo graphic) above an invoice body that's typed digitally below
+        it, so the real text layer starts only below that picture and never
+        carries the seller's name/address at all.
+
+        Scoped tightly to avoid ever touching a page that already works:
+        only looks within the page's own top ~22% (where a letterhead
+        banner sits), only at an image wide enough to be a banner (not a
+        small corner logo/stamp), and - critically - only when the real
+        text layer has NOTHING of its own already up there. An ordinary
+        letterhead with a small logo sitting ALONGSIDE real text in that
+        same spot (the common case, already handled by the ordinary
+        text-based Seller Name detection) never reaches this at all. OCRs
+        ONLY that one cropped region, never the rest of the page - the page
+        is still a genuine born-digital PDF, not a scanned one, and must
+        never be gated by the allow_scanned_pdfs_* toggle.
+        Returns [] when there's no such image, or the text layer already
+        covers that area."""
+        s = _PDF_POINT_SCALE
+        page_h = page.rect.height
+        page_w = page.rect.width
+        top_limit = page_h * 0.22
+
+        best = None
+        for img in page.get_images(full=True):
+            try:
+                rects = page.get_image_rects(img[0])
+            except Exception:  # noqa: BLE001 - a malformed image ref is just skipped
+                continue
+            for rect in rects:
+                if (rect.y0 < top_limit and rect.width >= page_w * 0.4
+                        and rect.height >= 10):
+                    if best is None or rect.y0 < best.y0:
+                        best = rect
+        if best is None:
+            return []
+
+        # Real text that overlaps the IMAGE'S OWN band specifically (not
+        # just "somewhere in the page's top region" - the real invoice
+        # body's very first line can easily start a little further down the
+        # page than that, well short of the image's own bottom edge, and
+        # must never be mistaken for "this image already has text on top of
+        # it"). Only skip the OCR when something genuinely shares the
+        # image's own space.
+        if any(best.y0 <= (b["top"] / s) <= best.y1 for b in text_boxes):
+            return []
+
+        # Rendered well above the pipeline's usual 300 dpi: this is one
+        # small, isolated crop (not a whole page), so the extra cost is
+        # negligible, and a decorative/stylised logo wordmark (unlike plain
+        # printed text) measurably reads more reliably at a higher
+        # resolution - confirmed directly against this exact kind of image
+        # ("WIN TECHNOLOGIES" misread as "WIN TEGHNOLOGIEE" at 300 dpi,
+        # read correctly at 450).
+        crop_dpi = 450
+        crop_scale = crop_dpi / 72.0
+        try:
+            pix = page.get_pixmap(clip=best, dpi=crop_dpi, alpha=False)
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            image = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        except Exception:  # noqa: BLE001 - best-effort; fall back to no header text
+            return []
+
+        with OCREngine._ocr_lock:
+            OCREngine.initialize()
+            result = OCREngine._ocr.ocr(image, det=True, rec=True, cls=True)
+        boxes = self.normalize_result(result)
+        if not boxes:
+            return []
+
+        # A round logo badge sitting to one side of the wordmark often just
+        # repeats the company name's own first word on its own ("WIN", next
+        # to "WIN TECHNOLOGIES") - a short standalone box whose entire text
+        # is already the leading word of a longer box nearby, roughly level
+        # with it, is that badge, not independent content; dropped so the
+        # two don't glue into a duplicated "WIN WIN TECHNOLOGIES" once
+        # merged into one row below. Scoped tightly (exact first-word match,
+        # same rough height) so it can't drop a genuinely distinct word.
+        drop = set()
+        for i, a in enumerate(boxes):
+            a_word = a["text"].strip().lower()
+            if not a_word or " " in a_word:
+                continue
+            for j, b in enumerate(boxes):
+                if i == j:
+                    continue
+                b_first = b["text"].strip().split(" ", 1)[0].lower() if b["text"].strip() else ""
+                if (a_word == b_first and len(b["text"].split()) > 1
+                        and abs(a["center_y"] - b["center_y"]) < 0.6 * max(a["height"], b["height"])):
+                    drop.add(i)
+                    break
+        if drop:
+            boxes = [b for i, b in enumerate(boxes) if i not in drop]
+
+        # The crop's own OCR coordinates start at (0, 0), in the crop_dpi
+        # pixel space - rescale to the pipeline's standard 300-dpi space
+        # first (coord / crop_scale * s), THEN shift by where the crop
+        # itself sits on the full page, so these boxes land exactly where
+        # a real text box at that same spot already would.
+        off_x, off_y = best.x0 * s, best.y0 * s
+        rescale = s / crop_scale
+        for b in boxes:
+            for k in ("x", "left", "right", "center_x"):
+                b[k] = b[k] * rescale + off_x
+            for k in ("y", "top", "bottom", "center_y"):
+                b[k] = b[k] * rescale + off_y
+            b["box"] = [[p[0] * rescale + off_x, p[1] * rescale + off_y] for p in b["box"]]
+        return boxes
+
     # Optional per-file progress reporting (see read_pdf's `progress`): a
     # callable taking a 0..1 fraction of the WHOLE document, and the slice of
     # that range the page currently being processed covers.
@@ -1395,6 +1507,14 @@ class OCREngine:
                     for page in doc:
                         boxes, is_broken_font = self._pdf_text_boxes(page)
                         if boxes:
+                            # A genuinely born-digital page can still have
+                            # its own letterhead pasted in as a picture (see
+                            # _header_image_boxes) rather than real text -
+                            # merge in whatever that crop's own OCR finds,
+                            # ahead of the real text rows, so it flows into
+                            # Seller Name/Address detection exactly like an
+                            # ordinary letterhead's first lines would.
+                            boxes = self._header_image_boxes(page, boxes) + boxes
                             inputs.append((boxes, None, False))   # fast path
                         else:
                             inputs.append((

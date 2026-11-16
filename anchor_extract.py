@@ -316,6 +316,32 @@ def _is_document_title(text):
             and any(w in _TITLE_ANCHOR_WORDS for w in words))
 
 
+# Common devotional/blessing phrases some vendors print as the very first
+# line of their letterhead, above their actual company name ("Jai Mata Di" /
+# "Jay IT Solutions" on the next line) - a complete, curated list of whole
+# phrases rather than a prefix match, since a prefix like "jai"/"om"/"shree"
+# is also a perfectly normal first word of a REAL company name ("Shree
+# Enterprises", "Om Traders", "Jai Industries") that must never be excluded
+# here. Matched only as the row's ENTIRE text (see _is_devotional_motto) -
+# never a substring - so it can't misfire on an unrelated company name that
+# merely contains one of these words elsewhere.
+_DEVOTIONAL_PHRASES = {
+    "jai mata di", "jai shree krishna", "jai shri krishna", "jai shree ram",
+    "jai shri ram", "jai hanuman", "jai bajrang bali", "jai bholenath",
+    "jai mahakal", "jai siya ram", "om sai ram", "shree ganeshay namah",
+    "shree ganeshaya namah", "jai ganesh", "har har mahadev", "jai durga",
+    "jai ambe", "jai ambey", "radhe radhe", "jai swaminarayan",
+}
+
+
+def _is_devotional_motto(text):
+    """True when `text` IS (not merely contains) one of _DEVOTIONAL_PHRASES -
+    a blessing banner some letterheads print above their real company name,
+    never a company name itself."""
+    words = re.findall(r"[a-z]+", (text or "").lower())
+    return bool(words) and " ".join(words) in _DEVOTIONAL_PHRASES
+
+
 def _restore_garbled_invoice_label(low):
     """A poor scan reads the "Invoice" of "Invoice No." as some other
     seven-letter word ("Involce No.", "InvoIce No.") so the literal "invoice
@@ -1039,7 +1065,20 @@ def extract(header_rows, footer_rows, page_width):
     # party-block pass below so that pass treats the true first address
     # line as Address, not a second (silently dropped) Name.
     if rows:
-        # Prefer the LEFT-of-divider slice of row 0, not the whole
+        # A devotional/blessing banner ("Jai Mata Di", "Om Sai Ram") printed
+        # as the page's very first line, above the real company name on the
+        # row right below it - never a name itself (see
+        # _is_devotional_motto). Claim it (so the party-block pass below
+        # doesn't ALSO treat it as address content once Name is set from the
+        # row after it) and shift to that next row, exactly as if it were
+        # the page's own first line - the checks below are unchanged either
+        # way.
+        name_row = 0
+        if len(rows) > 1 and _is_devotional_motto(_row_text(rows[0])):
+            claimed_rows.add(0)
+            name_row = 1
+
+        # Prefer the LEFT-of-divider slice of the name row, not the whole
         # unsliced row: a company name that's genuinely left-aligned (the
         # common case) can share its row with an unrelated right-side
         # document-title word ("BABA INFOTECH SOLUTION" ... "INVOICE") that
@@ -1050,13 +1089,13 @@ def extract(header_rows, footer_rows, page_width):
         # genuinely right/center-aligned letterhead (e.g. Printer World,
         # where the company name itself sits well past the divider) is
         # still found.
-        left0 = [w for w in rows[0] if w["x"] < divider]
-        first_text = _row_text(left0) if left0 else _row_text(rows[0])
+        left0 = [w for w in rows[name_row] if w["x"] < divider]
+        first_text = _row_text(left0) if left0 else _row_text(rows[name_row])
         if (first_text and not _is_label(first_text)
                 # The slice left of the divider can be just the tail of a
                 # longer title ("Invoice" | "Cum Delivery Challan") - judge
                 # the whole row too.
-                and not _is_document_title(_row_text(rows[0]))
+                and not _is_document_title(_row_text(rows[name_row]))
                 and not _looks_like_phone_line(first_text)
                 and not _looks_like_url_line(first_text)
                 and len(first_text.split()) <= 4
@@ -1067,19 +1106,21 @@ def extract(header_rows, footer_rows, page_width):
                 # the page's very first line) passes every other check
                 # here and wins the Seller Name outright.
                 and any(c.isalpha() for c in first_text)):
-            # Some 2-line logos stack the company name across rows 0 and 1
-            # (e.g. "Hewlett Packard" / "Enterprise" - the actual two-line
-            # HPE wordmark) - same left-aligned/centered spot, same short
-            # plain-text shape as row 0's own check, so tried again against
-            # row 1 immediately below it. Row 1 stays party-block content
+            # Some 2-line logos stack the company name across the name row
+            # and the one right below it (e.g. "Hewlett Packard" /
+            # "Enterprise" - the actual two-line HPE wordmark) - same
+            # left-aligned/centered spot, same short plain-text shape as the
+            # name row's own check, so tried again against the row
+            # immediately below it. That row stays party-block content
             # otherwise (a genuine next line of it might be the real
             # street address instead), so this only actually fires when
             # BOTH checks pass. Claiming it here (not just appending the
             # text) keeps the party-block pass below from ALSO treating it
             # as the first line of Seller Address once "Name" is set.
-            if len(rows) > 1 and 1 not in claimed_rows:
-                left1 = [w for w in rows[1] if w["x"] < divider]
-                second_text = _row_text(left1) if left1 else _row_text(rows[1])
+            next_row = name_row + 1
+            if len(rows) > next_row and next_row not in claimed_rows:
+                left1 = [w for w in rows[next_row] if w["x"] < divider]
+                second_text = _row_text(left1) if left1 else _row_text(rows[next_row])
                 if (second_text and not _is_label(second_text)
                         and not _looks_like_phone_line(second_text)
                         and not _looks_like_url_line(second_text)
@@ -1087,7 +1128,17 @@ def extract(header_rows, footer_rows, page_width):
                         and not any(c.isdigit() for c in second_text)
                         and any(c.isalpha() for c in second_text)):
                     first_text = f"{first_text} {second_text}"
-                    claimed_rows.add(1)
+                    claimed_rows.add(next_row)
+            # The name row itself needs claiming too whenever it ISN'T row 0
+            # - _party_pass's own ri==0 special-casing already recognizes
+            # "this exact row's text is what the fallback just claimed as
+            # Seller Name" and skips it on its own, but that recognition is
+            # only checked at ri==0. Once a devotional motto shifted the
+            # real name onto a LATER row, without this it would otherwise
+            # be re-scanned as ordinary content there and wrongly become the
+            # first line of Seller Address too, duplicating the name.
+            if name_row != 0:
+                claimed_rows.add(name_row)
             fields.setdefault("Seller Name", first_text)
 
     # ------------------------------------------------------------------
@@ -1675,6 +1726,15 @@ def extract(header_rows, footer_rows, page_width):
                         # entirely rather than consuming the "first content
                         # line" slot, so the next genuine line still
                         # becomes the Name instead of Address.
+                        continue
+                    if section == "Seller" and _is_devotional_motto(text):
+                        # A blessing banner ("Jai Mata Di", "Om Sai Ram")
+                        # printed on its own row, below a document-title row
+                        # that already consumed ri==0 (so the dedicated
+                        # Seller Name fallback above never got a chance to
+                        # skip it itself) - never a company name, skip it
+                        # the same way so the real name on the row right
+                        # after it is what gets claimed here instead.
                         continue
                     out.setdefault(f"{section} Name", text)
                     named[section] = True
