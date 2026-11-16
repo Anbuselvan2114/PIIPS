@@ -801,11 +801,15 @@ def get_processed_invoices():
     invoices against different POs, can coincidentally reuse an invoice
     number). Used to skip re-processing an invoice that is already in the
     database - unless its only existing record is in one of
-    _REPROCESSABLE_STATUSES (Excluded/Pending In SF/Data Mismatch/New
-    Template), in which case the caller re-processes it into that same
-    header instead of flagging a duplicate (see processor.py and
-    reprocess_reworkable_header). Backfills InvoiceNo from the mapped
-    'Vendor Invoice No.' column for rows saved before InvoiceNo existed.
+    _REPROCESSABLE_STATUSES (Excluded/New Template/Unsupported), in which
+    case the caller re-processes it into that same header instead of
+    flagging a duplicate (see processor.py and reprocess_reworkable_header).
+    A header currently at PENDING IN SF is left out of this map entirely
+    (see usp_GetProcessedInvoices), so a re-upload of it finds no match at
+    all and is processed as a brand new, independent invoice instead of
+    either merging or flagging a duplicate. Backfills InvoiceNo from the
+    mapped 'Vendor Invoice No.' column for rows saved before InvoiceNo
+    existed.
 
     Sample: get_processed_invoices()
     """
@@ -831,15 +835,14 @@ def get_processed_invoices():
 # header/batch/No.) instead of the re-upload being parked as a DUPLICATE -
 # see reprocess_reworkable_header. Each represents an invoice that never
 # reached a real, final outcome the first time - Excluded is a deliberate
-# drop (a real re-inclusion - see _mark_batch_reincluded); Pending In SF
-# just means the part hadn't reached Service First yet; New Template means
-# the format wasn't usable last time; Unsupported means the format matched
-# but something essential (e.g. the Vendor Invoice No.) couldn't be read -
-# in every case, a fresh upload deserves a fresh look rather than being
-# told it's a duplicate of itself. This re-processing only ever happens
-# when a USER deliberately re-uploads that exact file and starts a run -
-# nothing here pulls a file back in on its own (see processor.py's main
-# loop, which is the only caller, driven by whatever the user just
+# drop (a real re-inclusion - see _mark_batch_reincluded); New Template
+# means the format wasn't usable last time; Unsupported means the format
+# matched but something essential (e.g. the Vendor Invoice No.) couldn't be
+# read - in every case, a fresh upload deserves a fresh look rather than
+# being told it's a duplicate of itself. This re-processing only ever
+# happens when a USER deliberately re-uploads that exact file and starts a
+# run - nothing here pulls a file back in on its own (see processor.py's
+# main loop, which is the only caller, driven by whatever the user just
 # uploaded).
 # DATA MISMATCH is deliberately NOT in this list - its intended fix path
 # is the Part Description Mapping menu (correct the description/part on
@@ -849,14 +852,24 @@ def get_processed_invoices():
 # right back at DATA MISMATCH, so a re-upload now falls through to
 # DUPLICATE like any other already-processed invoice, steering the user
 # back to Part Description Mapping instead of a pointless reprocess.
+# PENDING IN SF is likewise deliberately NOT in this list (removed - it
+# used to be): that status is purely a timing issue on Service First's own
+# side (it hasn't received/processed the reservation yet), not something
+# wrong with THIS invoice's own record worth merging fresh data onto. A
+# re-upload of a Pending In SF invoice is no longer treated as a duplicate
+# OR merged into the existing row - see get_processed_invoices/
+# usp_GetProcessedInvoices, which now excludes a Pending In SF header from
+# the "already processed" map entirely, so the re-upload is processed as a
+# genuinely new, independent invoice (its own header, its own batch, its
+# own Document No. once downloaded), leaving the original Pending In SF
+# record exactly as it was - effectively parked out of the way, the same
+# way an Excluded invoice doesn't block a fresh upload either.
 # MANUALLY UPDATED is likewise NOT in this list - it's what Excluded/New
-# Template (or, before today, Data Mismatch) becomes once
-# usp_ExpireStaleUnresolved parks it as permanently unresolved (Pending In
-# SF is NOT swept by that expiry - a re-upload can still merge into it as
-# before); a re-upload of a Manually Updated invoice must fall through to
-# DUPLICATE, never merge back in.
+# Template/Data Mismatch becomes once usp_ExpireStaleUnresolved parks it as
+# permanently unresolved; a re-upload of a Manually Updated invoice must
+# fall through to DUPLICATE, never merge back in.
 # KEEP IN SYNC with usp_GetProcessedInvoices' own copy of this list.
-_REPROCESSABLE_STATUSES = ("EXCLUDED", "PENDING IN SF", "NEW TEMPLATE", "UNSUPPORTED")
+_REPROCESSABLE_STATUSES = ("EXCLUDED", "NEW TEMPLATE", "UNSUPPORTED")
 
 
 def reprocess_reworkable_header(existing_header_id, new_header_id):
@@ -5465,27 +5478,39 @@ _MENU_PROC_DDL = [
         -- BatchName now lives on the tracker (informational for dedup).
         -- HeaderId/IsReprocessable let the caller re-process an invoice
         -- whose only existing record is in one of database.
-        -- _REPROCESSABLE_STATUSES (Excluded/Pending In SF/New Template/
-        -- Unsupported - DATA MISMATCH deliberately excluded, see that
-        -- constant's own comment), instead of flagging it as a duplicate
-        -- (see database.get_processed_invoices/reprocess_reworkable_header)
-        -- - KEEP THIS LIST IN SYNC with _REPROCESSABLE_STATUSES. Picks one
+        -- _REPROCESSABLE_STATUSES (Excluded/New Template/Unsupported -
+        -- DATA MISMATCH deliberately excluded, see that constant's own
+        -- comment), instead of flagging it as a duplicate (see database.
+        -- get_processed_invoices/reprocess_reworkable_header) - KEEP THIS
+        -- LIST IN SYNC with _REPROCESSABLE_STATUSES. Picks one
         -- representative header per invoice no. (MIN Id) since an invoice
         -- no. is expected to map to a single real header in practice.
         -- BuyerOrderNo comes from the tracker (a fixed schema column,
         -- always present) rather than the header's own optional, Excel-
         -- mapped "Buyer's Order No." column (may not exist depending on
         -- field mapping) - part of the (InvoiceNo, vendor, PO) match key.
+        --
+        -- A header currently at PENDING IN SF is excluded from this result
+        -- entirely (not just flagged reprocessable=0) - unlike the others,
+        -- that status is purely Service First's own timing (it hasn't
+        -- received the reservation yet), not a problem worth merging fresh
+        -- data onto THIS record for. Leaving it out of the map means a
+        -- later re-upload of the same invoice finds no match at all and is
+        -- processed as a genuinely new, independent invoice - own header,
+        -- own batch, own Document No. once downloaded - while this
+        -- original Pending In SF row is left exactly as it was, parked out
+        -- of the way like an Excluded one.
         SELECT h.InvoiceNo, MIN(pt.BatchName) AS BatchName,
                MIN(h.Id) AS HeaderId,
                MAX(CASE WHEN s.StatusName IN (
-                       'EXCLUDED', 'PENDING IN SF', 'NEW TEMPLATE', 'UNSUPPORTED'
+                       'EXCLUDED', 'NEW TEMPLATE', 'UNSUPPORTED'
                    ) THEN 1 ELSE 0 END) AS IsReprocessable,
                MIN(pt.BuyerOrderNo) AS BuyerOrderNo
         FROM dbo.tbl_Purchase_Header h
         LEFT JOIN dbo.tbl_Purchase_Tracker pt ON pt.Purchase_Header_ID = h.Id
         LEFT JOIN dbo.tbl_status s ON s.StatusId = pt.StatusID
         WHERE h.InvoiceNo IS NOT NULL AND h.InvoiceNo <> ''
+          AND ISNULL(s.StatusName, '') <> 'PENDING IN SF'
         GROUP BY h.InvoiceNo;
     END
     """,
