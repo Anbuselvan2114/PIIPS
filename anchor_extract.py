@@ -202,9 +202,18 @@ LABEL_WORDS = [
     # dispatch / delivery labels — these are field captions, never values,
     # so a blank "Buyer's Order No." must not swallow the next label below it.
     "despatch", "dispatch", "despatched", "dispatched", "document no",
+    "doc no",  # same field, shorter abbreviated caption form ("Doc No.")
     "delivery note", "delivery",  # bare "Delivery" (e.g. "Delivery Challan No.") - without this a wrapped "Dated" label with nothing to its own right falls through to the NEXT row and this word gets taken as the date value instead of being recognized as a different field's own label
     "supplier's ref", "supplier ref", "e-way", "eway",
     "other reference", "reference no",
+    # "Reference No. & Date." - a standard GST tax-invoice field caption,
+    # abbreviated by some OCR/templates to "Ref No & Date" - same field as
+    # "reference no" above, just the shorter form.
+    "ref no & date", "ref no",
+    # "Destination" - a standard GST tax-invoice field caption (the goods'
+    # destination city/state), printed in the same metadata box as
+    # Dispatch Doc No./Delivery Note above - never address/name content.
+    "destination",
     # GST e-Invoice QR-code block (IRN/Ack No./Ack Date caption) sits above
     # the seller's letterhead on this layout — without these, "IRN : <64-
     # char hash>" becomes the very first unclaimed left-column line and
@@ -279,6 +288,110 @@ def _row_text_with_spans(row):
         parts.append(t)
         pos = start + len(t) + 1  # +1 for the joining space
     return " ".join(parts), spans
+
+
+def _mask_label_words(low, labels):
+    """Byte-per-character mask of `low` (already-lowercased text) with
+    every occurrence of any phrase in `labels` marked 1, word-boundary
+    safe (a label never matches starting mid-word, e.g. "rate" inside
+    "Corporate"). Shared by _strip_label_words and _is_pure_grid_caption
+    so both apply the exact same matching rule, just against a different
+    label set."""
+    masked = bytearray(len(low))
+    for lbl in labels:
+        pos = 0
+        while True:
+            i = low.find(lbl, pos)
+            if i == -1:
+                break
+            if i > 0 and low[i - 1].isalpha() and lbl[0].isalpha():
+                pos = i + 1
+                continue
+            for j in range(i, i + len(lbl)):
+                masked[j] = 1
+            pos = i + len(lbl)
+    return masked
+
+
+_PAGE_MARKER_RE = re.compile(r"\(?\s*page\s*\d+(?:\s+of\s+\d+)?\s*\)?", re.IGNORECASE)
+
+
+# A document TITLE/banner word - printed once per page as its own marker
+# ("Tax Invoice", "Original For Recipient", "Duplicate") - is also a
+# recognized LABEL_WORDS entry, but unlike a metadata GRID field caption
+# ("Destination", "Dated", "GSTIN", ...) it never has an adjacent VALUE
+# printed on the very next row. Only these need excluding from the
+# otherwise-general "every other label is a grid field caption" rule
+# below - using the full LABEL_WORDS list minus just this handful (instead
+# of a small hand-picked allowlist of grid fields) means every genuine
+# field caption is covered automatically, with no risk of missing one
+# that happens to share its row with another (e.g. "Delivery Date
+# Destination" - three caption phrases on one row - silently failing to
+# register as "pure caption" just because one of the three wasn't on an
+# explicit allowlist, and so wrongly letting its value row through as if
+# it were real Seller address content).
+_BANNER_ONLY_LABELS = frozenset((
+    "tax invoice", "commercial invoice", "delivery challan", "invoice",
+    "duplicate", "triplicate", "original", "original copy",
+    "original for recipient", "duplicate for transporter",
+    "triplicate for supplier",
+))
+_GRID_METADATA_LABELS = tuple(w for w in LABEL_WORDS if w not in _BANNER_ONLY_LABELS)
+
+
+def _is_pure_grid_caption(row):
+    """True only when `row`'s entire text is made up of _GRID_METADATA_LABELS
+    phrases, with nothing else left over - see _GRID_METADATA_LABELS/
+    _BANNER_ONLY_LABELS for why a document title/banner row never counts."""
+    text = _row_text(row)
+    if not text:
+        return False
+    low = text.lower()
+    if _is_garbled_tax_invoice_title(low) or _is_document_title(low):
+        return False
+    masked = _mask_label_words(low, _GRID_METADATA_LABELS)
+    return all(masked[i] for i in range(len(low)) if low[i].isalnum())
+
+
+def _strip_label_words(row):
+    """`row` with any word(s) that are ENTIRELY consumed by a LABEL_WORDS
+    caption phrase removed, keeping every other word as-is - unlike
+    _is_label (which judges a row's full joined text as label or not,
+    all-or-nothing), this lets a single OCR row that mixes a right-column
+    metadata caption with genuine, unrelated content sharing its line
+    (e.g. a "Destination" field caption printed at the same height as an
+    address block's own trailing city, both landing in one OCR row) keep
+    the real content while only the caption itself is dropped."""
+    text, spans = _row_text_with_spans(row)
+    low = text.lower()
+    # Same "PIN Code" guard as _label_span - never let the bare "code"
+    # entry eat into a pincode.
+    low = re.sub(r"(\bpin\s*)code\b", lambda m: m.group(1) + "xxxx", low)
+    masked = _mask_label_words(low, LABEL_WORDS)
+    # A multi-page invoice's own "(Page 2)" pagination marker can glue
+    # directly onto the preceding word with no space at all where the OCR
+    # lost the line break ("TAX INVOICE(Page 2)" as one run) - the "tax
+    # invoice" phrase match above only covers ITS OWN characters, leaving
+    # "(Page 2)" unmasked and so the whole glued token survives untouched
+    # (a word is only ever dropped here when ALL of its own characters are
+    # masked). Masking the pagination marker too, in the same pass, closes
+    # that gap regardless of which word(s) it happens to share a token with.
+    for m in _PAGE_MARKER_RE.finditer(low):
+        for j in range(m.start(), m.end()):
+            masked[j] = 1
+    kept = []
+    for start, end, w in spans:
+        # Trailing punctuation a tokenizer glued onto the word itself
+        # (e.g. "Date," as one token) sits inside this same [start, end)
+        # span but was never part of the label match itself - comparing
+        # only the span's actual letters/digits against the mask (instead
+        # of requiring literally every character, punctuation included, to
+        # be masked) still correctly drops a fully-matched label word.
+        alnum_positions = [i for i in range(start, end) if low[i].isalnum()]
+        if alnum_positions and all(masked[i] for i in alnum_positions):
+            continue
+        kept.append(w)
+    return kept
 
 
 def _is_garbled_tax_invoice_title(low):
@@ -1832,11 +1945,59 @@ def extract(header_rows, footer_rows, page_width):
         # would leak back in as Address text. Apply the same left-of-divider
         # slice and claimed_rows exclusion the ordinary (non-3-column) path
         # already gets, so only genuine Seller-block content survives.
-        prefix_rows = [
-            [w for w in row if w["x"] < divider]
-            for ri, row in enumerate(header_rows[:marker_ri])
-            if ri not in claimed_rows
-        ]
+        #
+        # A right/center-aligned letterhead (e.g. TPM Guru's own, printed
+        # entirely past the divider on every one of its lines) would
+        # otherwise lose its ENTIRE prefix this way - every row slices down
+        # to nothing, silently discarding the real company name/address
+        # rather than just trimming unrelated right-side content off a row
+        # that also has genuine left-side content. Falls back to the row's
+        # own full (unsliced) text, with any right-column metadata caption
+        # word(s) stripped out of it (_strip_label_words), only when the
+        # left-of-divider slice is completely empty - a prefix row sharing
+        # its line with a caption like "Doc No" / "Destination" that has
+        # nothing of its own left of the divider would otherwise either
+        # lose a genuine piece of address text sitting on the very same
+        # row right next to that caption (e.g. "Destination, Bangalore" -
+        # "Bangalore" is the real trailing city, not part of the caption),
+        # or - were the whole row kept unfiltered - glue the caption itself
+        # onto that real text. A row that has SOME real left-side content
+        # still only keeps that, exactly as before.
+        #
+        # This metadata box also prints some captions and their OWN values
+        # on two SEPARATE rows instead of sharing one line - e.g. a bare
+        # "Destination" caption row, then the actual destination city
+        # ("Chennai", "Madurai", ...) alone on the very next row. That city
+        # is the Destination FIELD's per-invoice value - the shipment's
+        # destination, not the seller's own registered address - so it must
+        # never be treated as address content either, even though the row
+        # carrying it has no label word of its own to strip. Tracking
+        # whether the immediately preceding row was PURELY one of the
+        # metadata grid's own field captions (_is_pure_grid_caption - a
+        # narrow, closed set, deliberately NOT the general _is_label check:
+        # a document TITLE/banner row like "Tax Invoice" or "Original For
+        # Recipient" is also a recognized label but never has an adjacent
+        # value row the way a grid caption does, so treating ITS next row
+        # as "just a value" would wrongly discard the genuine Seller name/
+        # address line that actually follows it) catches this: such a
+        # row's very next row is treated as that same field's value, not
+        # Seller text.
+        prefix_rows = []
+        prev_row_was_label_only = False
+        for ri, row in enumerate(header_rows[:marker_ri]):
+            if ri in claimed_rows:
+                continue
+            left = [w for w in row if w["x"] < divider]
+            if left:
+                prefix_rows.append(left)
+                prev_row_was_label_only = False
+                continue
+            if prev_row_was_label_only:
+                prefix_rows.append([])
+                prev_row_was_label_only = False
+                continue
+            prefix_rows.append(_strip_label_words(row))
+            prev_row_was_label_only = _is_pure_grid_caption(row)
         side_by_side_rows = (
             prefix_rows
             + [_marker_row("Bill to", bill_x, marker_row_src)] + bill_rows

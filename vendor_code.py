@@ -54,8 +54,14 @@ def vendor_code_from_filename(pdf_path):
     Sample: vendor_code_from_filename("sure_invoice.pdf") -> "" (last
             segment "invoice" doesn't look like a real code - old-style
             filename, no code appended)
+    Sample: vendor_code_from_filename("COMM_COMSYS01 (pages 1-2).pdf") ->
+            "COMSYS01" (a multi-invoice PDF split into one file per
+            invoice keeps a " (pages N-M)" page-range annotation on the
+            END of the original filename - stripped first so it never
+            gets glued onto the code segment itself)
     """
     stem = os.path.splitext(os.path.basename(pdf_path or ""))[0]
+    stem = re.sub(r"\s*\([^()]*\)\s*$", "", stem)
     last = stem.split("_")[-1].strip().upper()
     return last if _FILENAME_CODE_RE.match(last) else ""
 

@@ -47,6 +47,63 @@ _MIN_TEXT_CHARS = 60
 # is the signal to distrust the text layer and OCR the page instead.
 _MIN_ASCII_LETTER_RATIO = 0.5
 
+# A sneakier variant of the same broken/custom-font problem
+# (_MIN_ASCII_LETTER_RATIO's own case): some PDF generators embed the
+# invoice's own VARIABLE fields (Invoice No., Dated, Buyer's Order No.) in
+# a separate font/subset from the static template text (labels, seller
+# address, GSTIN) - when THAT subset's CMap is the one that's broken, the
+# page reads as perfectly good English everywhere else (so the ratio check
+# above never fires), but the one piece of data this pipeline actually
+# needs - the invoice's own number and dates - comes out as pure symbol
+# noise ("! \"" instead of a real invoice number). A label this pipeline
+# relies on being followed by real digits (every one of these always is,
+# on a genuine invoice) whose very next line has NONE, while the page
+# elsewhere clearly still has working digits (so this isn't just a blank
+# field, or the whole page being unreadable another way), is the signal.
+_CORRUPTED_FIELD_LABELS = ("invoice no", "dated", "buyer's order no", "buyers order no")
+
+
+def _has_corrupted_numeric_fields(page):
+    """True when the FIRST occurrence of a label in _CORRUPTED_FIELD_LABELS
+    is followed by non-empty text with no digit in it at all, while the
+    page as a whole does have real, readable digits elsewhere. "Followed
+    by" skips over any intervening CAPTION line (anchor_extract._is_label -
+    the exact same check the real field-anchoring logic already relies on)
+    rather than naively trusting the very next line - a grid layout
+    routinely prints another label before the real value ("Invoice No." /
+    "e-Way Bill No." / "253/26-27"), and mistaking that second label for a
+    corrupted value would wrongly send an already-working file through OCR
+    instead.
+
+    Only the FIRST occurrence of each label is ever checked - a label like
+    "Dated" is often printed a second/third time for an unrelated sub-field
+    (the Buyer's Order's own date, Delivery Note Date, ...) that's
+    routinely left genuinely blank on a real invoice, with nothing
+    recognizable as a label following it either; checking those secondary
+    occurrences too would mistake an ordinary blank field for corruption.
+    The PRIMARY, first occurrence is what this pipeline's own extraction
+    actually depends on, and corruption (a broken font) would show up there
+    regardless, since it isn't selective about which specific field it
+    breaks."""
+    text = page.get_text() or ""
+    if not re.search(r"\d", text):
+        return False  # no working digits anywhere - a different problem, not this one
+    lines = [ln.strip() for ln in text.splitlines()]
+    seen = set()
+    for i, line in enumerate(lines):
+        low = line.lower().rstrip(" .:")
+        if low not in _CORRUPTED_FIELD_LABELS or low in seen:
+            continue
+        seen.add(low)
+        for nxt in lines[i + 1:]:
+            if not nxt or anchor_extract._is_label(nxt):
+                continue
+            if not re.search(r"\d", nxt):
+                return True
+            break
+    return False
+
+
 # ---- Photographed-page detection ------------------------------------------
 # A flatbed/app scan is a clean, evenly-lit rectangle of paper: the border is
 # bright and uniform, and illumination barely varies across the page. A
@@ -518,6 +575,14 @@ class OCREngine:
             ascii_ratio = sum(1 for c in letters if c.isascii()) / len(letters)
             if ascii_ratio < _MIN_ASCII_LETTER_RATIO:
                 return [], True
+
+        # See _has_corrupted_numeric_fields's own comment: a narrower,
+        # sneakier variant of the same broken-font problem, where only the
+        # invoice's own variable fields (never the static template text
+        # around them) are corrupted - the ratio check above has nothing to
+        # catch here, since the surrounding letters are all genuine.
+        if _has_corrupted_numeric_fields(page):
+            return [], True
 
         # Merge words into line segments (by block+line), splitting where the
         # horizontal gap between consecutive words is large — this reproduces
