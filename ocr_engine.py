@@ -2619,7 +2619,7 @@ class OCREngine:
                       "total", "round off", "round-off", "roundoff",
                       "rounded off",
                       "rupees", "inr ", "grand total", "tax rate",
-                      "taxable", "amount chargeable", "in words",
+                      "taxable", "amount chargeable", "amount payable", "in words",
                       "declaration", "continued", "contd",
                       "computer generated invoice",
                       # A vendor that has no separate HSN/SAC table
